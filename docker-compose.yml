@@ -1,0 +1,9 @@
+services:
+  soundbot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./sounds:/app/sounds
+      - ./data:/app/data
+      - ./logs:/app/logs
