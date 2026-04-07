@@ -91,7 +91,9 @@ class SoundStore:
 
     def save(self) -> None:
         data = {"sounds": self._sounds, "version": 1}
-        self._metadata_path.write_text(json.dumps(data, indent=2))
+        tmp = self._metadata_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(self._metadata_path)
 
     def load(self) -> None:
         if self._metadata_path.exists():
