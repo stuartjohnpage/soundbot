@@ -19,5 +19,8 @@ console = logging.StreamHandler()
 console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
 logger.addHandler(console)
 
+if not config.DISCORD_TOKEN:
+    raise RuntimeError("DISCORD_TOKEN environment variable is required")
+
 bot = create_bot()
 bot.run(config.DISCORD_TOKEN, log_handler=None)

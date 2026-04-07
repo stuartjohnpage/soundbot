@@ -1,9 +1,10 @@
 import logging
 import random
+from pathlib import Path
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from . import config
 from .audio import validate_sound
@@ -36,6 +37,18 @@ class Soundboard(commands.Cog):
         self.mixer: MixerSource | None = None
         self.volume: float = config.DEFAULT_VOLUME / 100.0
 
+    async def cog_load(self) -> None:
+        self._save_loop.start()
+
+    async def cog_unload(self) -> None:
+        self._save_loop.cancel()
+        self.store.save()
+
+    @tasks.loop(seconds=60)
+    async def _save_loop(self) -> None:
+        """Persist play counts periodically."""
+        self.store.save()
+
     # -- Voice management --
 
     @app_commands.command(name="join", description="Bot joins your voice channel")
@@ -50,8 +63,9 @@ class Soundboard(commands.Cog):
         if interaction.guild.voice_client:
             await interaction.guild.voice_client.move_to(channel)
         else:
-            await channel.connect()
-        self.mixer = MixerSource()
+            vc = await channel.connect()
+            self.mixer = MixerSource()
+            vc.play(self.mixer)
         await interaction.response.send_message(f"Joined **{channel.name}**.")
 
     @app_commands.command(name="leave", description="Bot leaves the voice channel")
@@ -64,6 +78,7 @@ class Soundboard(commands.Cog):
             )
             return
         if self.mixer:
+            self.mixer.stop()
             self.mixer.cleanup()
             self.mixer = None
         await vc.disconnect()
@@ -100,9 +115,6 @@ class Soundboard(commands.Cog):
         if self.mixer is None:
             self.mixer = MixerSource()
         self.mixer.add(source)
-
-        if not vc.is_playing():
-            vc.play(self.mixer)
 
         self.store.increment_play_count(name)
         logger.info(
@@ -195,7 +207,12 @@ class Soundboard(commands.Cog):
         category: str | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
-        dest = config.SOUNDS_DIR / file.filename
+        # Sanitize filename to prevent path traversal
+        safe_name = Path(file.filename).name
+        dest = config.SOUNDS_DIR / safe_name
+        if not dest.resolve().is_relative_to(config.SOUNDS_DIR.resolve()):
+            await interaction.followup.send("Invalid filename.", ephemeral=True)
+            return
         await file.save(dest)
         try:
             validate_sound(dest, config.MAX_DURATION)
@@ -244,10 +261,16 @@ class Soundboard(commands.Cog):
         )
 
     @app_commands.command(name="listsounds", description="List all sounds")
-    @app_commands.describe(category="Optional category filter")
+    @app_commands.describe(
+        category="Optional category filter",
+        page="Page number (default 1)",
+    )
     @_admin_check()
     async def listsounds(
-        self, interaction: discord.Interaction, category: str | None = None
+        self,
+        interaction: discord.Interaction,
+        category: str | None = None,
+        page: int = 1,
     ) -> None:
         sounds = self.store.list_sounds(category=category)
         if not sounds:
@@ -256,17 +279,18 @@ class Soundboard(commands.Cog):
             )
             return
         pages = paginate(sounds, per_page=20)
+        # Clamp page to valid range
+        page_idx = max(0, min(page - 1, len(pages) - 1))
         lines = []
-        for name, entry in pages[0]:
-            cat = entry.get("category") or "—"
+        for name, entry in pages[page_idx]:
+            cat = entry.get("category") or "\u2014"
             plays = entry.get("play_count", 0)
             lines.append(f"`{name}` | {cat} | {plays} plays")
         embed = discord.Embed(
             title="Sound Library",
             description="\n".join(lines),
         )
-        if len(pages) > 1:
-            embed.set_footer(text=f"Page 1/{len(pages)}")
+        embed.set_footer(text=f"Page {page_idx + 1} of {len(pages)}")
         await interaction.response.send_message(embed=embed)
 
 
@@ -328,13 +352,22 @@ def create_bot() -> commands.Bot:
         sounds_dir=config.SOUNDS_DIR,
     )
 
-    @bot.event
-    async def on_ready():
+    async def setup_hook():
         config.SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
         store.scan_folder()
         store.save()
         await bot.add_cog(Soundboard(bot, store))
-        await bot.tree.sync()
-        logger.info("Bot ready as %s", bot.user)
+        if config.SYNC_COMMANDS:
+            await bot.tree.sync()
+
+    bot.setup_hook = setup_hook
+
+    @bot.event
+    async def on_ready():
+        logger.info("Connected as %s", bot.user)
+
+    @bot.event
+    async def on_close():
+        store.save()
 
     return bot

@@ -422,3 +422,33 @@ class TestFolderScan:
 
         # Should have imported one, not crashed
         assert store.get("airhorn") is not None
+
+    def test_scan_skips_file_tracked_under_different_path_form(self, tmp_path):
+        """scan_folder should not re-import a file stored with a different path string form.
+
+        If the file is tracked under a relative path like 'sounds/airhorn.mp3'
+        but scan_folder sees the absolute path, it should recognize they're the same file.
+        """
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        sound_file = sounds_dir / "airhorn.mp3"
+        sound_file.write_bytes(b"fake")
+
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        # Add the sound with a custom name (different from stem) so name check doesn't shortcut
+        store.add("my-horn", sound_file, category="custom")
+        # Overwrite the stored file path to use the un-resolved form
+        # (e.g., includes ../ or different casing on Windows)
+        alt_path = sounds_dir / ".." / "sounds" / "airhorn.mp3"
+        store._sounds["my-horn"]["file"] = str(alt_path)
+
+        # scan_folder should recognize this file is already tracked
+        store.scan_folder()
+
+        # The file should NOT be re-imported under its stem name "airhorn"
+        # because it's already tracked (just under a different path form)
+        assert store.get("airhorn") is None
+        assert len(store.list_sounds()) == 1

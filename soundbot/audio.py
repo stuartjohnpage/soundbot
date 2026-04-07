@@ -17,7 +17,10 @@ def get_duration(file_path: Path) -> float:
             capture_output=True,
             text=True,
             check=True,
+            timeout=10,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("Audio file could not be processed (timed out)") from exc
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         raise ValueError(f"Cannot read audio file: {file_path}") from exc
 

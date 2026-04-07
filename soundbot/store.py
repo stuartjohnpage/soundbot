@@ -103,11 +103,11 @@ class SoundStore:
             self._sounds = {}
 
     def scan_folder(self) -> None:
-        tracked_files = {entry["file"] for entry in self._sounds.values()}
+        tracked_files = {Path(entry["file"]).resolve() for entry in self._sounds.values()}
         for path in sorted(self._sounds_dir.rglob("*")):
             if not path.is_file() or path.suffix.lower() not in _AUDIO_EXTS:
                 continue
-            if str(path) in tracked_files:
+            if path.resolve() in tracked_files:
                 continue
             name = path.stem.lower()
             if name in self._sounds:

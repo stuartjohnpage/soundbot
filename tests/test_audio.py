@@ -1,14 +1,14 @@
 import shutil
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from soundbot.audio import get_duration, validate_sound
 
 _has_ffmpeg = shutil.which("ffprobe") is not None
-
-pytestmark = pytest.mark.skipif(not _has_ffmpeg, reason="FFmpeg/ffprobe not installed")
+_skip_no_ffmpeg = pytest.mark.skipif(not _has_ffmpeg, reason="FFmpeg/ffprobe not installed")
 
 
 @pytest.fixture()
@@ -43,12 +43,14 @@ def long_wav(tmp_path):
     return out
 
 
+@_skip_no_ffmpeg
 class TestGetDuration:
     def test_returns_correct_duration(self, short_wav):
         duration = get_duration(short_wav)
         assert 1.9 <= duration <= 2.1
 
 
+@_skip_no_ffmpeg
 class TestValidateSound:
     def test_valid_sound_passes(self, short_wav):
         # Should not raise
@@ -63,3 +65,15 @@ class TestValidateSound:
         bad_file.write_text("this is not audio")
         with pytest.raises(ValueError):
             validate_sound(bad_file, max_duration=6.0)
+
+
+class TestFfprobeTimeout:
+    """Tests that don't require ffmpeg installed."""
+
+    def test_timeout_expired_raises_valueerror(self, tmp_path):
+        fake_file = tmp_path / "stuck.mp3"
+        fake_file.write_bytes(b"fake")
+        with patch("soundbot.audio.subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd="ffprobe", timeout=10)
+            with pytest.raises(ValueError, match="timed out"):
+                get_duration(fake_file)

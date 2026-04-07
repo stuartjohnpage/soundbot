@@ -41,9 +41,10 @@ class TestMixerSingleSource:
         frame2 = mixer.read()
         assert len(frame2) == FRAME_SIZE
 
-        # Source exhausted - should return silence
+        # Source exhausted - should return silence (not empty bytes)
         frame3 = mixer.read()
-        assert frame3 == b""
+        assert len(frame3) == FRAME_SIZE
+        assert frame3 == b"\x00" * FRAME_SIZE
 
 
 class TestMixerTwoSources:
@@ -65,6 +66,62 @@ class TestMixerTwoSources:
         samples = struct.unpack(f"<{FRAME_SIZE // 2}h", frame)
         # 30000 + 30000 = 60000, should clip to 32767
         assert all(s == 32767 for s in samples)
+
+
+class TestMixerSilenceAndStop:
+    def test_returns_silence_when_no_sources_active(self):
+        """Mixer should return silence (not empty bytes) when no sources are active."""
+        mixer = MixerSource()
+        frame = mixer.read()
+        assert len(frame) == FRAME_SIZE
+        assert frame == b"\x00" * FRAME_SIZE
+
+    def test_returns_silence_after_sources_exhausted(self):
+        """After all sources finish, mixer returns silence (stays alive for more sounds)."""
+        mixer = MixerSource()
+        mixer.add(FakeSource(sample_value=1000, num_frames=1))
+        mixer.read()  # consume the one frame
+        frame = mixer.read()  # no active sources now
+        assert len(frame) == FRAME_SIZE
+        assert frame == b"\x00" * FRAME_SIZE
+
+    def test_returns_empty_when_stopped(self):
+        """Stopped mixer returns empty bytes to signal end-of-stream."""
+        mixer = MixerSource()
+        mixer.stop()
+        frame = mixer.read()
+        assert frame == b""
+
+    def test_reset_clears_stopped_state(self):
+        """reset() allows the mixer to be reused after being stopped."""
+        mixer = MixerSource()
+        mixer.stop()
+        assert mixer.read() == b""
+        mixer.reset()
+        frame = mixer.read()
+        assert len(frame) == FRAME_SIZE
+        assert frame == b"\x00" * FRAME_SIZE
+
+    def test_is_audio_source(self):
+        """MixerSource should be a discord.AudioSource subclass."""
+        import discord
+        mixer = MixerSource()
+        assert isinstance(mixer, discord.AudioSource)
+
+
+class TestMixerShortFrames:
+    def test_short_frame_is_padded(self):
+        """If a source returns fewer bytes than FRAME_SIZE, pad with zeros."""
+        mixer = MixerSource()
+
+        class ShortSource:
+            def read(self):
+                # Return a frame that's only 100 bytes (too short)
+                return b"\x01" * 100
+
+        mixer.add(ShortSource())
+        frame = mixer.read()
+        assert len(frame) == FRAME_SIZE
 
 
 class TestMixerCleanup:
@@ -97,5 +154,5 @@ class TestMixerCleanup:
         mixer.cleanup()
         assert s1.cleaned_up
         assert s2.cleaned_up
-        # No more sources
+        # Cleanup stops the mixer, so it returns empty bytes
         assert mixer.read() == b""
