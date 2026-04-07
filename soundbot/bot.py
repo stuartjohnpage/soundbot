@@ -1,0 +1,340 @@
+import logging
+import random
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from . import config
+from .audio import validate_sound
+from .mixer import MixerSource
+from .pagination import paginate
+from .store import SoundStore
+
+logger = logging.getLogger("soundbot")
+
+SOUNDS_PER_BOARD_PAGE = 20  # 5 rows * 5 cols - 1 row for nav = 4*5
+
+
+def _admin_check() -> app_commands.check:
+    """Check that the invoking user has the configured admin role."""
+
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member):
+            return False
+        if not any(r.name == config.ADMIN_ROLE for r in interaction.user.roles):
+            raise app_commands.MissingRole(config.ADMIN_ROLE)
+        return True
+
+    return app_commands.check(predicate)
+
+
+class Soundboard(commands.Cog):
+    def __init__(self, bot: commands.Bot, store: SoundStore) -> None:
+        self.bot = bot
+        self.store = store
+        self.mixer: MixerSource | None = None
+        self.volume: float = config.DEFAULT_VOLUME / 100.0
+
+    # -- Voice management --
+
+    @app_commands.command(name="join", description="Bot joins your voice channel")
+    @_admin_check()
+    async def join(self, interaction: discord.Interaction) -> None:
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message(
+                "You must be in a voice channel.", ephemeral=True
+            )
+            return
+        channel = interaction.user.voice.channel
+        if interaction.guild.voice_client:
+            await interaction.guild.voice_client.move_to(channel)
+        else:
+            await channel.connect()
+        self.mixer = MixerSource()
+        await interaction.response.send_message(f"Joined **{channel.name}**.")
+
+    @app_commands.command(name="leave", description="Bot leaves the voice channel")
+    @_admin_check()
+    async def leave(self, interaction: discord.Interaction) -> None:
+        vc = interaction.guild.voice_client
+        if not vc:
+            await interaction.response.send_message(
+                "Not in a voice channel.", ephemeral=True
+            )
+            return
+        if self.mixer:
+            self.mixer.cleanup()
+            self.mixer = None
+        await vc.disconnect()
+        await interaction.response.send_message("Left the voice channel.")
+
+    # -- Playback helpers --
+
+    def _ensure_voice(self, interaction: discord.Interaction) -> discord.VoiceClient:
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            raise ValueError("Bot is not in a voice channel. Use `/join` first.")
+        return vc
+
+    async def _play_sound(
+        self, interaction: discord.Interaction, name: str
+    ) -> None:
+        try:
+            vc = self._ensure_voice(interaction)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        entry = self.store.get(name)
+        if not entry:
+            await interaction.response.send_message(
+                f"Sound **{name}** not found.", ephemeral=True
+            )
+            return
+
+        source = discord.FFmpegPCMAudio(
+            entry["file"],
+            options=f"-filter:a volume={self.volume}",
+        )
+        if self.mixer is None:
+            self.mixer = MixerSource()
+        self.mixer.add(source)
+
+        if not vc.is_playing():
+            vc.play(self.mixer)
+
+        self.store.increment_play_count(name)
+        logger.info(
+            "play sound=%s user=%s guild=%s channel=%s",
+            name,
+            interaction.user,
+            interaction.guild,
+            getattr(interaction.user.voice, "channel", None),
+        )
+        await interaction.response.send_message(
+            f"**{interaction.user.display_name}** played **{name}**"
+        )
+
+    # -- Sound name autocomplete --
+
+    async def _sound_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        matches = self.store.search(current)
+        return [
+            app_commands.Choice(name=n, value=n) for n, _ in matches[:25]
+        ]
+
+    # -- Commands --
+
+    @app_commands.command(name="play", description="Play a sound")
+    @app_commands.describe(name="Sound name")
+    @app_commands.autocomplete(name=_sound_autocomplete)
+    @_admin_check()
+    async def play(self, interaction: discord.Interaction, name: str) -> None:
+        await self._play_sound(interaction, name)
+
+    @app_commands.command(name="random", description="Play a random sound")
+    @app_commands.describe(category="Optional category filter")
+    @_admin_check()
+    async def random_sound(
+        self, interaction: discord.Interaction, category: str | None = None
+    ) -> None:
+        sounds = self.store.list_sounds(category=category)
+        if not sounds:
+            await interaction.response.send_message(
+                "No sounds found.", ephemeral=True
+            )
+            return
+        name, _ = random.choice(sounds)
+        await self._play_sound(interaction, name)
+
+    @app_commands.command(name="volume", description="Set playback volume (0-100)")
+    @app_commands.describe(level="Volume percentage (0-100)")
+    @_admin_check()
+    async def volume(self, interaction: discord.Interaction, level: int) -> None:
+        if not 0 <= level <= 100:
+            await interaction.response.send_message(
+                "Volume must be between 0 and 100.", ephemeral=True
+            )
+            return
+        self.volume = level / 100.0
+        await interaction.response.send_message(f"Volume set to **{level}%**.")
+
+    # -- Board --
+
+    @app_commands.command(name="board", description="Show sound button board")
+    @_admin_check()
+    async def board(self, interaction: discord.Interaction) -> None:
+        sounds = self.store.list_sounds()
+        if not sounds:
+            await interaction.response.send_message(
+                "No sounds in the library.", ephemeral=True
+            )
+            return
+        pages = paginate(sounds, per_page=SOUNDS_PER_BOARD_PAGE)
+        view = BoardView(self, pages, page=0)
+        embed = view.make_embed()
+        await interaction.response.send_message(embed=embed, view=view)
+
+    # -- CRUD commands --
+
+    @app_commands.command(name="addsound", description="Add a new sound")
+    @app_commands.describe(
+        name="Sound name",
+        file="Audio file to upload",
+        category="Optional category",
+    )
+    @_admin_check()
+    async def addsound(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        file: discord.Attachment,
+        category: str | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        dest = config.SOUNDS_DIR / file.filename
+        await file.save(dest)
+        try:
+            validate_sound(dest, config.MAX_DURATION)
+            self.store.add(
+                name, dest, category=category, uploaded_by=str(interaction.user)
+            )
+            self.store.save()
+        except ValueError as exc:
+            dest.unlink(missing_ok=True)
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        await interaction.followup.send(f"Added sound **{name}**.")
+
+    @app_commands.command(name="removesound", description="Remove a sound")
+    @app_commands.describe(name="Sound name")
+    @app_commands.autocomplete(name=_sound_autocomplete)
+    @_admin_check()
+    async def removesound(
+        self, interaction: discord.Interaction, name: str
+    ) -> None:
+        try:
+            self.store.remove(name)
+            self.store.save()
+        except KeyError:
+            await interaction.response.send_message(
+                f"Sound **{name}** not found.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(f"Removed sound **{name}**.")
+
+    @app_commands.command(name="renamesound", description="Rename a sound")
+    @app_commands.describe(old="Current name", new="New name")
+    @app_commands.autocomplete(old=_sound_autocomplete)
+    @_admin_check()
+    async def renamesound(
+        self, interaction: discord.Interaction, old: str, new: str
+    ) -> None:
+        try:
+            self.store.rename(old, new)
+            self.store.save()
+        except (KeyError, ValueError) as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Renamed **{old}** to **{new}**."
+        )
+
+    @app_commands.command(name="listsounds", description="List all sounds")
+    @app_commands.describe(category="Optional category filter")
+    @_admin_check()
+    async def listsounds(
+        self, interaction: discord.Interaction, category: str | None = None
+    ) -> None:
+        sounds = self.store.list_sounds(category=category)
+        if not sounds:
+            await interaction.response.send_message(
+                "No sounds found.", ephemeral=True
+            )
+            return
+        pages = paginate(sounds, per_page=20)
+        lines = []
+        for name, entry in pages[0]:
+            cat = entry.get("category") or "—"
+            plays = entry.get("play_count", 0)
+            lines.append(f"`{name}` | {cat} | {plays} plays")
+        embed = discord.Embed(
+            title="Sound Library",
+            description="\n".join(lines),
+        )
+        if len(pages) > 1:
+            embed.set_footer(text=f"Page 1/{len(pages)}")
+        await interaction.response.send_message(embed=embed)
+
+
+class BoardView(discord.ui.View):
+    def __init__(self, cog: Soundboard, pages, page: int = 0) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.pages = pages
+        self.page = page
+        self._build_buttons()
+
+    def _build_buttons(self) -> None:
+        self.clear_items()
+        for name, _ in self.pages[self.page]:
+            btn = discord.ui.Button(label=name, style=discord.ButtonStyle.primary)
+            btn.callback = self._make_callback(name)
+            self.add_item(btn)
+
+        if len(self.pages) > 1:
+            if self.page > 0:
+                prev_btn = discord.ui.Button(label="Previous", style=discord.ButtonStyle.secondary)
+                prev_btn.callback = self._prev
+                self.add_item(prev_btn)
+            if self.page < len(self.pages) - 1:
+                next_btn = discord.ui.Button(label="Next", style=discord.ButtonStyle.secondary)
+                next_btn.callback = self._next
+                self.add_item(next_btn)
+
+    def make_embed(self) -> discord.Embed:
+        return discord.Embed(
+            title="Soundboard",
+            description=f"Page {self.page + 1}/{len(self.pages)}",
+        )
+
+    def _make_callback(self, name: str):
+        async def callback(interaction: discord.Interaction):
+            await self.cog._play_sound(interaction, name)
+
+        return callback
+
+    async def _prev(self, interaction: discord.Interaction) -> None:
+        self.page -= 1
+        self._build_buttons()
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    async def _next(self, interaction: discord.Interaction) -> None:
+        self.page += 1
+        self._build_buttons()
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+
+def create_bot() -> commands.Bot:
+    intents = discord.Intents.default()
+    intents.message_content = True
+    bot = commands.Bot(command_prefix="!", intents=intents)
+
+    store = SoundStore(
+        metadata_path=config.METADATA_FILE,
+        sounds_dir=config.SOUNDS_DIR,
+    )
+
+    @bot.event
+    async def on_ready():
+        config.SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
+        store.scan_folder()
+        store.save()
+        await bot.add_cog(Soundboard(bot, store))
+        await bot.tree.sync()
+        logger.info("Bot ready as %s", bot.user)
+
+    return bot
