@@ -13,3 +13,5 @@ DEFAULT_VOLUME: int = int(os.getenv("DEFAULT_VOLUME", "50"))
 LOG_FILE: Path = Path(os.getenv("LOG_FILE", "./soundbot.log"))
 MAX_DURATION: float = 6.0
 SYNC_COMMANDS: bool = os.getenv("SYNC_COMMANDS", "true").lower() == "true"
+_guild_id = os.getenv("GUILD_ID", "")
+GUILD_ID: int | None = int(_guild_id) if _guild_id else None

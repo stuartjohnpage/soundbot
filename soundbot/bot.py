@@ -442,7 +442,12 @@ def create_bot() -> commands.Bot:
         store.save()
         await bot.add_cog(Soundboard(bot, store))
         if config.SYNC_COMMANDS:
-            await bot.tree.sync()
+            if config.GUILD_ID:
+                guild = discord.Object(id=config.GUILD_ID)
+                bot.tree.copy_global_to(guild=guild)
+                await bot.tree.sync(guild=guild)
+            else:
+                await bot.tree.sync()
 
     bot.setup_hook = setup_hook
 
