@@ -1,0 +1,1 @@
+- [project_soundbot.md](project_soundbot.md) - Soundbot project structure, testing framework, and TDD patterns

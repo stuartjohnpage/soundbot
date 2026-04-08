@@ -7,7 +7,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from . import config
-from .audio import validate_sound
+from .audio import extract_audio, has_video_stream, validate_sound
 from .mixer import MixerSource
 from .pagination import paginate
 from .store import SoundStore
@@ -125,7 +125,7 @@ class Soundboard(commands.Cog):
             getattr(interaction.user.voice, "channel", None),
         )
         await interaction.response.send_message(
-            f"**{interaction.user.display_name}** played **{name}**"
+            f"Playing **{name}**", ephemeral=True
         )
 
     # -- Sound name autocomplete --
@@ -215,6 +215,18 @@ class Soundboard(commands.Cog):
             return
         await file.save(dest)
         try:
+            if has_video_stream(dest):
+                audio_dest = dest.with_suffix(".mp3")
+                if audio_dest.exists():
+                    dest.unlink(missing_ok=True)
+                    await interaction.followup.send(
+                        f"A file named `{audio_dest.name}` already exists.",
+                        ephemeral=True,
+                    )
+                    return
+                extract_audio(dest, audio_dest)
+                dest.unlink(missing_ok=True)
+                dest = audio_dest
             validate_sound(dest, config.MAX_DURATION)
             self.store.add(
                 name, dest, category=category, uploaded_by=str(interaction.user)
