@@ -752,7 +752,7 @@ class TestV1BackCompat:
         assert store.get("airhorn")["uploaded_by"] == "stuart#1234"
 
     def test_v1_store_reports_version_for_migration(self, tmp_path):
-        """The store must expose loaded version so the migration code can decide to run."""
+        """The store must expose the startup version so the migration code can decide to run."""
         sounds_dir = tmp_path / "sounds"
         sounds_dir.mkdir()
         v1_data = {"version": 1, "sounds": {}}
@@ -762,7 +762,7 @@ class TestV1BackCompat:
             metadata_path=tmp_path / "sounds.json",
             sounds_dir=sounds_dir,
         )
-        assert store.loaded_version == 1
+        assert store.startup_version == 1
 
     def test_new_store_reports_current_version(self, tmp_path):
         """A fresh store (no file) reports the current schema version (2)."""
@@ -772,7 +772,31 @@ class TestV1BackCompat:
             metadata_path=tmp_path / "sounds.json",
             sounds_dir=sounds_dir,
         )
-        assert store.loaded_version == 2
+        assert store.startup_version == 2
+
+    def test_startup_version_not_mutated_by_save(self, tmp_path):
+        """save() must not touch startup_version — it is a load-time snapshot.
+
+        The migration gate depends on this invariant: if save() flipped the
+        in-memory startup version, a setup_hook save between load() and
+        on_ready would silently close the migration gate and strand every
+        v1 user with empty tags.
+        """
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        v1_data = {"version": 1, "sounds": {}}
+        (tmp_path / "sounds.json").write_text(json.dumps(v1_data))
+
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        assert store.startup_version == 1
+
+        store.save()
+
+        # startup_version must NOT have moved to 2.
+        assert store.startup_version == 1
 
 
 class TestMigrationPureFunction:

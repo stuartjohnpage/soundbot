@@ -71,7 +71,7 @@ def test_migration_runs_when_version_is_v1(tmp_path):
         },
     )
     store = _make_store(tmp_path)
-    assert store.loaded_version == 1
+    assert store.startup_version == 1
 
     guilds = [
         _FakeGuild("My Cool Server", ["airhorn"]),
@@ -87,15 +87,16 @@ def test_migration_runs_when_version_is_v1(tmp_path):
     # Persisted to disk at v2
     data = json.loads((tmp_path / "sounds.json").read_text())
     assert data["version"] == 2
-    assert store.loaded_version == 2
+    # startup_version is a frozen load-time snapshot — it stays at 1.
+    assert store.startup_version == 1
 
 
 def test_migration_skipped_when_already_v2(tmp_path):
+    # Seed an explicit v2 file so startup_version reflects v2 at load time.
+    metadata = tmp_path / "sounds.json"
+    metadata.write_text(json.dumps({"version": 2, "sounds": {"airhorn": _entry(tags=[])}}))
     store = _make_store(tmp_path)
-    # First create at v2 by saving with the current store
-    store.replace_sounds({"airhorn": _entry(tags=[])})
-    store.save()
-    assert store.loaded_version == 2
+    assert store.startup_version == 2
 
     guild = _FakeGuild("server", ["airhorn"])
     asyncio.run(run_migration_if_needed(store, [guild]))
@@ -173,7 +174,7 @@ def test_migration_skipped_when_no_guilds_connected(tmp_path):
     """
     _seed_v1(tmp_path, {"airhorn": _entry()})
     store = _make_store(tmp_path)
-    assert store.loaded_version == 1
+    assert store.startup_version == 1
 
     # No guilds connected
     asyncio.run(run_migration_if_needed(store, []))
@@ -182,6 +183,55 @@ def test_migration_skipped_when_no_guilds_connected(tmp_path):
     data = json.loads((tmp_path / "sounds.json").read_text())
     assert data["version"] == 1
     # Store still reports v1 so the next on_ready will retry
-    assert store.loaded_version == 1
+    assert store.startup_version == 1
     # Sound is untouched (no spurious tags or empty-list backfill mismatch)
     assert "tags" not in data["sounds"]["airhorn"] or data["sounds"]["airhorn"]["tags"] == []
+
+
+def test_migration_runs_even_after_setup_hook_save(tmp_path):
+    """Regression: the real startup sequence saves before on_ready fires.
+
+    bot.setup_hook calls store.save() to persist any scan_folder additions.
+    That write flushes a v2 file to disk. on_ready then fires and calls
+    run_migration_if_needed. The gate must still let the migration run,
+    because the *on-disk-at-load-time* version was v1 — the subsequent
+    save() must not close the gate.
+
+    Before the fix this test fails because save() mutates loaded_version
+    to CURRENT_SCHEMA_VERSION, causing the migration to early-return
+    and leaving every sound with tags=[] permanently.
+    """
+    _seed_v1(
+        tmp_path,
+        {
+            "airhorn": _entry(),
+            "rimshot": _entry(),
+        },
+    )
+    # Step 1: store loads v1 file
+    store = _make_store(tmp_path)
+    assert store.startup_version == 1
+
+    # Step 2: simulate setup_hook — it calls save() unconditionally after
+    # scan_folder, which flushes the sounds dict to disk at v2.
+    store.save()
+
+    # The startup snapshot must survive the save — it reflects the
+    # on-disk version at load time, not the current in-memory version.
+    assert store.startup_version == 1
+
+    # Step 3: on_ready fires and runs the migration against connected guilds.
+    guilds = [
+        _FakeGuild("My Cool Server", ["airhorn"]),
+        _FakeGuild("Other Place", ["rimshot"]),
+    ]
+    asyncio.run(run_migration_if_needed(store, guilds))
+
+    # Migration must have actually tagged the sounds.
+    assert store.get("airhorn")["tags"] == ["my-cool-server"]
+    assert store.get("rimshot")["tags"] == ["other-place"]
+    # And the file on disk is now v2 with the correct tags.
+    data = json.loads((tmp_path / "sounds.json").read_text())
+    assert data["version"] == 2
+    assert data["sounds"]["airhorn"]["tags"] == ["my-cool-server"]
+    assert data["sounds"]["rimshot"]["tags"] == ["other-place"]

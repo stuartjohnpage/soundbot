@@ -707,8 +707,8 @@ def create_bot() -> commands.Bot:
             await run_migration_if_needed(store, list(bot.guilds))
         except Exception:
             logger.exception(
-                "tag migration failed; sounds.json left at v%d for retry",
-                store.loaded_version,
+                "tag migration failed; sounds.json left at v%d (startup) for retry",
+                store.startup_version,
             )
 
     @bot.event

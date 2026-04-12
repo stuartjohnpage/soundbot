@@ -59,7 +59,12 @@ class SoundStore:
         self._metadata_path = metadata_path
         self._sounds_dir = sounds_dir
         self._sounds: dict[str, dict] = {}
-        self.loaded_version: int = CURRENT_SCHEMA_VERSION
+        # Version of the file on disk at the moment load() was called. Set
+        # exactly once here and NEVER mutated by subsequent writes — the
+        # migration gate needs a frozen "what did we open?" snapshot so a
+        # setup_hook save() between load and on_ready can't close the gate
+        # before run_migration_if_needed has had a chance to look.
+        self.startup_version: int = CURRENT_SCHEMA_VERSION
         self.load()
 
     @staticmethod
@@ -220,16 +225,19 @@ class SoundStore:
         tmp = self._metadata_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(self._metadata_path)
-        self.loaded_version = CURRENT_SCHEMA_VERSION
+        # Intentionally does NOT mutate self.startup_version — that field is a
+        # frozen snapshot of the on-disk version at load time, used by the
+        # migration gate. Writing a new file to disk doesn't change what the
+        # store was constructed against.
 
     def load(self) -> None:
         if self._metadata_path.exists():
             data = json.loads(self._metadata_path.read_text())
             self._sounds = data.get("sounds", {})
-            self.loaded_version = data.get("version", 1)
+            self.startup_version = data.get("version", 1)
         else:
             self._sounds = {}
-            self.loaded_version = CURRENT_SCHEMA_VERSION
+            self.startup_version = CURRENT_SCHEMA_VERSION
         # Ensure every entry has a tags field (backfill on load for v1)
         for entry in self._sounds.values():
             if "tags" not in entry:

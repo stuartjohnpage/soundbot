@@ -50,22 +50,28 @@ async def run_migration_if_needed(store: SoundStore, guilds) -> None:
     """Backfill v1 sounds.json with sanitized-guild-name tags from each
     connected guild's Discord soundboard, then save at v2.
 
-    No-op when the store is already at v2. No-op when the guild list is
-    empty (we have nothing to match against, and committing v2 anyway
-    would burn the retry opportunity forever).
+    No-op when the store's on-disk version at startup was already v2.
+    No-op when the guild list is empty (we have nothing to match against,
+    and committing v2 anyway would burn the retry opportunity forever).
+
+    Why the gate reads ``store.startup_version`` and not the in-memory
+    schema version: ``bot.setup_hook`` writes the store to disk via
+    ``store.save()`` BEFORE ``on_ready`` fires. That save legitimately
+    flushes the file to v2. If the gate looked at a "current version"
+    field that ``save()`` mutates, the migration would early-return here
+    on every real startup and every v1 user would silently end up with
+    empty tags. ``startup_version`` is a frozen snapshot of what was on
+    disk when the store was constructed, set once in ``load()``, so the
+    gate reflects the pre-setup-hook state.
 
     Atomic on fetch failures: if any guild's fetch raises, no save
-    happens and the file stays at v1 so the next startup retries. Note
-    that an in-progress _save_loop tick (60s cadence) could in theory
-    persist a half-migrated v2 dict if the migration succeeded in
-    memory but raised between replace_sounds and save — kept simple
-    here because save() doesn't currently raise on this path.
+    happens and the file stays at v1 so the next startup retries.
 
-    The `guilds` parameter is duck-typed: it must yield objects with
-    `.name` and an awaitable `fetch_soundboard_sounds()` method. Tested
-    against fake guild objects in tests/test_migration.py.
+    The ``guilds`` parameter is duck-typed: it must yield objects with
+    ``.name`` and an awaitable ``fetch_soundboard_sounds()`` method.
+    Tested against fake guild objects in tests/test_migration.py.
     """
-    if store.loaded_version >= CURRENT_SCHEMA_VERSION:
+    if store.startup_version >= CURRENT_SCHEMA_VERSION:
         return
 
     if not guilds:
@@ -75,8 +81,8 @@ async def run_migration_if_needed(store: SoundStore, guilds) -> None:
         # leave every sound untagged forever.
         logger.warning(
             "tag migration skipped: bot has no connected guilds yet; "
-            "leaving sounds.json at v%d for retry on next startup",
-            store.loaded_version,
+            "leaving sounds.json at v%d (startup) for retry on next startup",
+            store.startup_version,
         )
         return
 
@@ -100,7 +106,7 @@ async def run_migration_if_needed(store: SoundStore, guilds) -> None:
                 continue
         guild_map[guild_tag] = sanitized_sound_names
 
-    v1_data = {"version": store.loaded_version, "sounds": store.raw_sounds()}
+    v1_data = {"version": store.startup_version, "sounds": store.raw_sounds()}
     v2_data = migrate_v1_to_v2(v1_data, guild_map)
     # Swap in the migrated dict via the public hook and persist atomically.
     store.replace_sounds(v2_data["sounds"])
