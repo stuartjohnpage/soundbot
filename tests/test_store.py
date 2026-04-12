@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -691,3 +692,121 @@ class TestV1BackCompat:
             sounds_dir=sounds_dir,
         )
         assert store.loaded_version == 2
+
+
+class TestMigrationPureFunction:
+    """Pure-function migration: v1 store dict + guild→sounds mapping → v2 store dict.
+
+    The mapping is supplied by the caller; no Discord API is involved here.
+    """
+
+    def _v1(self, sounds: dict) -> dict:
+        return {"version": 1, "sounds": sounds}
+
+    def _entry(self, **overrides) -> dict:
+        base = {
+            "file": "/tmp/x.mp3",
+            "category": None,
+            "uploaded_by": "u#1",
+            "uploaded_at": "2025-01-01T00:00:00+00:00",
+            "play_count": 0,
+        }
+        base.update(overrides)
+        return base
+
+    def test_zero_guild_match_leaves_tags_empty(self):
+        from soundbot.store import migrate_v1_to_v2
+
+        v1 = self._v1({"airhorn": self._entry()})
+        guild_map: dict[str, set[str]] = {
+            "alpha": {"rimshot"},
+            "beta": {"klaxon"},
+        }
+        v2 = migrate_v1_to_v2(v1, guild_map)
+
+        assert v2["version"] == 2
+        assert v2["sounds"]["airhorn"]["tags"] == []
+
+    def test_one_guild_match_applies_one_tag(self):
+        from soundbot.store import migrate_v1_to_v2
+
+        v1 = self._v1({"airhorn": self._entry()})
+        guild_map = {
+            "alpha": {"airhorn"},
+            "beta": {"klaxon"},
+        }
+        v2 = migrate_v1_to_v2(v1, guild_map)
+
+        assert v2["sounds"]["airhorn"]["tags"] == ["alpha"]
+
+    def test_multi_guild_match_applies_multiple_tags(self):
+        from soundbot.store import migrate_v1_to_v2
+
+        v1 = self._v1({"airhorn": self._entry()})
+        guild_map = {
+            "alpha": {"airhorn"},
+            "beta": {"airhorn"},
+            "gamma": {"airhorn"},
+        }
+        v2 = migrate_v1_to_v2(v1, guild_map)
+
+        assert v2["sounds"]["airhorn"]["tags"] == ["alpha", "beta", "gamma"]
+
+    def test_migration_preserves_existing_fields(self):
+        from soundbot.store import migrate_v1_to_v2
+
+        v1 = self._v1({
+            "airhorn": self._entry(
+                file="/data/airhorn.mp3",
+                category="memes",
+                uploaded_by="stuart#1234",
+                play_count=42,
+            )
+        })
+        guild_map = {"alpha": {"airhorn"}}
+        v2 = migrate_v1_to_v2(v1, guild_map)
+
+        e = v2["sounds"]["airhorn"]
+        assert e["file"] == "/data/airhorn.mp3"
+        assert e["category"] == "memes"
+        assert e["uploaded_by"] == "stuart#1234"
+        assert e["play_count"] == 42
+        assert e["tags"] == ["alpha"]
+
+    def test_migration_does_not_mutate_input(self):
+        from soundbot.store import migrate_v1_to_v2
+
+        v1 = self._v1({"airhorn": self._entry()})
+        guild_map = {"alpha": {"airhorn"}}
+        original_v1 = json.loads(json.dumps(v1))  # deep copy snapshot
+
+        migrate_v1_to_v2(v1, guild_map)
+
+        assert v1 == original_v1, "migration must not mutate input v1 dict"
+
+    def test_migration_handles_pre_existing_tags_field(self):
+        """If a v1 entry somehow already has tags, the migration appends to them."""
+        from soundbot.store import migrate_v1_to_v2
+
+        v1 = self._v1({
+            "airhorn": self._entry(tags=["pre-existing"])
+        })
+        guild_map = {"alpha": {"airhorn"}}
+        v2 = migrate_v1_to_v2(v1, guild_map)
+
+        assert v2["sounds"]["airhorn"]["tags"] == ["alpha", "pre-existing"]
+
+    def test_migration_returns_v2_marker(self):
+        from soundbot.store import migrate_v1_to_v2
+
+        v1 = self._v1({})
+        v2 = migrate_v1_to_v2(v1, {})
+        assert v2["version"] == 2
+
+    def test_migration_dedupes_overlap_with_existing_tags(self):
+        from soundbot.store import migrate_v1_to_v2
+
+        v1 = self._v1({"airhorn": self._entry(tags=["alpha"])})
+        guild_map = {"alpha": {"airhorn"}}
+        v2 = migrate_v1_to_v2(v1, guild_map)
+        assert v2["sounds"]["airhorn"]["tags"] == ["alpha"]
