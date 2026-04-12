@@ -4,8 +4,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+_TAG_RE = re.compile(r"^[a-z0-9-]+$")
 _MAX_NAME_LENGTH = 32
+_MAX_TAG_LENGTH = 32
 _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus", ".webm"}
+
+CURRENT_SCHEMA_VERSION = 2
 
 
 class SoundStore:
@@ -13,6 +17,7 @@ class SoundStore:
         self._metadata_path = metadata_path
         self._sounds_dir = sounds_dir
         self._sounds: dict[str, dict] = {}
+        self.loaded_version: int = CURRENT_SCHEMA_VERSION
         self.load()
 
     @staticmethod
@@ -27,6 +32,21 @@ class SoundStore:
         if not sanitized:
             raise ValueError(f"Cannot derive a valid name from '{raw}'")
         return sanitized.lower()
+
+    @staticmethod
+    def _validate_tag(tag: str) -> None:
+        if not tag or len(tag) > _MAX_TAG_LENGTH or not _TAG_RE.match(tag):
+            raise ValueError(
+                f"Tag '{tag}' is invalid: must be 1-{_MAX_TAG_LENGTH} characters of [a-z0-9-]"
+            )
+
+    @staticmethod
+    def sanitize_tag(raw: str) -> str:
+        """Sanitize a raw string into a valid tag, or raise ValueError."""
+        sanitized = re.sub(r"[^a-zA-Z0-9-]", "-", raw).strip("-")[:_MAX_TAG_LENGTH].lower()
+        if not sanitized:
+            raise ValueError(f"Cannot derive a valid tag from '{raw}'")
+        return sanitized
 
     def add(
         self,
@@ -45,7 +65,42 @@ class SoundStore:
             "uploaded_by": uploaded_by,
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
             "play_count": 0,
+            "tags": [],
         }
+
+    def add_tag(self, name: str, tag: str) -> None:
+        self._validate_tag(tag)
+        key = name.lower()
+        if key not in self._sounds:
+            raise KeyError(f"Sound '{name}' not found")
+        entry = self._sounds[key]
+        tags = entry.setdefault("tags", [])
+        if tag not in tags:
+            tags.append(tag)
+            tags.sort()
+
+    def remove_tag(self, name: str, tag: str) -> None:
+        key = name.lower()
+        if key not in self._sounds:
+            raise KeyError(f"Sound '{name}' not found")
+        tags = self._sounds[key].setdefault("tags", [])
+        if tag not in tags:
+            raise KeyError(f"Tag '{tag}' not present on sound '{name}'")
+        tags.remove(tag)
+
+    def list_tags(self, name: str) -> list[str]:
+        key = name.lower()
+        if key not in self._sounds:
+            raise KeyError(f"Sound '{name}' not found")
+        return list(self._sounds[key].get("tags", []))
+
+    def global_tags(self) -> list[tuple[str, int]]:
+        """Return all tags with usage counts, sorted by count desc then name asc."""
+        counts: dict[str, int] = {}
+        for entry in self._sounds.values():
+            for tag in entry.get("tags", []):
+                counts[tag] = counts.get(tag, 0) + 1
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
     def rename(self, old_name: str, new_name: str) -> None:
         self._validate_name(new_name)
@@ -69,11 +124,16 @@ class SoundStore:
     def get(self, name: str) -> dict | None:
         return self._sounds.get(name.lower())
 
-    def list_sounds(self, category: str | None = None) -> list[tuple[str, dict]]:
+    def list_sounds(
+        self, category: str | None = None, tag: str | None = None
+    ) -> list[tuple[str, dict]]:
         results = []
         for name, entry in self._sounds.items():
-            if category is None or entry.get("category") == category:
-                results.append((name, entry))
+            if category is not None and entry.get("category") != category:
+                continue
+            if tag is not None and tag not in entry.get("tags", []):
+                continue
+            results.append((name, entry))
         return sorted(results, key=lambda x: x[0])
 
     def search(self, query: str) -> list[tuple[str, dict]]:
@@ -98,17 +158,24 @@ class SoundStore:
         self._sounds[key]["play_count"] += 1
 
     def save(self) -> None:
-        data = {"sounds": self._sounds, "version": 1}
+        data = {"sounds": self._sounds, "version": CURRENT_SCHEMA_VERSION}
         tmp = self._metadata_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(self._metadata_path)
+        self.loaded_version = CURRENT_SCHEMA_VERSION
 
     def load(self) -> None:
         if self._metadata_path.exists():
             data = json.loads(self._metadata_path.read_text())
             self._sounds = data.get("sounds", {})
+            self.loaded_version = data.get("version", 1)
         else:
             self._sounds = {}
+            self.loaded_version = CURRENT_SCHEMA_VERSION
+        # Ensure every entry has a tags field (backfill on load for v1)
+        for entry in self._sounds.values():
+            if "tags" not in entry:
+                entry["tags"] = []
 
     def scan_folder(self) -> None:
         tracked_files = {Path(entry["file"]).resolve() for entry in self._sounds.values()}

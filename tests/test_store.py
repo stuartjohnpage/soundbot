@@ -349,7 +349,7 @@ class TestPersistence:
         data = json.loads(metadata_path.read_text())
         assert "sounds" in data
         assert "version" in data
-        assert data["version"] == 1
+        assert data["version"] == 2
         assert "airhorn" in data["sounds"]
 
 
@@ -452,3 +452,242 @@ class TestFolderScan:
         # because it's already tracked (just under a different path form)
         assert store.get("airhorn") is None
         assert len(store.list_sounds()) == 1
+
+
+class TestTags:
+    def _store_with_sound(self, tmp_path, name="airhorn"):
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        f = sounds_dir / f"{name}.mp3"
+        f.write_bytes(b"fake")
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        store.add(name, f)
+        return store
+
+    def test_new_sound_starts_with_empty_tags(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        assert store.get("airhorn")["tags"] == []
+
+    def test_add_tag_appends_to_list(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        store.add_tag("airhorn", "meme")
+        assert store.get("airhorn")["tags"] == ["meme"]
+
+    def test_add_tag_dedupes_on_double_add(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        store.add_tag("airhorn", "meme")
+        store.add_tag("airhorn", "meme")
+        assert store.get("airhorn")["tags"] == ["meme"]
+
+    def test_add_tag_stores_sorted(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        store.add_tag("airhorn", "meme")
+        store.add_tag("airhorn", "alpha")
+        store.add_tag("airhorn", "zulu")
+        assert store.get("airhorn")["tags"] == ["alpha", "meme", "zulu"]
+
+    def test_add_tag_rejects_invalid_chars(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        with pytest.raises(ValueError, match="invalid"):
+            store.add_tag("airhorn", "Bad Tag!")
+
+    def test_add_tag_rejects_uppercase(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        with pytest.raises(ValueError, match="invalid"):
+            store.add_tag("airhorn", "MyTag")
+
+    def test_add_tag_rejects_too_long(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        with pytest.raises(ValueError, match="invalid"):
+            store.add_tag("airhorn", "a" * 33)
+
+    def test_add_tag_rejects_empty(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        with pytest.raises(ValueError, match="invalid"):
+            store.add_tag("airhorn", "")
+
+    def test_add_tag_accepts_alphanumeric_and_hyphen(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        store.add_tag("airhorn", "my-server-2")
+        assert "my-server-2" in store.get("airhorn")["tags"]
+
+    def test_add_tag_unknown_sound_raises(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        with pytest.raises(KeyError):
+            store.add_tag("nope", "meme")
+
+    def test_remove_tag_removes_existing(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        store.add_tag("airhorn", "meme")
+        store.add_tag("airhorn", "funny")
+        store.remove_tag("airhorn", "meme")
+        assert store.get("airhorn")["tags"] == ["funny"]
+
+    def test_remove_tag_unknown_tag_raises(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        store.add_tag("airhorn", "meme")
+        with pytest.raises(KeyError):
+            store.remove_tag("airhorn", "nope")
+
+    def test_remove_tag_unknown_sound_raises(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        with pytest.raises(KeyError):
+            store.remove_tag("nope", "meme")
+
+    def test_list_tags_for_sound(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        store.add_tag("airhorn", "meme")
+        store.add_tag("airhorn", "funny")
+        assert store.list_tags("airhorn") == ["funny", "meme"]
+
+    def test_list_tags_unknown_sound_raises(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        with pytest.raises(KeyError):
+            store.list_tags("nope")
+
+    def test_global_tags_returns_counts_sorted_desc(self, tmp_path):
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        for n in ["a", "b", "c"]:
+            f = sounds_dir / f"{n}.mp3"
+            f.write_bytes(b"fake")
+        store = SoundStore(metadata_path=tmp_path / "sounds.json", sounds_dir=sounds_dir)
+        for n in ["a", "b", "c"]:
+            store.add(n, sounds_dir / f"{n}.mp3")
+        store.add_tag("a", "meme")
+        store.add_tag("a", "funny")
+        store.add_tag("b", "meme")
+        store.add_tag("b", "funny")
+        store.add_tag("c", "meme")
+
+        result = store.global_tags()
+        # meme: 3, funny: 2 — sorted by count desc
+        assert result == [("meme", 3), ("funny", 2)]
+
+    def test_global_tags_returns_empty_when_no_tags(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        assert store.global_tags() == []
+
+    def test_list_sounds_filtered_by_tag(self, tmp_path):
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        for n in ["a", "b", "c"]:
+            f = sounds_dir / f"{n}.mp3"
+            f.write_bytes(b"fake")
+        store = SoundStore(metadata_path=tmp_path / "sounds.json", sounds_dir=sounds_dir)
+        for n in ["a", "b", "c"]:
+            store.add(n, sounds_dir / f"{n}.mp3")
+        store.add_tag("a", "meme")
+        store.add_tag("c", "meme")
+
+        result = store.list_sounds(tag="meme")
+        names = [s[0] for s in result]
+        assert names == ["a", "c"]
+
+    def test_list_sounds_with_no_tag_filter_returns_all(self, tmp_path):
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        for n in ["a", "b"]:
+            f = sounds_dir / f"{n}.mp3"
+            f.write_bytes(b"fake")
+        store = SoundStore(metadata_path=tmp_path / "sounds.json", sounds_dir=sounds_dir)
+        for n in ["a", "b"]:
+            store.add(n, sounds_dir / f"{n}.mp3")
+        store.add_tag("a", "meme")
+        # No filter → both
+        result = store.list_sounds()
+        assert len(result) == 2
+
+    def test_save_writes_version_2(self, tmp_path):
+        import json
+
+        store = self._store_with_sound(tmp_path)
+        store.save()
+        data = json.loads((tmp_path / "sounds.json").read_text())
+        assert data["version"] == 2
+
+    def test_save_persists_tags(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        store.add_tag("airhorn", "meme")
+        store.add_tag("airhorn", "funny")
+        store.save()
+
+        # Reload
+        store2 = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=tmp_path / "sounds",
+        )
+        assert store2.get("airhorn")["tags"] == ["funny", "meme"]
+
+
+class TestV1BackCompat:
+    def test_loads_v1_file_without_tags(self, tmp_path):
+        """A v1 sounds.json file (no tags) must load and every entry gets tags: []."""
+        import json
+
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        f = sounds_dir / "airhorn.mp3"
+        f.write_bytes(b"fake")
+
+        v1_data = {
+            "version": 1,
+            "sounds": {
+                "airhorn": {
+                    "file": str(f),
+                    "category": "memes",
+                    "uploaded_by": "stuart#1234",
+                    "uploaded_at": "2025-01-01T00:00:00+00:00",
+                    "play_count": 5,
+                },
+                "rimshot": {
+                    "file": str(sounds_dir / "rimshot.mp3"),
+                    "category": None,
+                    "uploaded_by": "user#0001",
+                    "uploaded_at": "2025-01-02T00:00:00+00:00",
+                    "play_count": 0,
+                },
+            },
+        }
+        (tmp_path / "sounds.json").write_text(json.dumps(v1_data))
+
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+
+        # Both entries should be loaded with empty tags
+        assert store.get("airhorn")["tags"] == []
+        assert store.get("rimshot")["tags"] == []
+        # Existing fields preserved
+        assert store.get("airhorn")["category"] == "memes"
+        assert store.get("airhorn")["play_count"] == 5
+        assert store.get("airhorn")["uploaded_by"] == "stuart#1234"
+
+    def test_v1_store_reports_version_for_migration(self, tmp_path):
+        """The store must expose loaded version so the migration code can decide to run."""
+        import json
+
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        v1_data = {"version": 1, "sounds": {}}
+        (tmp_path / "sounds.json").write_text(json.dumps(v1_data))
+
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        assert store.loaded_version == 1
+
+    def test_new_store_reports_current_version(self, tmp_path):
+        """A fresh store (no file) reports the current schema version (2)."""
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        assert store.loaded_version == 2
