@@ -197,12 +197,9 @@ class Soundboard(commands.Cog):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         # If a tag was already typed in the same interaction, restrict to sounds
-        # carrying that tag.
-        tag = None
-        try:
-            tag = interaction.namespace.tag
-        except AttributeError:
-            pass
+        # carrying that tag. Namespace returns None (not AttributeError) for
+        # absent options, so commands without a `tag` field fall through cleanly.
+        tag = getattr(interaction.namespace, "tag", None)
         if tag:
             tagged = {n for n, _ in self.store.list_sounds(tag=tag)}
             matches = [(n, e) for n, e in self.store.search(current) if n in tagged]
@@ -229,11 +226,7 @@ class Soundboard(commands.Cog):
 
         Reads the `sound` option from the same interaction's namespace.
         """
-        sound_name = None
-        try:
-            sound_name = interaction.namespace.sound
-        except AttributeError:
-            pass
+        sound_name = getattr(interaction.namespace, "sound", None)
         if not sound_name:
             return []
         try:
@@ -574,7 +567,9 @@ class Soundboard(commands.Cog):
             self.store.remove_tag(sound, tag)
             self.store.save()
         except KeyError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            # KeyError.__str__ wraps the message in quotes; pull the raw arg.
+            msg = exc.args[0] if exc.args else "Not found."
+            await interaction.response.send_message(msg, ephemeral=True)
             return
         await interaction.response.send_message(
             f"Removed `{tag}` from **{sound}**.", ephemeral=True
