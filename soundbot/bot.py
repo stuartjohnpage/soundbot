@@ -95,7 +95,7 @@ class Soundboard(commands.Cog):
         return vc
 
     async def _play_sound(
-        self, interaction: discord.Interaction, name: str
+        self, interaction: discord.Interaction, name: str, *, suppress_reply: bool = False
     ) -> None:
         try:
             vc = self._ensure_voice(interaction)
@@ -126,9 +126,10 @@ class Soundboard(commands.Cog):
             interaction.guild,
             getattr(interaction.user.voice, "channel", None),
         )
-        await interaction.response.send_message(
-            f"Playing **{name}**", ephemeral=True
-        )
+        if not suppress_reply:
+            await interaction.response.send_message(
+                f"Playing **{name}**", ephemeral=True
+            )
 
     # -- Sound name autocomplete --
 
@@ -380,7 +381,9 @@ class Soundboard(commands.Cog):
 
 class BoardView(discord.ui.View):
     def __init__(self, cog: Soundboard, pages, page: int = 0) -> None:
-        super().__init__(timeout=300)
+        # timeout=None: buttons stay active until the bot restarts. Views aren't
+        # persistent, so any existing boards go dead on restart — users re-run /board.
+        super().__init__(timeout=None)
         self.cog = cog
         self.pages = pages
         self.page = page
@@ -411,7 +414,9 @@ class BoardView(discord.ui.View):
 
     def _make_callback(self, name: str):
         async def callback(interaction: discord.Interaction):
-            await self.cog._play_sound(interaction, name)
+            await self.cog._play_sound(interaction, name, suppress_reply=True)
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
         return callback
 
