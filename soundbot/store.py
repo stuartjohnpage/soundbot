@@ -13,6 +13,32 @@ _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus", ".webm"}
 CURRENT_SCHEMA_VERSION = 2
 
 
+def parse_tags(raw: str | None) -> list[str]:
+    """Parse a user-supplied comma-separated tag string into a sorted list.
+
+    - None or empty -> [].
+    - Each element is lowercased and validated against the same rules
+      as add_tag (1-32 chars of [a-z0-9-]).
+    - Empty elements (e.g. trailing commas) are skipped.
+    - Duplicates are removed.
+    - Raises ValueError for any invalid element — the caller can show
+      the message to the user before any side effects.
+    """
+    if not raw:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw_element in raw.split(","):
+        element = raw_element.strip().lower()
+        if not element:
+            continue
+        SoundStore._validate_tag(element)
+        if element not in seen:
+            seen.add(element)
+            out.append(element)
+    return sorted(out)
+
+
 def migrate_v1_to_v2(
     v1_data: dict, guild_sound_map: dict[str, set[str]]
 ) -> dict:

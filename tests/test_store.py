@@ -810,3 +810,53 @@ class TestMigrationPureFunction:
         guild_map = {"alpha": {"airhorn"}}
         v2 = migrate_v1_to_v2(v1, guild_map)
         assert v2["sounds"]["airhorn"]["tags"] == ["alpha"]
+
+
+class TestParseTags:
+    def test_parses_comma_separated(self):
+        from soundbot.store import parse_tags
+
+        assert parse_tags("meme,funny,dave") == ["dave", "funny", "meme"]
+
+    def test_strips_whitespace(self):
+        from soundbot.store import parse_tags
+
+        assert parse_tags("meme , funny , dave") == ["dave", "funny", "meme"]
+
+    def test_dedupes(self):
+        from soundbot.store import parse_tags
+
+        assert parse_tags("meme,meme,funny") == ["funny", "meme"]
+
+    def test_empty_string_returns_empty_list(self):
+        from soundbot.store import parse_tags
+
+        assert parse_tags("") == []
+
+    def test_none_returns_empty_list(self):
+        from soundbot.store import parse_tags
+
+        assert parse_tags(None) == []
+
+    def test_skips_empty_elements(self):
+        from soundbot.store import parse_tags
+
+        # Trailing comma, double commas
+        assert parse_tags("meme,,funny,") == ["funny", "meme"]
+
+    def test_lowercases(self):
+        from soundbot.store import parse_tags
+
+        assert parse_tags("MEME,Funny") == ["funny", "meme"]
+
+    def test_rejects_invalid_element(self):
+        from soundbot.store import parse_tags
+
+        with pytest.raises(ValueError, match="invalid"):
+            parse_tags("meme,bad tag!")
+
+    def test_rejects_too_long_element(self):
+        from soundbot.store import parse_tags
+
+        with pytest.raises(ValueError, match="invalid"):
+            parse_tags("meme," + "a" * 33)

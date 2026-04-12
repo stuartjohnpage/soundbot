@@ -10,7 +10,12 @@ from . import config
 from .audio import extract_audio, has_video_stream, validate_sound
 from .mixer import MixerSource
 from .pagination import paginate
-from .store import CURRENT_SCHEMA_VERSION, SoundStore, migrate_v1_to_v2
+from .store import (
+    CURRENT_SCHEMA_VERSION,
+    SoundStore,
+    migrate_v1_to_v2,
+    parse_tags,
+)
 
 logger = logging.getLogger("soundbot")
 
@@ -314,6 +319,7 @@ class Soundboard(commands.Cog):
         name="Sound name",
         file="Audio file to upload",
         category="Optional category",
+        tags="Optional comma-separated tags (e.g. meme,funny,dave)",
     )
     @_admin_check()
     async def addsound(
@@ -322,8 +328,15 @@ class Soundboard(commands.Cog):
         name: str,
         file: discord.Attachment,
         category: str | None = None,
+        tags: str | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
+        # Validate tags before any file I/O so we fail cleanly on bad input.
+        try:
+            tag_list = parse_tags(tags)
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
         # Sanitize filename to prevent path traversal
         safe_name = Path(file.filename).name
         dest = config.SOUNDS_DIR / safe_name
@@ -348,12 +361,17 @@ class Soundboard(commands.Cog):
             self.store.add(
                 name, dest, category=category, uploaded_by=str(interaction.user)
             )
+            for tag in tag_list:
+                self.store.add_tag(name, tag)
             self.store.save()
         except ValueError as exc:
             dest.unlink(missing_ok=True)
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        await interaction.followup.send(f"Added sound **{name}**.")
+        msg = f"Added sound **{name}**."
+        if tag_list:
+            msg += f" Tagged: {', '.join(f'`{t}`' for t in tag_list)}."
+        await interaction.followup.send(msg)
 
     @app_commands.command(name="removesound", description="Remove a sound")
     @app_commands.describe(name="Sound name")
