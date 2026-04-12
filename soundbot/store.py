@@ -13,6 +13,13 @@ _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus", ".webm"}
 CURRENT_SCHEMA_VERSION = 2
 
 
+def _validate_tag(tag: str) -> None:
+    if not tag or len(tag) > _MAX_TAG_LENGTH or not _TAG_RE.match(tag):
+        raise ValueError(
+            f"Tag '{tag}' is invalid: must be 1-{_MAX_TAG_LENGTH} characters of [a-z0-9-]"
+        )
+
+
 def parse_tags(raw: str | None) -> list[str]:
     """Parse a user-supplied comma-separated tag string into a sorted list.
 
@@ -32,7 +39,7 @@ def parse_tags(raw: str | None) -> list[str]:
         element = raw_element.strip().lower()
         if not element:
             continue
-        SoundStore._validate_tag(element)
+        _validate_tag(element)
         if element not in seen:
             seen.add(element)
             out.append(element)
@@ -90,13 +97,6 @@ class SoundStore:
         return sanitized.lower()
 
     @staticmethod
-    def _validate_tag(tag: str) -> None:
-        if not tag or len(tag) > _MAX_TAG_LENGTH or not _TAG_RE.match(tag):
-            raise ValueError(
-                f"Tag '{tag}' is invalid: must be 1-{_MAX_TAG_LENGTH} characters of [a-z0-9-]"
-            )
-
-    @staticmethod
     def sanitize_tag(raw: str) -> str:
         """Sanitize a raw string into a valid tag, or raise ValueError."""
         sanitized = re.sub(r"[^a-zA-Z0-9-]", "-", raw).strip("-")[:_MAX_TAG_LENGTH].lower()
@@ -125,7 +125,7 @@ class SoundStore:
         }
 
     def add_tag(self, name: str, tag: str) -> None:
-        self._validate_tag(tag)
+        _validate_tag(tag)
         key = name.lower()
         if key not in self._sounds:
             raise KeyError(f"Sound '{name}' not found")
