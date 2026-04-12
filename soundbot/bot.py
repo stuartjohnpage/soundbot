@@ -38,6 +38,11 @@ def classify_import_sound(
       - "file_conflict": no local entry, but a file with the destination
         name already exists on disk in a different format
 
+    ``guild_tag``, if non-None, must already be sanitized (lowercase, the
+    [a-z0-9-] character set produced by SoundStore.sanitize_tag). This
+    function does no normalization — it compares against entry["tags"]
+    with == membership, and those are always stored canonicalized.
+
     Pre-fix bug: tagged_existing, already_tagged, and file_conflict all
     collapsed into a single "skipped (already tagged)" bucket which was
     factually wrong for the latter two cases.
@@ -707,7 +712,7 @@ def create_bot() -> commands.Bot:
             await run_migration_if_needed(store, list(bot.guilds))
         except Exception:
             logger.exception(
-                "tag migration failed; sounds.json left at v%d (startup) for retry",
+                "tag migration failed; startup snapshot was v%d, will retry next startup",
                 store.startup_version,
             )
 

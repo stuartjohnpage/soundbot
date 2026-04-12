@@ -81,7 +81,7 @@ async def run_migration_if_needed(store: SoundStore, guilds) -> None:
         # leave every sound untagged forever.
         logger.warning(
             "tag migration skipped: bot has no connected guilds yet; "
-            "leaving sounds.json at v%d (startup) for retry on next startup",
+            "startup snapshot is v%d, will retry on next startup",
             store.startup_version,
         )
         return

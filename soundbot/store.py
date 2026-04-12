@@ -208,6 +208,10 @@ class SoundStore:
         Used by the migration runner to install a freshly-built v2 dict
         without poking the private _sounds attribute. The caller is
         responsible for calling save() afterwards if they want it persisted.
+
+        Ownership: the store takes ownership of the passed dict. The
+        caller must not mutate it after calling this — pass a fresh dict
+        (or a deepcopy) if you need to retain your own reference.
         """
         self._sounds = sounds
 
@@ -215,10 +219,12 @@ class SoundStore:
         """Read accessor for the underlying sounds dict.
 
         Used by the migration runner to build a v1_data snapshot without
-        poking _sounds directly. The caller MUST treat the returned dict
-        as read-only — there is no defensive copy.
+        poking _sounds directly. Returns a shallow copy — callers can
+        reassign or drop keys freely without touching store state. The
+        entry dicts themselves are shared; consumers that mutate nested
+        values must do their own deep copy (migrate_v1_to_v2 already does).
         """
-        return self._sounds
+        return dict(self._sounds)
 
     def save(self) -> None:
         data = {"sounds": self._sounds, "version": CURRENT_SCHEMA_VERSION}
