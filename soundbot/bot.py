@@ -83,6 +83,11 @@ def _admin_check() -> app_commands.check:
 
 
 class Soundboard(commands.Cog):
+    tag_group = app_commands.Group(
+        name="tag",
+        description="Manage sound tags",
+    )
+
     def __init__(self, bot: commands.Bot, store: SoundStore) -> None:
         self.bot = bot
         self.store = store
@@ -190,6 +195,38 @@ class Soundboard(commands.Cog):
         return [
             app_commands.Choice(name=n, value=n) for n, _ in matches[:25]
         ]
+
+    # -- Tag autocomplete --
+
+    async def _global_tag_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete from the global set of tags currently in use."""
+        current_lower = current.lower()
+        matches = [t for t, _ in self.store.global_tags() if current_lower in t]
+        return [app_commands.Choice(name=t, value=t) for t in matches[:25]]
+
+    async def _sound_tag_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete tags actually present on the currently-typed sound.
+
+        Reads the `sound` option from the same interaction's namespace.
+        """
+        sound_name = None
+        try:
+            sound_name = interaction.namespace.sound
+        except AttributeError:
+            pass
+        if not sound_name:
+            return []
+        try:
+            tags = self.store.list_tags(sound_name)
+        except KeyError:
+            return []
+        current_lower = current.lower()
+        matches = [t for t in tags if current_lower in t]
+        return [app_commands.Choice(name=t, value=t) for t in matches[:25]]
 
     # -- Commands --
 
@@ -427,6 +464,89 @@ class Soundboard(commands.Cog):
         )
         embed.set_footer(text=f"Page {page_idx + 1} of {len(pages)}")
         await interaction.response.send_message(embed=embed)
+
+    # -- /tag commands --
+
+    @tag_group.command(name="add", description="Add a tag to a sound")
+    @app_commands.describe(sound="Sound name", tag="Tag to add")
+    @app_commands.autocomplete(sound=_sound_autocomplete, tag=_global_tag_autocomplete)
+    @_admin_check()
+    async def tag_add(
+        self, interaction: discord.Interaction, sound: str, tag: str
+    ) -> None:
+        try:
+            self.store.add_tag(sound, tag)
+            self.store.save()
+        except KeyError:
+            await interaction.response.send_message(
+                f"Sound **{sound}** not found.", ephemeral=True
+            )
+            return
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Tagged **{sound}** with `{tag}`.", ephemeral=True
+        )
+
+    @tag_group.command(name="remove", description="Remove a tag from a sound")
+    @app_commands.describe(sound="Sound name", tag="Tag to remove")
+    @app_commands.autocomplete(sound=_sound_autocomplete, tag=_sound_tag_autocomplete)
+    @_admin_check()
+    async def tag_remove(
+        self, interaction: discord.Interaction, sound: str, tag: str
+    ) -> None:
+        try:
+            self.store.remove_tag(sound, tag)
+            self.store.save()
+        except KeyError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Removed `{tag}` from **{sound}**.", ephemeral=True
+        )
+
+    @tag_group.command(
+        name="list", description="List tags on a sound, or all tags globally"
+    )
+    @app_commands.describe(sound="Optional sound name; omit to list all tags")
+    @app_commands.autocomplete(sound=_sound_autocomplete)
+    @_admin_check()
+    async def tag_list(
+        self, interaction: discord.Interaction, sound: str | None = None
+    ) -> None:
+        if sound is not None:
+            try:
+                tags = self.store.list_tags(sound)
+            except KeyError:
+                await interaction.response.send_message(
+                    f"Sound **{sound}** not found.", ephemeral=True
+                )
+                return
+            if not tags:
+                await interaction.response.send_message(
+                    f"**{sound}** has no tags.", ephemeral=True
+                )
+                return
+            tag_str = ", ".join(f"`{t}`" for t in tags)
+            await interaction.response.send_message(
+                f"Tags on **{sound}**: {tag_str}", ephemeral=True
+            )
+            return
+
+        # Global listing
+        all_tags = self.store.global_tags()
+        if not all_tags:
+            await interaction.response.send_message(
+                "No tags in the library yet.", ephemeral=True
+            )
+            return
+        lines = [f"`{t}` ({n})" for t, n in all_tags]
+        embed = discord.Embed(
+            title="Tags",
+            description="\n".join(lines),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class BoardView(discord.ui.View):
