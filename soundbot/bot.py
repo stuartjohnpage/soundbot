@@ -93,7 +93,7 @@ class Soundboard(commands.Cog):
         return vc
 
     async def _play_sound(
-        self, interaction: discord.Interaction, name: str
+        self, interaction: discord.Interaction, name: str, *, silent: bool = False
     ) -> None:
         try:
             vc = self._ensure_voice(interaction)
@@ -124,9 +124,10 @@ class Soundboard(commands.Cog):
             interaction.guild,
             getattr(interaction.user.voice, "channel", None),
         )
-        await interaction.response.send_message(
-            f"Playing **{name}**", ephemeral=True
-        )
+        if not silent:
+            await interaction.response.send_message(
+                f"Playing **{name}**", ephemeral=True
+            )
 
     # -- Sound name autocomplete --
 
@@ -339,7 +340,9 @@ class BoardView(discord.ui.View):
 
     def _make_callback(self, name: str):
         async def callback(interaction: discord.Interaction):
-            await self.cog._play_sound(interaction, name)
+            await self.cog._play_sound(interaction, name, silent=True)
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
         return callback
 
