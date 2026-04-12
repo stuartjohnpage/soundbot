@@ -420,6 +420,18 @@ class Soundboard(commands.Cog):
                 "This command can only be used in a server.", ephemeral=True
             )
             return
+
+        # Sanitize the guild name once — this is the auto-tag we apply to
+        # every imported AND every pre-existing sound matched on re-import.
+        try:
+            guild_tag = SoundStore.sanitize_tag(guild.name)
+        except ValueError:
+            guild_tag = None
+            logger.warning(
+                "guild name %r could not be sanitized into a tag; importing without auto-tag",
+                guild.name,
+            )
+
         try:
             sounds = await guild.fetch_soundboard_sounds()
         except discord.HTTPException as exc:
@@ -435,6 +447,7 @@ class Soundboard(commands.Cog):
             return
 
         imported = []
+        tagged_existing: list[str] = []
         skipped = []
         failed = []
         for sound in sounds:
@@ -442,8 +455,15 @@ class Soundboard(commands.Cog):
                 key = SoundStore.sanitize_name(sound.name)
             except ValueError:
                 key = f"sound_{sound.id}"
-            if self.store.get(key):
-                skipped.append(key)
+            existing_entry = self.store.get(key)
+            if existing_entry is not None:
+                # Re-import path: don't re-download, but apply the guild tag
+                # so cross-server origins are tracked.
+                if guild_tag and guild_tag not in existing_entry.get("tags", []):
+                    self.store.add_tag(key, guild_tag)
+                    tagged_existing.append(key)
+                else:
+                    skipped.append(key)
                 continue
             dest = config.SOUNDS_DIR / f"{key}.ogg"
             if dest.exists():
@@ -458,18 +478,27 @@ class Soundboard(commands.Cog):
                     category=DISCORD_IMPORT_CATEGORY,
                     uploaded_by=str(interaction.user),
                 )
+                if guild_tag:
+                    self.store.add_tag(key, guild_tag)
                 imported.append(key)
             except (discord.HTTPException, ValueError, OSError) as exc:
                 dest.unlink(missing_ok=True)
                 failed.append(f"{key}: {exc}")
                 logger.warning("Failed to import soundboard sound %s: %s", key, exc)
 
-        if imported:
+        if imported or tagged_existing:
             self.store.save()
         parts = [f"**Imported {len(imported)}** sound(s)."]
+        if guild_tag:
+            parts[0] += f" Auto-tag: `{guild_tag}`."
+        if tagged_existing:
+            names = ", ".join(tagged_existing)
+            parts.append(
+                f"Tagged existing {len(tagged_existing)}: {names}"
+            )
         if skipped:
             names = ", ".join(skipped)
-            parts.append(f"Skipped {len(skipped)} (already exist): {names}")
+            parts.append(f"Skipped {len(skipped)} (already tagged): {names}")
         if failed:
             parts.append(f"Failed {len(failed)}: {', '.join(failed)}")
         msg = "\n".join(parts)
