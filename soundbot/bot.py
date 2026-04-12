@@ -10,13 +10,63 @@ from . import config
 from .audio import extract_audio, has_video_stream, validate_sound
 from .mixer import MixerSource
 from .pagination import paginate
-from .store import SoundStore
+from .store import CURRENT_SCHEMA_VERSION, SoundStore, migrate_v1_to_v2
 
 logger = logging.getLogger("soundbot")
 
 SOUNDS_PER_BOARD_PAGE = 20  # 5 rows * 5 cols - 1 row for nav = 4*5
 DISCORD_IMPORT_CATEGORY = "discord-import"
 _MAX_SUMMARY_LENGTH = 1900  # Leave headroom under Discord's 2000-char limit
+
+
+async def run_migration_if_needed(store: SoundStore, guilds) -> None:
+    """Backfill v1 sounds.json with sanitized-guild-name tags from each
+    connected guild's Discord soundboard, then save at v2.
+
+    No-op when the store is already at v2. Atomic: if any guild's fetch
+    raises, no save happens and the file stays at v1 so the next startup
+    retries.
+
+    Tested via tests/test_migration.py with fake guild objects.
+    """
+    if store.loaded_version >= CURRENT_SCHEMA_VERSION:
+        return
+
+    # Fetch each guild once and build the sanitized {tag: {sound_names}} map.
+    guild_map: dict[str, set[str]] = {}
+    for guild in guilds:
+        try:
+            guild_tag = SoundStore.sanitize_tag(guild.name)
+        except ValueError:
+            logger.warning(
+                "skipping guild %r during migration: name cannot be sanitized",
+                getattr(guild, "name", "?"),
+            )
+            continue
+        # Single fetch per guild.
+        sounds = await guild.fetch_soundboard_sounds()
+        sanitized_sound_names: set[str] = set()
+        for s in sounds:
+            try:
+                sanitized_sound_names.add(SoundStore.sanitize_name(s.name))
+            except ValueError:
+                continue
+        guild_map[guild_tag] = sanitized_sound_names
+
+    v1_data = {"version": store.loaded_version, "sounds": store._sounds}
+    v2_data = migrate_v1_to_v2(v1_data, guild_map)
+    # Replace store contents in-memory and persist atomically.
+    store._sounds = v2_data["sounds"]
+    store.save()
+
+    tagged = sum(1 for e in store._sounds.values() if e.get("tags"))
+    untagged = len(store._sounds) - tagged
+    logger.info(
+        "tag migration complete: processed=%d tagged=%d untagged=%d",
+        len(store._sounds),
+        tagged,
+        untagged,
+    )
 
 
 def _admin_check() -> app_commands.check:
@@ -459,6 +509,14 @@ def create_bot() -> commands.Bot:
     @bot.event
     async def on_ready():
         logger.info("Connected as %s", bot.user)
+        # One-shot v1 -> v2 tag backfill against connected soundboards.
+        try:
+            await run_migration_if_needed(store, list(bot.guilds))
+        except Exception:
+            logger.exception(
+                "tag migration failed; sounds.json left at v%d for retry",
+                store.loaded_version,
+            )
 
     @bot.event
     async def on_close():
