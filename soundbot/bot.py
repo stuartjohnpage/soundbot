@@ -191,7 +191,18 @@ class Soundboard(commands.Cog):
     async def _sound_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        matches = self.store.search(current)
+        # If a tag was already typed in the same interaction, restrict to sounds
+        # carrying that tag.
+        tag = None
+        try:
+            tag = interaction.namespace.tag
+        except AttributeError:
+            pass
+        if tag:
+            tagged = {n for n, _ in self.store.list_sounds(tag=tag)}
+            matches = [(n, e) for n, e in self.store.search(current) if n in tagged]
+        else:
+            matches = self.store.search(current)
         return [
             app_commands.Choice(name=n, value=n) for n, _ in matches[:25]
         ]
@@ -231,19 +242,31 @@ class Soundboard(commands.Cog):
     # -- Commands --
 
     @app_commands.command(name="play", description="Play a sound")
-    @app_commands.describe(name="Sound name")
-    @app_commands.autocomplete(name=_sound_autocomplete)
+    @app_commands.describe(name="Sound name", tag="Optional tag filter for autocomplete")
+    @app_commands.autocomplete(name=_sound_autocomplete, tag=_global_tag_autocomplete)
     @_admin_check()
-    async def play(self, interaction: discord.Interaction, name: str) -> None:
+    async def play(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        tag: str | None = None,
+    ) -> None:
         await self._play_sound(interaction, name)
 
     @app_commands.command(name="random", description="Play a random sound")
-    @app_commands.describe(category="Optional category filter")
+    @app_commands.describe(
+        category="Optional category filter",
+        tag="Optional tag filter",
+    )
+    @app_commands.autocomplete(tag=_global_tag_autocomplete)
     @_admin_check()
     async def random_sound(
-        self, interaction: discord.Interaction, category: str | None = None
+        self,
+        interaction: discord.Interaction,
+        category: str | None = None,
+        tag: str | None = None,
     ) -> None:
-        sounds = self.store.list_sounds(category=category)
+        sounds = self.store.list_sounds(category=category, tag=tag)
         if not sounds:
             await interaction.response.send_message(
                 "No sounds found.", ephemeral=True
@@ -267,9 +290,13 @@ class Soundboard(commands.Cog):
     # -- Board --
 
     @app_commands.command(name="board", description="Show sound button board")
+    @app_commands.describe(tag="Optional tag filter")
+    @app_commands.autocomplete(tag=_global_tag_autocomplete)
     @_admin_check()
-    async def board(self, interaction: discord.Interaction) -> None:
-        sounds = self.store.list_sounds()
+    async def board(
+        self, interaction: discord.Interaction, tag: str | None = None
+    ) -> None:
+        sounds = self.store.list_sounds(tag=tag)
         if not sounds:
             await interaction.response.send_message(
                 "No sounds in the library.", ephemeral=True
