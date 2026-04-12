@@ -308,7 +308,7 @@ class Soundboard(commands.Cog):
 
 class BoardView(discord.ui.View):
     def __init__(self, cog: Soundboard, pages, page: int = 0) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.cog = cog
         self.pages = pages
         self.page = page
