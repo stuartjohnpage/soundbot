@@ -335,8 +335,6 @@ class TestPersistence:
         assert store.list_sounds() == []
 
     def test_save_creates_valid_json_with_version(self, tmp_path):
-        import json
-
         sounds_dir = tmp_path / "sounds"
         sounds_dir.mkdir()
         f = sounds_dir / "airhorn.mp3"
@@ -352,6 +350,62 @@ class TestPersistence:
         assert "version" in data
         assert data["version"] == 2
         assert "airhorn" in data["sounds"]
+
+    def test_replace_sounds_swaps_in_memory_state(self, tmp_path):
+        """replace_sounds is the public hook used by the migration runner
+        to swap the store's in-memory dict without poking _sounds directly.
+        """
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        f = sounds_dir / "old.mp3"
+        f.write_bytes(b"fake")
+
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        store.add("old", f)
+        assert store.get("old") is not None
+
+        new_sounds = {
+            "new": {
+                "file": "/tmp/new.mp3",
+                "category": None,
+                "uploaded_by": "u#1",
+                "uploaded_at": "2025-01-01T00:00:00+00:00",
+                "play_count": 0,
+                "tags": ["alpha"],
+            }
+        }
+        store.replace_sounds(new_sounds)
+
+        assert store.get("old") is None
+        assert store.get("new") is not None
+        assert store.get("new")["tags"] == ["alpha"]
+
+    def test_replace_sounds_persists_after_save(self, tmp_path):
+        """Round-trip: replace then save then load — replacement survives."""
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        metadata_path = tmp_path / "sounds.json"
+        store = SoundStore(metadata_path=metadata_path, sounds_dir=sounds_dir)
+        store.replace_sounds(
+            {
+                "new": {
+                    "file": "/tmp/new.mp3",
+                    "category": None,
+                    "uploaded_by": "u#1",
+                    "uploaded_at": "2025-01-01T00:00:00+00:00",
+                    "play_count": 0,
+                    "tags": ["alpha"],
+                }
+            }
+        )
+        store.save()
+
+        store2 = SoundStore(metadata_path=metadata_path, sounds_dir=sounds_dir)
+        assert store2.get("new") is not None
+        assert store2.get("new")["tags"] == ["alpha"]
 
 
 class TestFolderScan:
@@ -495,10 +549,20 @@ class TestTags:
         with pytest.raises(ValueError, match="invalid"):
             store.add_tag("airhorn", "Bad Tag!")
 
-    def test_add_tag_rejects_uppercase(self, tmp_path):
+    def test_add_tag_lowercases_input(self, tmp_path):
         store = self._store_with_sound(tmp_path)
-        with pytest.raises(ValueError, match="invalid"):
-            store.add_tag("airhorn", "MyTag")
+        store.add_tag("airhorn", "MEME")
+        assert store.get("airhorn")["tags"] == ["meme"]
+
+    def test_add_tag_lowercases_mixed_case(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        store.add_tag("airhorn", "Meme")
+        assert store.get("airhorn")["tags"] == ["meme"]
+
+    def test_add_tag_strips_whitespace(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        store.add_tag("airhorn", "  meme  ")
+        assert store.get("airhorn")["tags"] == ["meme"]
 
     def test_add_tag_rejects_too_long(self, tmp_path):
         store = self._store_with_sound(tmp_path)
@@ -527,16 +591,23 @@ class TestTags:
         store.remove_tag("airhorn", "meme")
         assert store.get("airhorn")["tags"] == ["funny"]
 
-    def test_remove_tag_unknown_tag_raises(self, tmp_path):
+    def test_remove_tag_unknown_tag_raises_value_error(self, tmp_path):
         store = self._store_with_sound(tmp_path)
         store.add_tag("airhorn", "meme")
-        with pytest.raises(KeyError):
+        with pytest.raises(ValueError, match="not present"):
             store.remove_tag("airhorn", "nope")
 
-    def test_remove_tag_unknown_sound_raises(self, tmp_path):
+    def test_remove_tag_unknown_sound_raises_key_error(self, tmp_path):
         store = self._store_with_sound(tmp_path)
-        with pytest.raises(KeyError):
+        with pytest.raises(KeyError, match="not found"):
             store.remove_tag("nope", "meme")
+
+    def test_remove_tag_lowercases_input(self, tmp_path):
+        store = self._store_with_sound(tmp_path)
+        store.add_tag("airhorn", "meme")
+        # User passes uppercase; should still match the canonical lowercase tag
+        store.remove_tag("airhorn", "MEME")
+        assert store.get("airhorn")["tags"] == []
 
     def test_list_tags_for_sound(self, tmp_path):
         store = self._store_with_sound(tmp_path)

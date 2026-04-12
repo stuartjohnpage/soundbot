@@ -125,24 +125,29 @@ class SoundStore:
         }
 
     def add_tag(self, name: str, tag: str) -> None:
-        _validate_tag(tag)
+        # Lenient case handling: canonicalize at the entry point so MEME, meme,
+        # and Meme all collapse to "meme". Matches what parse_tags already does
+        # for the comma-separated /addsound path.
+        canonical = (tag or "").strip().lower()
+        _validate_tag(canonical)
         key = name.lower()
         if key not in self._sounds:
             raise KeyError(f"Sound '{name}' not found")
         entry = self._sounds[key]
         tags = entry.setdefault("tags", [])
-        if tag not in tags:
-            tags.append(tag)
+        if canonical not in tags:
+            tags.append(canonical)
             tags.sort()
 
     def remove_tag(self, name: str, tag: str) -> None:
+        canonical = (tag or "").strip().lower()
         key = name.lower()
         if key not in self._sounds:
             raise KeyError(f"Sound '{name}' not found")
         tags = self._sounds[key].setdefault("tags", [])
-        if tag not in tags:
-            raise KeyError(f"Tag '{tag}' not present on sound '{name}'")
-        tags.remove(tag)
+        if canonical not in tags:
+            raise ValueError(f"Tag '{canonical}' not present on sound '{name}'")
+        tags.remove(canonical)
 
     def list_tags(self, name: str) -> list[str]:
         key = name.lower()
@@ -212,6 +217,15 @@ class SoundStore:
         if key not in self._sounds:
             raise KeyError(f"Sound '{name}' not found")
         self._sounds[key]["play_count"] += 1
+
+    def replace_sounds(self, sounds: dict) -> None:
+        """Public hook for swapping the in-memory sounds dict wholesale.
+
+        Used by the migration runner to install a freshly-built v2 dict
+        without poking the private _sounds attribute. The caller is
+        responsible for calling save() afterwards if they want it persisted.
+        """
+        self._sounds = sounds
 
     def save(self) -> None:
         data = {"sounds": self._sounds, "version": CURRENT_SCHEMA_VERSION}
