@@ -164,3 +164,26 @@ def test_migration_sanitizes_sound_names_from_discord(tmp_path):
 
     # The sound was matched after sanitization
     assert "server" in store.get("my_sound")["tags"]
+
+
+def test_migration_skipped_when_no_guilds_connected(tmp_path):
+    """Zero guilds at ready time means we have nothing to match against.
+
+    Running the migration anyway would silently mark every sound untagged
+    and bump the file to v2 — losing the retry opportunity forever.
+    Refuse to migrate and leave the file at v1 so the next startup retries.
+    """
+    _seed_v1(tmp_path, {"airhorn": _entry()})
+    store = _make_store(tmp_path)
+    assert store.loaded_version == 1
+
+    # No guilds connected
+    asyncio.run(run_migration_if_needed(store, []))
+
+    # File on disk is still v1
+    data = json.loads((tmp_path / "sounds.json").read_text())
+    assert data["version"] == 1
+    # Store still reports v1 so the next on_ready will retry
+    assert store.loaded_version == 1
+    # Sound is untouched (no spurious tags or empty-list backfill mismatch)
+    assert "tags" not in data["sounds"]["airhorn"] or data["sounds"]["airhorn"]["tags"] == []

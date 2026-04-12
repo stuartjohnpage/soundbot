@@ -24,20 +24,73 @@ DISCORD_IMPORT_CATEGORY = "discord-import"
 _MAX_SUMMARY_LENGTH = 1900  # Leave headroom under Discord's 2000-char limit
 
 
+def classify_import_sound(
+    existing_entry: dict | None,
+    dest_exists: bool,
+    guild_tag: str | None,
+) -> str:
+    """Classify an incoming /importsounds soundboard sound into a bucket.
+
+    Pure function so the bucketing decisions can be unit-tested without
+    standing up a real discord.Interaction. Returns one of:
+
+      - "needs_download": no local entry, no file collision -> proceed
+      - "tagged_existing": local entry exists, lacked the guild tag
+        (the caller will add it)
+      - "already_tagged": local entry exists, no new tag to add
+        (either it already had the guild_tag, or guild_tag is None)
+      - "file_conflict": no local entry, but a file with the destination
+        name already exists on disk in a different format
+
+    Pre-fix bug: tagged_existing, already_tagged, and file_conflict all
+    collapsed into a single "skipped (already tagged)" bucket which was
+    factually wrong for the latter two cases.
+    """
+    if existing_entry is not None:
+        # Direct subscript: SoundStore.load() guarantees the tags key exists
+        # on every entry, so falling back with .get() would be lying about
+        # the invariant.
+        if guild_tag and guild_tag not in existing_entry["tags"]:
+            return "tagged_existing"
+        return "already_tagged"
+    if dest_exists:
+        return "file_conflict"
+    return "needs_download"
+
+
 async def run_migration_if_needed(store: SoundStore, guilds) -> None:
     """Backfill v1 sounds.json with sanitized-guild-name tags from each
     connected guild's Discord soundboard, then save at v2.
 
-    No-op when the store is already at v2. Atomic: if any guild's fetch
-    raises, no save happens and the file stays at v1 so the next startup
-    retries.
+    No-op when the store is already at v2. No-op when the guild list is
+    empty (we have nothing to match against, and committing v2 anyway
+    would burn the retry opportunity forever).
+
+    Atomic on fetch failures: if any guild's fetch raises, no save
+    happens and the file stays at v1 so the next startup retries. Note
+    that an in-progress _save_loop tick (60s cadence) could in theory
+    persist a half-migrated v2 dict if the migration succeeded in
+    memory but raised between replace_sounds and save — kept simple
+    here because save() doesn't currently raise on this path.
 
     Tested via tests/test_migration.py with fake guild objects.
     """
     if store.loaded_version >= CURRENT_SCHEMA_VERSION:
         return
 
-    # Fetch each guild once and build the sanitized {tag: {sound_names}} map.
+    if not guilds:
+        # Zero guilds means we have no soundboards to match against.
+        # Refuse to migrate so the next on_ready retries with a populated
+        # bot.guilds list. Marking the file as v2 here would silently
+        # leave every sound untagged forever.
+        logger.warning(
+            "tag migration skipped: bot has no connected guilds yet; "
+            "leaving sounds.json at v%d for retry on next startup",
+            store.loaded_version,
+        )
+        return
+
+    # One fetch per guild — not per sound — to stay under Discord's rate limits.
     guild_map: dict[str, set[str]] = {}
     for guild in guilds:
         try:
@@ -48,7 +101,6 @@ async def run_migration_if_needed(store: SoundStore, guilds) -> None:
                 getattr(guild, "name", "?"),
             )
             continue
-        # Single fetch per guild.
         sounds = await guild.fetch_soundboard_sounds()
         sanitized_sound_names: set[str] = set()
         for s in sounds:
@@ -58,17 +110,19 @@ async def run_migration_if_needed(store: SoundStore, guilds) -> None:
                 continue
         guild_map[guild_tag] = sanitized_sound_names
 
-    v1_data = {"version": store.loaded_version, "sounds": store._sounds}
+    v1_data = {"version": store.loaded_version, "sounds": store.raw_sounds()}
     v2_data = migrate_v1_to_v2(v1_data, guild_map)
-    # Replace store contents in-memory and persist atomically.
-    store._sounds = v2_data["sounds"]
+    # Swap in the migrated dict via the public hook and persist atomically.
+    store.replace_sounds(v2_data["sounds"])
     store.save()
 
-    tagged = sum(1 for e in store._sounds.values() if e.get("tags"))
-    untagged = len(store._sounds) - tagged
+    sounds_view = store.raw_sounds()
+    # Direct subscript: migrate_v1_to_v2 guarantees every entry has a tags key.
+    tagged = sum(1 for e in sounds_view.values() if e["tags"])
+    untagged = len(sounds_view) - tagged
     logger.info(
         "tag migration complete: processed=%d tagged=%d untagged=%d",
-        len(store._sounds),
+        len(sounds_view),
         tagged,
         untagged,
     )
@@ -249,6 +303,12 @@ class Soundboard(commands.Cog):
         name: str,
         tag: str | None = None,
     ) -> None:
+        # `tag` is intentionally consumed only by _sound_autocomplete via
+        # interaction.namespace.tag — it scopes the name autocomplete to
+        # sounds carrying that tag. The function body never reads it; the
+        # explicit `del` keeps a future maintainer from helpfully removing
+        # the parameter and breaking the autocomplete coupling.
+        del tag
         await self._play_sound(interaction, name)
 
     @app_commands.command(name="random", description="Play a random sound")
@@ -440,8 +500,9 @@ class Soundboard(commands.Cog):
             return
 
         imported = []
-        tagged_existing: list[str] = []
-        skipped = []
+        tagged_existing = []
+        already_tagged = []
+        file_conflict = []
         failed = []
         for sound in sounds:
             try:
@@ -449,19 +510,21 @@ class Soundboard(commands.Cog):
             except ValueError:
                 key = f"sound_{sound.id}"
             existing_entry = self.store.get(key)
-            if existing_entry is not None:
-                # Re-import path: don't re-download, but apply the guild tag
-                # so cross-server origins are tracked.
-                if guild_tag and guild_tag not in existing_entry.get("tags", []):
-                    self.store.add_tag(key, guild_tag)
-                    tagged_existing.append(key)
-                else:
-                    skipped.append(key)
-                continue
             dest = config.SOUNDS_DIR / f"{key}.ogg"
-            if dest.exists():
-                skipped.append(f"{key} (file exists)")
+            bucket = classify_import_sound(
+                existing_entry, dest.exists(), guild_tag
+            )
+            if bucket == "tagged_existing":
+                self.store.add_tag(key, guild_tag)
+                tagged_existing.append(key)
                 continue
+            if bucket == "already_tagged":
+                already_tagged.append(key)
+                continue
+            if bucket == "file_conflict":
+                file_conflict.append(key)
+                continue
+            # bucket == "needs_download"
             try:
                 await sound.save(dest)
                 validate_sound(dest, config.MAX_DURATION)
@@ -489,9 +552,16 @@ class Soundboard(commands.Cog):
             parts.append(
                 f"Tagged existing {len(tagged_existing)}: {names}"
             )
-        if skipped:
-            names = ", ".join(skipped)
-            parts.append(f"Skipped {len(skipped)} (already tagged): {names}")
+        if already_tagged:
+            names = ", ".join(already_tagged)
+            parts.append(
+                f"Already tagged {len(already_tagged)}: {names}"
+            )
+        if file_conflict:
+            names = ", ".join(file_conflict)
+            parts.append(
+                f"File conflict {len(file_conflict)} (a different file with that name exists on disk): {names}"
+            )
         if failed:
             parts.append(f"Failed {len(failed)}: {', '.join(failed)}")
         msg = "\n".join(parts)
@@ -566,8 +636,11 @@ class Soundboard(commands.Cog):
         try:
             self.store.remove_tag(sound, tag)
             self.store.save()
-        except KeyError as exc:
-            # KeyError.__str__ wraps the message in quotes; pull the raw arg.
+        except (KeyError, ValueError) as exc:
+            # remove_tag raises KeyError when the sound doesn't exist and
+            # ValueError when the tag isn't on the sound. Both render to
+            # the user via str(exc); KeyError's repr quoting is avoided
+            # because exc.args[0] is the user-facing message either way.
             msg = exc.args[0] if exc.args else "Not found."
             await interaction.response.send_message(msg, ephemeral=True)
             return

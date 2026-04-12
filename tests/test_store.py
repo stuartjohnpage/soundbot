@@ -383,6 +383,21 @@ class TestPersistence:
         assert store.get("new") is not None
         assert store.get("new")["tags"] == ["alpha"]
 
+    def test_raw_sounds_returns_underlying_dict(self, tmp_path):
+        """raw_sounds is the read-side companion to replace_sounds."""
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        f = sounds_dir / "airhorn.mp3"
+        f.write_bytes(b"fake")
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        store.add("airhorn", f)
+        raw = store.raw_sounds()
+        assert "airhorn" in raw
+        assert raw["airhorn"]["file"] == str(f)
+
     def test_replace_sounds_persists_after_save(self, tmp_path):
         """Round-trip: replace then save then load — replacement survives."""
         sounds_dir = tmp_path / "sounds"

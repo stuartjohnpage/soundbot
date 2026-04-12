@@ -227,6 +227,15 @@ class SoundStore:
         """
         self._sounds = sounds
 
+    def raw_sounds(self) -> dict:
+        """Read accessor for the underlying sounds dict.
+
+        Used by the migration runner to build a v1_data snapshot without
+        poking _sounds directly. The caller MUST treat the returned dict
+        as read-only — there is no defensive copy.
+        """
+        return self._sounds
+
     def save(self) -> None:
         data = {"sounds": self._sounds, "version": CURRENT_SCHEMA_VERSION}
         tmp = self._metadata_path.with_suffix(".tmp")
