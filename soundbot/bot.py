@@ -15,6 +15,8 @@ from .store import SoundStore
 logger = logging.getLogger("soundbot")
 
 SOUNDS_PER_BOARD_PAGE = 20  # 5 rows * 5 cols - 1 row for nav = 4*5
+DISCORD_IMPORT_CATEGORY = "discord-import"
+_MAX_SUMMARY_LENGTH = 1900  # Leave headroom under Discord's 2000-char limit
 
 
 def _admin_check() -> app_commands.check:
@@ -272,6 +274,76 @@ class Soundboard(commands.Cog):
             f"Renamed **{old}** to **{new}**."
         )
 
+    @app_commands.command(
+        name="importsounds",
+        description="Import sounds from Discord's built-in soundboard",
+    )
+    @_admin_check()
+    async def importsounds(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        try:
+            sounds = await guild.fetch_soundboard_sounds()
+        except discord.HTTPException as exc:
+            await interaction.followup.send(
+                f"Failed to fetch soundboard sounds: {exc}", ephemeral=True
+            )
+            return
+
+        if not sounds:
+            await interaction.followup.send(
+                "No sounds found in Discord's soundboard.", ephemeral=True
+            )
+            return
+
+        imported = []
+        skipped = []
+        failed = []
+        for sound in sounds:
+            try:
+                key = SoundStore.sanitize_name(sound.name)
+            except ValueError:
+                key = f"sound_{sound.id}"
+            if self.store.get(key):
+                skipped.append(key)
+                continue
+            dest = config.SOUNDS_DIR / f"{key}.ogg"
+            if dest.exists():
+                skipped.append(f"{key} (file exists)")
+                continue
+            try:
+                await sound.save(dest)
+                validate_sound(dest, config.MAX_DURATION)
+                self.store.add(
+                    key,
+                    dest,
+                    category=DISCORD_IMPORT_CATEGORY,
+                    uploaded_by=str(interaction.user),
+                )
+                imported.append(key)
+            except (discord.HTTPException, ValueError, OSError) as exc:
+                dest.unlink(missing_ok=True)
+                failed.append(f"{key}: {exc}")
+                logger.warning("Failed to import soundboard sound %s: %s", key, exc)
+
+        if imported:
+            self.store.save()
+        parts = [f"**Imported {len(imported)}** sound(s)."]
+        if skipped:
+            names = ", ".join(skipped)
+            parts.append(f"Skipped {len(skipped)} (already exist): {names}")
+        if failed:
+            parts.append(f"Failed {len(failed)}: {', '.join(failed)}")
+        msg = "\n".join(parts)
+        if len(msg) > _MAX_SUMMARY_LENGTH:
+            msg = msg[:_MAX_SUMMARY_LENGTH] + "\n... (truncated)"
+        await interaction.followup.send(msg, ephemeral=True)
+
     @app_commands.command(name="listsounds", description="List all sounds")
     @app_commands.describe(
         category="Optional category filter",
@@ -370,7 +442,12 @@ def create_bot() -> commands.Bot:
         store.save()
         await bot.add_cog(Soundboard(bot, store))
         if config.SYNC_COMMANDS:
-            await bot.tree.sync()
+            if config.GUILD_ID:
+                guild = discord.Object(id=config.GUILD_ID)
+                bot.tree.copy_global_to(guild=guild)
+                await bot.tree.sync(guild=guild)
+            else:
+                await bot.tree.sync()
 
     bot.setup_hook = setup_hook
 

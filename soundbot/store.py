@@ -20,6 +20,14 @@ class SoundStore:
         if not name or len(name) > _MAX_NAME_LENGTH or not _NAME_RE.match(name):
             raise ValueError(f"Sound name '{name}' is invalid: must be 1-{_MAX_NAME_LENGTH} alphanumeric/hyphen/underscore characters")
 
+    @staticmethod
+    def sanitize_name(raw: str) -> str:
+        """Sanitize a raw string into a valid sound name, or raise ValueError."""
+        sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", raw).strip("_")[:_MAX_NAME_LENGTH]
+        if not sanitized:
+            raise ValueError(f"Cannot derive a valid name from '{raw}'")
+        return sanitized.lower()
+
     def add(
         self,
         name: str,
