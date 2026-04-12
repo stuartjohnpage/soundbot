@@ -801,7 +801,7 @@ class TestMigrationPureFunction:
         return base
 
     def test_zero_guild_match_leaves_tags_empty(self):
-        from soundbot.store import migrate_v1_to_v2
+        from soundbot.migration import migrate_v1_to_v2
 
         v1 = self._v1({"airhorn": self._entry()})
         guild_map: dict[str, set[str]] = {
@@ -814,7 +814,7 @@ class TestMigrationPureFunction:
         assert v2["sounds"]["airhorn"]["tags"] == []
 
     def test_one_guild_match_applies_one_tag(self):
-        from soundbot.store import migrate_v1_to_v2
+        from soundbot.migration import migrate_v1_to_v2
 
         v1 = self._v1({"airhorn": self._entry()})
         guild_map = {
@@ -826,7 +826,7 @@ class TestMigrationPureFunction:
         assert v2["sounds"]["airhorn"]["tags"] == ["alpha"]
 
     def test_multi_guild_match_applies_multiple_tags(self):
-        from soundbot.store import migrate_v1_to_v2
+        from soundbot.migration import migrate_v1_to_v2
 
         v1 = self._v1({"airhorn": self._entry()})
         guild_map = {
@@ -839,7 +839,7 @@ class TestMigrationPureFunction:
         assert v2["sounds"]["airhorn"]["tags"] == ["alpha", "beta", "gamma"]
 
     def test_migration_preserves_existing_fields(self):
-        from soundbot.store import migrate_v1_to_v2
+        from soundbot.migration import migrate_v1_to_v2
 
         v1 = self._v1({
             "airhorn": self._entry(
@@ -860,7 +860,7 @@ class TestMigrationPureFunction:
         assert e["tags"] == ["alpha"]
 
     def test_migration_does_not_mutate_input(self):
-        from soundbot.store import migrate_v1_to_v2
+        from soundbot.migration import migrate_v1_to_v2
 
         v1 = self._v1({"airhorn": self._entry()})
         guild_map = {"alpha": {"airhorn"}}
@@ -872,7 +872,7 @@ class TestMigrationPureFunction:
 
     def test_migration_handles_pre_existing_tags_field(self):
         """If a v1 entry somehow already has tags, the migration appends to them."""
-        from soundbot.store import migrate_v1_to_v2
+        from soundbot.migration import migrate_v1_to_v2
 
         v1 = self._v1({
             "airhorn": self._entry(tags=["pre-existing"])
@@ -883,14 +883,14 @@ class TestMigrationPureFunction:
         assert v2["sounds"]["airhorn"]["tags"] == ["alpha", "pre-existing"]
 
     def test_migration_returns_v2_marker(self):
-        from soundbot.store import migrate_v1_to_v2
+        from soundbot.migration import migrate_v1_to_v2
 
         v1 = self._v1({})
         v2 = migrate_v1_to_v2(v1, {})
         assert v2["version"] == 2
 
     def test_migration_dedupes_overlap_with_existing_tags(self):
-        from soundbot.store import migrate_v1_to_v2
+        from soundbot.migration import migrate_v1_to_v2
 
         v1 = self._v1({"airhorn": self._entry(tags=["alpha"])})
         guild_map = {"alpha": {"airhorn"}}

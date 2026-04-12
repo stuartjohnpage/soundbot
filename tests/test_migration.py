@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from soundbot.bot import run_migration_if_needed
+from soundbot.migration import run_migration_if_needed
 from soundbot.store import SoundStore
 
 

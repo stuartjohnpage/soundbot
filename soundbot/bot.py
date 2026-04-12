@@ -8,14 +8,10 @@ from discord.ext import commands, tasks
 
 from . import config
 from .audio import extract_audio, has_video_stream, validate_sound
+from .migration import run_migration_if_needed
 from .mixer import MixerSource
 from .pagination import paginate
-from .store import (
-    CURRENT_SCHEMA_VERSION,
-    SoundStore,
-    migrate_v1_to_v2,
-    parse_tags,
-)
+from .store import SoundStore, parse_tags
 
 logger = logging.getLogger("soundbot")
 
@@ -56,76 +52,6 @@ def classify_import_sound(
     if dest_exists:
         return "file_conflict"
     return "needs_download"
-
-
-async def run_migration_if_needed(store: SoundStore, guilds) -> None:
-    """Backfill v1 sounds.json with sanitized-guild-name tags from each
-    connected guild's Discord soundboard, then save at v2.
-
-    No-op when the store is already at v2. No-op when the guild list is
-    empty (we have nothing to match against, and committing v2 anyway
-    would burn the retry opportunity forever).
-
-    Atomic on fetch failures: if any guild's fetch raises, no save
-    happens and the file stays at v1 so the next startup retries. Note
-    that an in-progress _save_loop tick (60s cadence) could in theory
-    persist a half-migrated v2 dict if the migration succeeded in
-    memory but raised between replace_sounds and save — kept simple
-    here because save() doesn't currently raise on this path.
-
-    Tested via tests/test_migration.py with fake guild objects.
-    """
-    if store.loaded_version >= CURRENT_SCHEMA_VERSION:
-        return
-
-    if not guilds:
-        # Zero guilds means we have no soundboards to match against.
-        # Refuse to migrate so the next on_ready retries with a populated
-        # bot.guilds list. Marking the file as v2 here would silently
-        # leave every sound untagged forever.
-        logger.warning(
-            "tag migration skipped: bot has no connected guilds yet; "
-            "leaving sounds.json at v%d for retry on next startup",
-            store.loaded_version,
-        )
-        return
-
-    # One fetch per guild — not per sound — to stay under Discord's rate limits.
-    guild_map: dict[str, set[str]] = {}
-    for guild in guilds:
-        try:
-            guild_tag = SoundStore.sanitize_tag(guild.name)
-        except ValueError:
-            logger.warning(
-                "skipping guild %r during migration: name cannot be sanitized",
-                getattr(guild, "name", "?"),
-            )
-            continue
-        sounds = await guild.fetch_soundboard_sounds()
-        sanitized_sound_names: set[str] = set()
-        for s in sounds:
-            try:
-                sanitized_sound_names.add(SoundStore.sanitize_name(s.name))
-            except ValueError:
-                continue
-        guild_map[guild_tag] = sanitized_sound_names
-
-    v1_data = {"version": store.loaded_version, "sounds": store.raw_sounds()}
-    v2_data = migrate_v1_to_v2(v1_data, guild_map)
-    # Swap in the migrated dict via the public hook and persist atomically.
-    store.replace_sounds(v2_data["sounds"])
-    store.save()
-
-    sounds_view = store.raw_sounds()
-    # Direct subscript: migrate_v1_to_v2 guarantees every entry has a tags key.
-    tagged = sum(1 for e in sounds_view.values() if e["tags"])
-    untagged = len(sounds_view) - tagged
-    logger.info(
-        "tag migration complete: processed=%d tagged=%d untagged=%d",
-        len(sounds_view),
-        tagged,
-        untagged,
-    )
 
 
 def _admin_check() -> app_commands.check:

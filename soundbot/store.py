@@ -1,4 +1,3 @@
-import copy
 import json
 import re
 from datetime import datetime, timezone
@@ -44,35 +43,6 @@ def parse_tags(raw: str | None) -> list[str]:
             seen.add(element)
             out.append(element)
     return sorted(out)
-
-
-def migrate_v1_to_v2(
-    v1_data: dict, guild_sound_map: dict[str, set[str]]
-) -> dict:
-    """Pure migration from a v1 store dict to a v2 store dict.
-
-    Inputs:
-      v1_data: the on-disk dict, e.g. {"version": 1, "sounds": {...}}.
-      guild_sound_map: mapping of sanitized_guild_name -> set of sanitized
-        sound names that exist in that guild's Discord soundboard. Caller is
-        responsible for sanitizing both keys and values.
-
-    For every local sound that matches a guild's soundboard, the sanitized
-    guild name is appended as a tag. Tags are stored sorted and deduped.
-    Sounds with no matches keep their existing tags (or [] if absent).
-
-    Does not mutate v1_data.
-    """
-    v2 = copy.deepcopy(v1_data)
-    v2["version"] = CURRENT_SCHEMA_VERSION
-    sounds = v2.get("sounds", {})
-    for sound_name, entry in sounds.items():
-        existing = list(entry.get("tags", []))
-        for guild_tag, sound_set in guild_sound_map.items():
-            if sound_name in sound_set and guild_tag not in existing:
-                existing.append(guild_tag)
-        entry["tags"] = sorted(existing)
-    return v2
 
 
 class SoundStore:
