@@ -68,6 +68,10 @@ def _admin_check() -> app_commands.check:
 
 
 class Soundboard(commands.Cog):
+    # Class-level Group is the discord.py pattern for Cog-scoped grouped
+    # commands: methods decorated with @tag_group.command get registered as
+    # /tag <subcommand> when the Cog is added. See discord.py docs:
+    # https://discordpy.readthedocs.io/en/stable/interactions/api.html#discord.app_commands.Group
     tag_group = app_commands.Group(
         name="tag",
         description="Manage sound tags",
@@ -342,6 +346,7 @@ class Soundboard(commands.Cog):
             )
             for tag in tag_list:
                 self.store.add_tag(name, tag)
+            # Single save after the batch — add_tag mutates only in-memory state.
             self.store.save()
         except ValueError as exc:
             dest.unlink(missing_ok=True)

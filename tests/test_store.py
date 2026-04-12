@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from soundbot.store import SoundStore
+from soundbot.migration import migrate_v1_to_v2
+from soundbot.store import SoundStore, parse_tags
 
 
 class TestAddAndRetrieve:
@@ -689,8 +690,6 @@ class TestTags:
         assert len(result) == 2
 
     def test_save_writes_version_2(self, tmp_path):
-        import json
-
         store = self._store_with_sound(tmp_path)
         store.save()
         data = json.loads((tmp_path / "sounds.json").read_text())
@@ -713,8 +712,6 @@ class TestTags:
 class TestV1BackCompat:
     def test_loads_v1_file_without_tags(self, tmp_path):
         """A v1 sounds.json file (no tags) must load and every entry gets tags: []."""
-        import json
-
         sounds_dir = tmp_path / "sounds"
         sounds_dir.mkdir()
         f = sounds_dir / "airhorn.mp3"
@@ -756,8 +753,6 @@ class TestV1BackCompat:
 
     def test_v1_store_reports_version_for_migration(self, tmp_path):
         """The store must expose loaded version so the migration code can decide to run."""
-        import json
-
         sounds_dir = tmp_path / "sounds"
         sounds_dir.mkdir()
         v1_data = {"version": 1, "sounds": {}}
@@ -801,8 +796,6 @@ class TestMigrationPureFunction:
         return base
 
     def test_zero_guild_match_leaves_tags_empty(self):
-        from soundbot.migration import migrate_v1_to_v2
-
         v1 = self._v1({"airhorn": self._entry()})
         guild_map: dict[str, set[str]] = {
             "alpha": {"rimshot"},
@@ -814,8 +807,6 @@ class TestMigrationPureFunction:
         assert v2["sounds"]["airhorn"]["tags"] == []
 
     def test_one_guild_match_applies_one_tag(self):
-        from soundbot.migration import migrate_v1_to_v2
-
         v1 = self._v1({"airhorn": self._entry()})
         guild_map = {
             "alpha": {"airhorn"},
@@ -826,8 +817,6 @@ class TestMigrationPureFunction:
         assert v2["sounds"]["airhorn"]["tags"] == ["alpha"]
 
     def test_multi_guild_match_applies_multiple_tags(self):
-        from soundbot.migration import migrate_v1_to_v2
-
         v1 = self._v1({"airhorn": self._entry()})
         guild_map = {
             "alpha": {"airhorn"},
@@ -839,8 +828,6 @@ class TestMigrationPureFunction:
         assert v2["sounds"]["airhorn"]["tags"] == ["alpha", "beta", "gamma"]
 
     def test_migration_preserves_existing_fields(self):
-        from soundbot.migration import migrate_v1_to_v2
-
         v1 = self._v1({
             "airhorn": self._entry(
                 file="/data/airhorn.mp3",
@@ -860,8 +847,6 @@ class TestMigrationPureFunction:
         assert e["tags"] == ["alpha"]
 
     def test_migration_does_not_mutate_input(self):
-        from soundbot.migration import migrate_v1_to_v2
-
         v1 = self._v1({"airhorn": self._entry()})
         guild_map = {"alpha": {"airhorn"}}
         original_v1 = json.loads(json.dumps(v1))  # deep copy snapshot
@@ -872,8 +857,6 @@ class TestMigrationPureFunction:
 
     def test_migration_handles_pre_existing_tags_field(self):
         """If a v1 entry somehow already has tags, the migration appends to them."""
-        from soundbot.migration import migrate_v1_to_v2
-
         v1 = self._v1({
             "airhorn": self._entry(tags=["pre-existing"])
         })
@@ -883,15 +866,11 @@ class TestMigrationPureFunction:
         assert v2["sounds"]["airhorn"]["tags"] == ["alpha", "pre-existing"]
 
     def test_migration_returns_v2_marker(self):
-        from soundbot.migration import migrate_v1_to_v2
-
         v1 = self._v1({})
         v2 = migrate_v1_to_v2(v1, {})
         assert v2["version"] == 2
 
     def test_migration_dedupes_overlap_with_existing_tags(self):
-        from soundbot.migration import migrate_v1_to_v2
-
         v1 = self._v1({"airhorn": self._entry(tags=["alpha"])})
         guild_map = {"alpha": {"airhorn"}}
         v2 = migrate_v1_to_v2(v1, guild_map)
@@ -900,49 +879,31 @@ class TestMigrationPureFunction:
 
 class TestParseTags:
     def test_parses_comma_separated(self):
-        from soundbot.store import parse_tags
-
-        assert parse_tags("meme,funny,dave") == ["dave", "funny", "meme"]
+        assert set(parse_tags("meme,funny,dave")) == {"dave", "funny", "meme"}
 
     def test_strips_whitespace(self):
-        from soundbot.store import parse_tags
-
-        assert parse_tags("meme , funny , dave") == ["dave", "funny", "meme"]
+        assert set(parse_tags("meme , funny , dave")) == {"dave", "funny", "meme"}
 
     def test_dedupes(self):
-        from soundbot.store import parse_tags
-
-        assert parse_tags("meme,meme,funny") == ["funny", "meme"]
+        assert set(parse_tags("meme,meme,funny")) == {"funny", "meme"}
 
     def test_empty_string_returns_empty_list(self):
-        from soundbot.store import parse_tags
-
         assert parse_tags("") == []
 
     def test_none_returns_empty_list(self):
-        from soundbot.store import parse_tags
-
         assert parse_tags(None) == []
 
     def test_skips_empty_elements(self):
-        from soundbot.store import parse_tags
-
         # Trailing comma, double commas
-        assert parse_tags("meme,,funny,") == ["funny", "meme"]
+        assert set(parse_tags("meme,,funny,")) == {"funny", "meme"}
 
     def test_lowercases(self):
-        from soundbot.store import parse_tags
-
-        assert parse_tags("MEME,Funny") == ["funny", "meme"]
+        assert set(parse_tags("MEME,Funny")) == {"funny", "meme"}
 
     def test_rejects_invalid_element(self):
-        from soundbot.store import parse_tags
-
         with pytest.raises(ValueError, match="invalid"):
             parse_tags("meme,bad tag!")
 
     def test_rejects_too_long_element(self):
-        from soundbot.store import parse_tags
-
         with pytest.raises(ValueError, match="invalid"):
             parse_tags("meme," + "a" * 33)

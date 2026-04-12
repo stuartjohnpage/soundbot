@@ -91,11 +91,9 @@ def test_migration_runs_when_version_is_v1(tmp_path):
 
 
 def test_migration_skipped_when_already_v2(tmp_path):
-    sounds_dir = tmp_path / "sounds"
-    sounds_dir.mkdir()
+    store = _make_store(tmp_path)
     # First create at v2 by saving with the current store
-    store = SoundStore(metadata_path=tmp_path / "sounds.json", sounds_dir=sounds_dir)
-    store._sounds["airhorn"] = _entry(tags=[])
+    store.replace_sounds({"airhorn": _entry(tags=[])})
     store.save()
     assert store.loaded_version == 2
 

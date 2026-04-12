@@ -4,6 +4,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+# Tags are intentionally stricter than names: no underscores, lowercase only.
+# They have to round-trip through sanitize_tag() which mirrors the character
+# set Discord guild names get normalized to.
 _TAG_RE = re.compile(r"^[a-z0-9-]+$")
 _MAX_NAME_LENGTH = 32
 _MAX_TAG_LENGTH = 32
@@ -12,6 +15,8 @@ _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus", ".webm"}
 CURRENT_SCHEMA_VERSION = 2
 
 
+# Module-scope (not on SoundStore) because two consumers — parse_tags and
+# SoundStore.add_tag — both need it, and parse_tags is itself a free function.
 def _validate_tag(tag: str) -> None:
     if not tag or len(tag) > _MAX_TAG_LENGTH or not _TAG_RE.match(tag):
         raise ValueError(
@@ -20,15 +25,19 @@ def _validate_tag(tag: str) -> None:
 
 
 def parse_tags(raw: str | None) -> list[str]:
-    """Parse a user-supplied comma-separated tag string into a sorted list.
+    """Parse a user-supplied comma-separated tag string into a deduped list.
 
     - None or empty -> [].
     - Each element is lowercased and validated against the same rules
       as add_tag (1-32 chars of [a-z0-9-]).
     - Empty elements (e.g. trailing commas) are skipped.
-    - Duplicates are removed.
+    - Duplicates are removed; insertion order is preserved.
     - Raises ValueError for any invalid element — the caller can show
       the message to the user before any side effects.
+
+    Order is intentionally NOT canonicalized: the only consumer is
+    SoundStore.add_tag, which re-sorts on insertion. Tests use set
+    comparisons.
     """
     if not raw:
         return []
@@ -42,7 +51,7 @@ def parse_tags(raw: str | None) -> list[str]:
         if element not in seen:
             seen.add(element)
             out.append(element)
-    return sorted(out)
+    return out
 
 
 class SoundStore:
