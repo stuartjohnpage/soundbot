@@ -335,15 +335,28 @@ class Soundboard(commands.Cog):
     def _find_existing_by_path(self, path: Path) -> str | None:
         """Return the name of any store entry whose file is `path`, or None.
 
-        Used by addsound to refuse an upload that would silently overwrite
-        another sound's file. Pre-fix bug: two sounds with the same
-        uploaded filename (different names) would both land at the same
-        dest on disk. The second upload would clobber the first's bytes,
-        corrupting the first entry even though no exception was raised.
+        Used by addsound and importsounds to refuse a write that would
+        silently overwrite another sound's file. Pre-fix bug: two sounds
+        with the same destination filename (different names) would both
+        land at the same path on disk. The second write would clobber the
+        first's bytes, corrupting the first entry without raising.
+
+        Both sides are resolved to absolute paths before comparison so a
+        relative-vs-absolute mismatch (e.g. `SOUNDS_DIR=sounds` in config
+        vs `sounds/foo.mp3` already stored absolutely) doesn't defeat the
+        check. `.resolve(strict=False)` doesn't raise on missing files,
+        but we still guard against OSError on path encoding edge cases.
         """
+        try:
+            target = Path(path).resolve(strict=False)
+        except OSError:
+            return None
         for existing_name, existing_entry in self.store.list_sounds():
-            if Path(existing_entry["file"]) == path:
-                return existing_name
+            try:
+                if Path(existing_entry["file"]).resolve(strict=False) == target:
+                    return existing_name
+            except OSError:
+                continue
         return None
 
     @app_commands.command(name="addsound", description="Add a new sound")
@@ -534,6 +547,7 @@ class Soundboard(commands.Cog):
         tagged_existing = []
         already_tagged = []
         file_conflict = []
+        path_conflict = []
         failed = []
         for sound in sounds:
             try:
@@ -555,7 +569,14 @@ class Soundboard(commands.Cog):
             if bucket == "file_conflict":
                 file_conflict.append(key)
                 continue
-            # bucket == "needs_download"
+            # bucket == "needs_download". Even though `key` doesn't have a
+            # store entry, the dest path could still be owned by an entry
+            # under a different name (dangling pointer, manual JSON edit,
+            # etc.). Don't silently overwrite — same guard addsound uses.
+            other_owner = self._find_existing_by_path(dest)
+            if other_owner is not None:
+                path_conflict.append(f"{key} (owned by '{other_owner}')")
+                continue
             try:
                 await sound.save(dest)
                 validate_sound(dest, config.MAX_DURATION)
@@ -592,6 +613,11 @@ class Soundboard(commands.Cog):
             names = ", ".join(file_conflict)
             parts.append(
                 f"File conflict {len(file_conflict)} (a different file with that name exists on disk): {names}"
+            )
+        if path_conflict:
+            names = ", ".join(path_conflict)
+            parts.append(
+                f"Path conflict {len(path_conflict)} (another sound entry already owns that file): {names}"
             )
         if failed:
             parts.append(f"Failed {len(failed)}: {', '.join(failed)}")

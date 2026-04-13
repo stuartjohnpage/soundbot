@@ -244,6 +244,130 @@ class TestRemoveSoundCacheInvalidation:
         assert cog.pcm_cache._cache == before
 
 
+class TestFindExistingByPath:
+    """Direct unit tests for the _find_existing_by_path helper. The
+    integration tests in TestAddSoundClobberPrevention exercise it
+    through addsound; these cover its contract independently so a future
+    refactor can move the iteration without losing coverage."""
+
+    def test_returns_name_when_path_matches(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        sounds_dir = Path(cog.store._sounds_dir)
+        path = sounds_dir / "alpha.mp3"
+        path.write_bytes(b"")
+        cog.store.add("alpha", path)
+
+        assert cog._find_existing_by_path(path) == "alpha"
+
+    def test_returns_none_for_unowned_path(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        sounds_dir = Path(cog.store._sounds_dir)
+        owned = sounds_dir / "alpha.mp3"
+        owned.write_bytes(b"")
+        cog.store.add("alpha", owned)
+
+        unowned = sounds_dir / "beta.mp3"
+        assert cog._find_existing_by_path(unowned) is None
+
+    def test_returns_none_on_empty_store(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        sounds_dir = Path(cog.store._sounds_dir)
+        assert cog._find_existing_by_path(sounds_dir / "anything.mp3") is None
+
+    def test_finds_match_among_multiple_entries(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        sounds_dir = Path(cog.store._sounds_dir)
+        for name in ("one", "two", "three"):
+            p = sounds_dir / f"{name}.mp3"
+            p.write_bytes(b"")
+            cog.store.add(name, p)
+
+        target = sounds_dir / "two.mp3"
+        assert cog._find_existing_by_path(target) == "two"
+
+    def test_resolves_relative_against_absolute(self, tmp_path, monkeypatch):
+        """The helper resolves both sides — same logical file via different
+        path representations (relative vs absolute) should still match."""
+        cog = _make_cog(tmp_path)
+        sounds_dir = Path(cog.store._sounds_dir)
+
+        # Store an entry with the absolute path
+        abs_path = (sounds_dir / "alpha.mp3").resolve()
+        abs_path.write_bytes(b"")
+        cog.store.add("alpha", abs_path)
+
+        # Look it up by a relative path that resolves to the same place
+        monkeypatch.chdir(sounds_dir)
+        assert cog._find_existing_by_path(Path("alpha.mp3")) == "alpha"
+
+    def test_does_not_raise_on_unusual_paths(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        # Empty store: any input path should return None, never raise
+        assert cog._find_existing_by_path(Path("")) is None
+        assert cog._find_existing_by_path(Path("does/not/exist.mp3")) is None
+
+
+class TestImportSoundsPathConflict:
+    """The same store-entry-path-collision guard that addsound got needs
+    to fire in importsounds too: a fresh download of a Discord soundboard
+    sound must not silently overwrite a file owned by an entry under a
+    different name."""
+
+    def test_path_conflict_blocks_download(self, tmp_path, monkeypatch):
+        from soundbot import config
+
+        cog = _make_cog(tmp_path)
+        sounds_dir = Path(cog.store._sounds_dir)
+        monkeypatch.setattr(config, "SOUNDS_DIR", sounds_dir)
+        monkeypatch.setattr(config, "MAX_DURATION", 60)
+
+        # Pre-populate: an entry under the name "owner" points at the
+        # path that "victim.ogg" would download to. The file is *not* on
+        # disk (so classify_import_sound returns "needs_download"), but
+        # the entry still owns it. Without the guard, we'd silently
+        # overwrite "owner"'s file with the new download.
+        target_path = sounds_dir / "victim.ogg"
+        cog.store.add("owner", target_path)
+
+        # Discord soundboard sound mock — sanitize_name("victim") -> "victim"
+        sound = MagicMock()
+        sound.name = "victim"
+        sound.id = 1234
+
+        save_called = []
+
+        async def fake_save(path):
+            save_called.append(str(path))
+            Path(path).write_bytes(b"new-bytes")
+
+        sound.save = fake_save
+
+        guild = MagicMock()
+        guild.name = "test-guild"
+        guild.fetch_soundboard_sounds = AsyncMock(return_value=[sound])
+
+        interaction = _make_interaction()
+        interaction.guild = guild
+
+        asyncio.run(Soundboard.importsounds.callback(cog, interaction))
+
+        # sound.save was never called — the guard refused before download
+        assert save_called == []
+        # "owner" entry intact
+        assert cog.store.get("owner")["file"] == str(target_path)
+        # No "victim" entry was added
+        assert cog.store.get("victim") is None
+        # The user was told via the followup summary
+        interaction.followup.send.assert_called()
+        # Find the summary call (the one that mentions "Path conflict")
+        summary_calls = [
+            c for c in interaction.followup.send.call_args_list
+            if "Path conflict" in (c.args[0] if c.args else "")
+        ]
+        assert len(summary_calls) == 1
+        assert "owner" in summary_calls[0].args[0]
+
+
 class TestAddSoundClobberPrevention:
     """The error-path unlink in addsound used to clobber another entry's
     file. Pre-existing bug, surfaced in the second review of PR #18.
