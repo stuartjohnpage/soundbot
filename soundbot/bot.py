@@ -699,6 +699,10 @@ def create_bot() -> commands.Bot:
                 guild = discord.Object(id=config.GUILD_ID)
                 bot.tree.copy_global_to(guild=guild)
                 await bot.tree.sync(guild=guild)
+                # Wipe any leftover global registrations from prior non-guild
+                # syncs so commands don't appear twice in the guild.
+                bot.tree.clear_commands(guild=None)
+                await bot.tree.sync()
             else:
                 await bot.tree.sync()
 
