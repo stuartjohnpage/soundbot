@@ -174,9 +174,23 @@ class Soundboard(commands.Cog):
             )
             return
 
+        # The to_thread await above is a yield point: a concurrent /leave can
+        # tear down the mixer and disconnect the voice client before we get
+        # back here. Re-check before touching self.mixer — otherwise we'd
+        # silently drop the sound and leak an orphan mixer.
+        if self.mixer is None or not vc.is_connected():
+            logger.info("voice torn down during decode, dropping sound=%s", name)
+            if not interaction.response.is_done():
+                try:
+                    await interaction.response.send_message(
+                        "Voice connection lost while loading sound.",
+                        ephemeral=True,
+                    )
+                except discord.HTTPException:
+                    pass
+            return
+
         source = CachedPCMSource(pcm_bytes)
-        if self.mixer is None:
-            self.mixer = MixerSource(volume=self.volume)
         self.mixer.add(source)
 
         self.store.increment_play_count(name)
@@ -362,6 +376,11 @@ class Soundboard(commands.Cog):
                 dest.unlink(missing_ok=True)
                 dest = audio_dest
             validate_sound(dest, config.MAX_DURATION)
+            # Drop any stale cached PCM for this path before the new entry
+            # is added. Two distinct sound names uploaded with the same
+            # filename land at the same dest on disk, and a previous /play
+            # may have populated the cache with the old file's bytes.
+            self.pcm_cache.invalidate(dest)
             self.store.add(
                 name, dest, category=category, uploaded_by=str(interaction.user)
             )
@@ -408,6 +427,10 @@ class Soundboard(commands.Cog):
     async def renamesound(
         self, interaction: discord.Interaction, old: str, new: str
     ) -> None:
+        # No pcm_cache interaction needed: store.rename swaps the dict key
+        # in metadata but leaves the file on disk at the same path, and the
+        # cache is keyed by file path. The same bytes are still correct
+        # under the new name.
         try:
             self.store.rename(old, new)
             self.store.save()

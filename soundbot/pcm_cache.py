@@ -26,7 +26,10 @@ def decode_to_pcm(file_path: str | Path) -> bytes:
 
     Format matches discord.py's voice pipeline exactly so the output can
     be fed to the mixer with no further conversion. Raises ValueError on
-    decode failure (bad file, ffmpeg missing, timeout).
+    decode failure (bad file, ffmpeg missing, timeout). The ffmpeg stderr
+    tail is included in the exception message so the caller's log line
+    names the actual cause (codec missing, unsupported format, etc.)
+    rather than an opaque "Failed to decode".
     """
     try:
         result = subprocess.run(
@@ -43,12 +46,16 @@ def decode_to_pcm(file_path: str | Path) -> bytes:
             check=True,
             timeout=30,
         )
-    except (
-        subprocess.CalledProcessError,
-        subprocess.TimeoutExpired,
-        FileNotFoundError,
-    ) as exc:
-        raise ValueError(f"Failed to decode audio: {file_path}") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", "replace").strip()
+        detail = f": {stderr[:200]}" if stderr else ""
+        raise ValueError(f"Failed to decode audio: {file_path}{detail}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"Failed to decode audio: {file_path} (timed out)") from exc
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"Failed to decode audio: {file_path} (ffmpeg not found)"
+        ) from exc
     return result.stdout
 
 
@@ -58,6 +65,14 @@ class PCMCache:
     Threading: `get` calls the decoder synchronously; callers that run
     inside asyncio should wrap with `asyncio.to_thread` so the event
     loop stays responsive while a cold miss is decoding.
+
+    Memory: no eviction. At 48kHz/stereo/s16le the wire format is
+    ~192KB/sec, so a typical 2s soundboard clip is ~380KB. A library of
+    100 clips fits comfortably in <50MB, which is fine for this bot's
+    expected scale. If the library grows past the low thousands, or if
+    average clip length jumps (music, long samples), swap this for an
+    LRU keyed by byte budget. There is no runtime signal that tells you
+    you've hit the wall — watch RSS.
     """
 
     def __init__(

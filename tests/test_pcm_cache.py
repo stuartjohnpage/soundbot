@@ -34,6 +34,24 @@ class TestDecodeToPcm:
             with pytest.raises(ValueError, match="Failed to decode"):
                 decode_to_pcm("missing.ogg")
 
+    def test_called_process_error_preserves_ffmpeg_stderr(self):
+        """The opaque 'Failed to decode' error was the #1 review nit —
+        we should surface ffmpeg's stderr so logs name the real cause."""
+        err = subprocess.CalledProcessError(
+            1, "ffmpeg", stderr=b"unsupported codec: foo"
+        )
+        with patch("soundbot.pcm_cache.subprocess.run") as mock_run:
+            mock_run.side_effect = err
+            with pytest.raises(ValueError, match="unsupported codec: foo"):
+                decode_to_pcm("bad.ogg")
+
+    def test_called_process_error_with_no_stderr_is_safe(self):
+        err = subprocess.CalledProcessError(1, "ffmpeg", stderr=None)
+        with patch("soundbot.pcm_cache.subprocess.run") as mock_run:
+            mock_run.side_effect = err
+            with pytest.raises(ValueError, match="Failed to decode"):
+                decode_to_pcm("bad.ogg")
+
     def test_timeout_raises_value_error(self):
         with patch("soundbot.pcm_cache.subprocess.run") as mock_run:
             mock_run.side_effect = subprocess.TimeoutExpired("ffmpeg", 30)
