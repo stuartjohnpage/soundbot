@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 from pathlib import Path
@@ -11,6 +12,7 @@ from .audio import extract_audio, has_video_stream, validate_sound
 from .migration import run_migration_if_needed
 from .mixer import MixerSource
 from .pagination import paginate
+from .pcm_cache import CachedPCMSource, PCMCache
 from .store import SoundStore, parse_tags
 
 logger = logging.getLogger("soundbot")
@@ -87,6 +89,7 @@ class Soundboard(commands.Cog):
         self.store = store
         self.mixer: MixerSource | None = None
         self.volume: float = config.DEFAULT_VOLUME / 100.0
+        self.pcm_cache = PCMCache()
 
     async def cog_load(self) -> None:
         self._save_loop.start()
@@ -115,7 +118,7 @@ class Soundboard(commands.Cog):
             await interaction.guild.voice_client.move_to(channel)
         else:
             vc = await channel.connect()
-            self.mixer = MixerSource()
+            self.mixer = MixerSource(volume=self.volume)
             vc.play(self.mixer)
         await interaction.response.send_message(f"Joined **{channel.name}**.")
 
@@ -159,12 +162,35 @@ class Soundboard(commands.Cog):
             )
             return
 
-        source = discord.FFmpegPCMAudio(
-            entry["file"],
-            options=f"-filter:a volume={self.volume}",
-        )
-        if self.mixer is None:
-            self.mixer = MixerSource()
+        # First play for a file pays the ffmpeg decode cost; every subsequent
+        # press is an in-memory slice. Done via to_thread so a cold miss
+        # doesn't block the event loop.
+        try:
+            pcm_bytes = await asyncio.to_thread(self.pcm_cache.get, entry["file"])
+        except ValueError as exc:
+            logger.warning("decode failed for %s: %s", name, exc)
+            await interaction.response.send_message(
+                f"Failed to decode **{name}**.", ephemeral=True
+            )
+            return
+
+        # The to_thread await above is a yield point: a concurrent /leave can
+        # tear down the mixer and disconnect the voice client before we get
+        # back here. Re-check before touching self.mixer — otherwise we'd
+        # silently drop the sound and leak an orphan mixer.
+        if self.mixer is None or not vc.is_connected():
+            logger.info("voice torn down during decode, dropping sound=%s", name)
+            if not interaction.response.is_done():
+                try:
+                    await interaction.response.send_message(
+                        "Voice connection lost while loading sound.",
+                        ephemeral=True,
+                    )
+                except discord.HTTPException:
+                    pass
+            return
+
+        source = CachedPCMSource(pcm_bytes)
         self.mixer.add(source)
 
         self.store.increment_play_count(name)
@@ -278,6 +304,10 @@ class Soundboard(commands.Cog):
             )
             return
         self.volume = level / 100.0
+        # Mixer holds its own copy so read() can apply volume without
+        # reaching back into the cog on every frame.
+        if self.mixer is not None:
+            self.mixer.volume = self.volume
         await interaction.response.send_message(f"Volume set to **{level}%**.")
 
     # -- Board --
@@ -301,6 +331,33 @@ class Soundboard(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view)
 
     # -- CRUD commands --
+
+    def _find_existing_by_path(self, path: Path) -> str | None:
+        """Return the name of any store entry whose file is `path`, or None.
+
+        Used by addsound and importsounds to refuse a write that would
+        silently overwrite another sound's file. Pre-fix bug: two sounds
+        with the same destination filename (different names) would both
+        land at the same path on disk. The second write would clobber the
+        first's bytes, corrupting the first entry without raising.
+
+        Both sides are resolved to absolute paths before comparison so a
+        relative-vs-absolute mismatch (e.g. `SOUNDS_DIR=sounds` in config
+        vs `sounds/foo.mp3` already stored absolutely) doesn't defeat the
+        check. `.resolve(strict=False)` doesn't raise on missing files,
+        but we still guard against OSError on path encoding edge cases.
+        """
+        try:
+            target = Path(path).resolve(strict=False)
+        except OSError:
+            return None
+        for existing_name, existing_entry in self.store.list_sounds():
+            try:
+                if Path(existing_entry["file"]).resolve(strict=False) == target:
+                    return existing_name
+            except OSError:
+                continue
+        return None
 
     @app_commands.command(name="addsound", description="Add a new sound")
     @app_commands.describe(
@@ -331,6 +388,24 @@ class Soundboard(commands.Cog):
         if not dest.resolve().is_relative_to(config.SOUNDS_DIR.resolve()):
             await interaction.followup.send("Invalid filename.", ephemeral=True)
             return
+        # Must come before file.save: we never want to write to a path that
+        # another entry already owns. Catches both same-name re-uploads
+        # (refuse, tell user to remove first) and different-name same-filename
+        # collisions (would otherwise corrupt the existing entry).
+        owner = self._find_existing_by_path(dest)
+        if owner is not None:
+            if owner == name.lower():
+                msg = (
+                    f"Sound **{owner}** already uses `{dest.name}`. "
+                    "Remove it first if you want to replace it."
+                )
+            else:
+                msg = (
+                    f"Cannot upload: `{dest.name}` is already in use by sound "
+                    f"**{owner}**. Remove that sound first or rename your upload."
+                )
+            await interaction.followup.send(msg, ephemeral=True)
+            return
         await file.save(dest)
         try:
             if has_video_stream(dest):
@@ -342,10 +417,28 @@ class Soundboard(commands.Cog):
                         ephemeral=True,
                     )
                     return
+                # Same no-clobber guard as the pre-save check, but for the
+                # extracted audio destination. Covers the case where a store
+                # entry references a file path that was manually deleted off
+                # disk — the .exists() check above would miss it.
+                audio_owner = self._find_existing_by_path(audio_dest)
+                if audio_owner is not None:
+                    dest.unlink(missing_ok=True)
+                    await interaction.followup.send(
+                        f"Cannot upload: `{audio_dest.name}` is already in use "
+                        f"by sound **{audio_owner}**. Remove that sound first.",
+                        ephemeral=True,
+                    )
+                    return
                 extract_audio(dest, audio_dest)
                 dest.unlink(missing_ok=True)
                 dest = audio_dest
             validate_sound(dest, config.MAX_DURATION)
+            # Drop any stale cached PCM for this path before the new entry
+            # is added. Two distinct sound names uploaded with the same
+            # filename land at the same dest on disk, and a previous /play
+            # may have populated the cache with the old file's bytes.
+            self.pcm_cache.invalidate(dest)
             self.store.add(
                 name, dest, category=category, uploaded_by=str(interaction.user)
             )
@@ -354,6 +447,11 @@ class Soundboard(commands.Cog):
             # Single save after the batch — add_tag mutates only in-memory state.
             self.store.save()
         except ValueError as exc:
+            # Safe to unlink: _find_existing_by_path above guarantees no
+            # other entry references this path, and the same check fires
+            # for audio_dest post-extraction. (Concurrent /addsound calls
+            # could race around the file.save yield point — that's a
+            # pre-existing TOCTOU limitation, not introduced by this.)
             dest.unlink(missing_ok=True)
             await interaction.followup.send(str(exc), ephemeral=True)
             return
@@ -369,6 +467,7 @@ class Soundboard(commands.Cog):
     async def removesound(
         self, interaction: discord.Interaction, name: str
     ) -> None:
+        entry = self.store.get(name)
         try:
             self.store.remove(name)
             self.store.save()
@@ -377,6 +476,11 @@ class Soundboard(commands.Cog):
                 f"Sound **{name}** not found.", ephemeral=True
             )
             return
+        # Drop any cached PCM so a re-add under the same filename doesn't
+        # serve stale bytes. `entry` was fetched before remove(), so we
+        # still have the path even though the store entry is gone.
+        if entry is not None:
+            self.pcm_cache.invalidate(entry["file"])
         await interaction.response.send_message(f"Removed sound **{name}**.")
 
     @app_commands.command(name="renamesound", description="Rename a sound")
@@ -386,6 +490,10 @@ class Soundboard(commands.Cog):
     async def renamesound(
         self, interaction: discord.Interaction, old: str, new: str
     ) -> None:
+        # No pcm_cache interaction needed: store.rename swaps the dict key
+        # in metadata but leaves the file on disk at the same path, and the
+        # cache is keyed by file path. The same bytes are still correct
+        # under the new name.
         try:
             self.store.rename(old, new)
             self.store.save()
@@ -439,6 +547,7 @@ class Soundboard(commands.Cog):
         tagged_existing = []
         already_tagged = []
         file_conflict = []
+        path_conflict = []
         failed = []
         for sound in sounds:
             try:
@@ -460,7 +569,14 @@ class Soundboard(commands.Cog):
             if bucket == "file_conflict":
                 file_conflict.append(key)
                 continue
-            # bucket == "needs_download"
+            # bucket == "needs_download". Even though `key` doesn't have a
+            # store entry, the dest path could still be owned by an entry
+            # under a different name (dangling pointer, manual JSON edit,
+            # etc.). Don't silently overwrite — same guard addsound uses.
+            other_owner = self._find_existing_by_path(dest)
+            if other_owner is not None:
+                path_conflict.append(f"{key} (owned by '{other_owner}')")
+                continue
             try:
                 await sound.save(dest)
                 validate_sound(dest, config.MAX_DURATION)
@@ -497,6 +613,11 @@ class Soundboard(commands.Cog):
             names = ", ".join(file_conflict)
             parts.append(
                 f"File conflict {len(file_conflict)} (a different file with that name exists on disk): {names}"
+            )
+        if path_conflict:
+            names = ", ".join(path_conflict)
+            parts.append(
+                f"Path conflict {len(path_conflict)} (another sound entry already owns that file): {names}"
             )
         if failed:
             parts.append(f"Failed {len(failed)}: {', '.join(failed)}")

@@ -124,6 +124,85 @@ class TestMixerShortFrames:
         assert len(frame) == FRAME_SIZE
 
 
+class TestMixerVolume:
+    def test_default_volume_is_unity(self):
+        """Default volume=1.0 must leave samples untouched."""
+        mixer = MixerSource()
+        assert mixer.volume == 1.0
+        mixer.add(FakeSource(sample_value=1000, num_frames=1))
+
+        frame = mixer.read()
+        samples = struct.unpack(f"<{FRAME_SIZE // 2}h", frame)
+        assert all(s == 1000 for s in samples)
+
+    def test_half_volume_halves_samples(self):
+        mixer = MixerSource(volume=0.5)
+        mixer.add(FakeSource(sample_value=1000, num_frames=1))
+
+        frame = mixer.read()
+        samples = struct.unpack(f"<{FRAME_SIZE // 2}h", frame)
+        assert all(s == 500 for s in samples)
+
+    def test_zero_volume_silences_output(self):
+        mixer = MixerSource(volume=0.0)
+        mixer.add(FakeSource(sample_value=5000, num_frames=1))
+
+        frame = mixer.read()
+        samples = struct.unpack(f"<{FRAME_SIZE // 2}h", frame)
+        assert all(s == 0 for s in samples)
+
+    def test_volume_setter_changes_subsequent_reads(self):
+        """The /volume command mutates `mixer.volume` at runtime."""
+        mixer = MixerSource(volume=1.0)
+        mixer.add(FakeSource(sample_value=4000, num_frames=2))
+
+        frame1 = mixer.read()
+        samples1 = struct.unpack(f"<{FRAME_SIZE // 2}h", frame1)
+        assert all(s == 4000 for s in samples1)
+
+        mixer.volume = 0.25
+        frame2 = mixer.read()
+        samples2 = struct.unpack(f"<{FRAME_SIZE // 2}h", frame2)
+        assert all(s == 1000 for s in samples2)
+
+    def test_volume_applied_after_summing(self):
+        """Volume scales the mix, not each source independently.
+
+        With two sources at 20000 and volume=0.5, the mix is (20000+20000)*0.5
+        = 20000, which stays well under the int16 clip ceiling. If volume
+        were applied per-source before summing, same answer — so use values
+        where it matters: 30000+30000=60000, pre-clip *0.5=30000 (valid),
+        vs per-source 15000+15000=30000 (also valid, same result).
+        The distinguishing case is headroom beyond int16.
+        """
+        mixer = MixerSource(volume=0.5)
+        mixer.add(FakeSource(sample_value=30000, num_frames=1))
+        mixer.add(FakeSource(sample_value=30000, num_frames=1))
+
+        frame = mixer.read()
+        samples = struct.unpack(f"<{FRAME_SIZE // 2}h", frame)
+        # (30000 + 30000) * 0.5 = 30000, no clip
+        assert all(s == 30000 for s in samples)
+
+    def test_clipping_still_applies_with_volume(self):
+        """Volume *boost* (>1.0) must still clip to int16 range."""
+        mixer = MixerSource(volume=2.0)
+        mixer.add(FakeSource(sample_value=20000, num_frames=1))
+
+        frame = mixer.read()
+        samples = struct.unpack(f"<{FRAME_SIZE // 2}h", frame)
+        # 20000 * 2 = 40000, clipped to 32767
+        assert all(s == 32767 for s in samples)
+
+    def test_negative_clipping_with_volume(self):
+        mixer = MixerSource(volume=2.0)
+        mixer.add(FakeSource(sample_value=-20000, num_frames=1))
+
+        frame = mixer.read()
+        samples = struct.unpack(f"<{FRAME_SIZE // 2}h", frame)
+        assert all(s == -32768 for s in samples)
+
+
 class TestMixerCleanup:
     def test_finished_sources_are_cleaned_up(self):
         mixer = MixerSource()

@@ -15,9 +15,13 @@ class MixerSource(discord.AudioSource):
     Returns empty bytes only when explicitly stopped.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, volume: float = 1.0) -> None:
         self._sources: list = []
         self._stopped: bool = False
+        # Applied sample-wise in read() before clipping. Moved out of the
+        # per-press `ffmpeg -filter:a volume=...` path so playback can skip
+        # ffmpeg entirely — see soundbot/pcm_cache.py.
+        self.volume: float = volume
 
     def add(self, source) -> None:
         self._sources.append(source)
@@ -59,9 +63,11 @@ class MixerSource(discord.AudioSource):
         if not active:
             return SILENCE
 
-        # Clip to int16 range
+        # Apply volume then clip to int16 range. int(x * 1.0) == x for int
+        # x, so volume=1.0 is effectively a pass-through.
+        volume = self.volume
         for i in range(SAMPLES_PER_FRAME):
-            mixed[i] = max(-32768, min(32767, mixed[i]))
+            mixed[i] = max(-32768, min(32767, int(mixed[i] * volume)))
 
         return struct.pack(f"<{SAMPLES_PER_FRAME}h", *mixed)
 
