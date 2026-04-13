@@ -196,7 +196,10 @@ class TestVolumeCommand:
         asyncio.run(Soundboard.volume.callback(cog, interaction, 75))
 
         assert cog.volume == 0.75
-        # Did not raise
+        # Did not raise, and still confirmed to the user
+        interaction.response.send_message.assert_called_once()
+        args, _ = interaction.response.send_message.call_args
+        assert "75" in args[0]
 
     def test_volume_command_rejects_out_of_range(self, tmp_path):
         cog = _make_cog(tmp_path)
@@ -229,11 +232,139 @@ class TestRemoveSoundCacheInvalidation:
         cog = _make_cog(tmp_path)
         cog.pcm_cache = PCMCache(decoder=lambda p: b"cached")
         cog.pcm_cache.get("some/other/path")
+        cog.pcm_cache.get("another/path")
+        before = dict(cog.pcm_cache._cache)
 
         interaction = _make_interaction()
         asyncio.run(Soundboard.removesound.callback(cog, interaction, "ghost"))
 
-        assert "some/other/path" in cog.pcm_cache
+        # Stronger than "specific key still present": every entry is
+        # still present and nothing new appeared. Would fail if
+        # removesound ever started invalidating an arbitrary path.
+        assert cog.pcm_cache._cache == before
+
+
+class TestAddSoundClobberPrevention:
+    """The error-path unlink in addsound used to clobber another entry's
+    file. Pre-existing bug, surfaced in the second review of PR #18.
+    Both clobber scenarios are covered:
+
+    - Different name, same uploaded filename: silently corrupts the
+      existing entry even without raising. Must refuse pre-save.
+    - Same name, same filename: `store.add` raises on name collision,
+      error path unlinks the file the *existing* entry still needs.
+      Also refuse pre-save.
+    """
+
+    def _setup(self, tmp_path, monkeypatch):
+        from soundbot import config
+
+        cog = _make_cog(tmp_path)
+        sounds_dir = Path(cog.store._sounds_dir)
+        monkeypatch.setattr(config, "SOUNDS_DIR", sounds_dir)
+        monkeypatch.setattr(config, "MAX_DURATION", 60)
+        monkeypatch.setattr("soundbot.bot.has_video_stream", lambda p: False)
+        monkeypatch.setattr("soundbot.bot.validate_sound", lambda p, d: None)
+        return cog, sounds_dir
+
+    def test_different_name_same_filename_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        cog, sounds_dir = self._setup(tmp_path, monkeypatch)
+
+        existing_path = sounds_dir / "thing.mp3"
+        existing_path.write_bytes(b"first-content")
+        cog.store.add("first", existing_path)
+
+        attachment = MagicMock(spec=discord.Attachment)
+        attachment.filename = "thing.mp3"
+
+        async def fake_save(path):
+            Path(path).write_bytes(b"second-content")
+
+        attachment.save = fake_save
+
+        interaction = _make_interaction()
+        asyncio.run(
+            Soundboard.addsound.callback(
+                cog, interaction, "second", attachment
+            )
+        )
+
+        # File content is intact — file.save never ran
+        assert existing_path.read_bytes() == b"first-content"
+        # No "second" entry was added
+        assert cog.store.get("second") is None
+        # Original "first" entry intact
+        assert cog.store.get("first")["file"] == str(existing_path)
+        # User was told why
+        interaction.followup.send.assert_called_once()
+        args, kwargs = interaction.followup.send.call_args
+        assert "first" in args[0]
+        assert kwargs.get("ephemeral") is True
+
+    def test_same_name_same_filename_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        cog, sounds_dir = self._setup(tmp_path, monkeypatch)
+
+        existing_path = sounds_dir / "thing.mp3"
+        existing_path.write_bytes(b"original-content")
+        cog.store.add("existing", existing_path)
+
+        attachment = MagicMock(spec=discord.Attachment)
+        attachment.filename = "thing.mp3"
+
+        async def fake_save(path):
+            Path(path).write_bytes(b"replacement-content")
+
+        attachment.save = fake_save
+
+        interaction = _make_interaction()
+        asyncio.run(
+            Soundboard.addsound.callback(
+                cog, interaction, "existing", attachment
+            )
+        )
+
+        # Original file content preserved — file.save never ran
+        assert existing_path.read_bytes() == b"original-content"
+        # Store entry intact
+        assert cog.store.get("existing") is not None
+        # User told to remove first
+        interaction.followup.send.assert_called_once()
+        args, _ = interaction.followup.send.call_args
+        assert "remove" in args[0].lower() or "already" in args[0].lower()
+
+    def test_different_name_different_filename_succeeds(
+        self, tmp_path, monkeypatch
+    ):
+        """The guard must not false-positive on unrelated uploads."""
+        cog, sounds_dir = self._setup(tmp_path, monkeypatch)
+
+        existing_path = sounds_dir / "alpha.mp3"
+        existing_path.write_bytes(b"alpha-bytes")
+        cog.store.add("alpha", existing_path)
+
+        attachment = MagicMock(spec=discord.Attachment)
+        attachment.filename = "beta.mp3"
+
+        async def fake_save(path):
+            Path(path).write_bytes(b"beta-bytes")
+
+        attachment.save = fake_save
+
+        interaction = _make_interaction()
+        asyncio.run(
+            Soundboard.addsound.callback(
+                cog, interaction, "beta", attachment
+            )
+        )
+
+        assert cog.store.get("beta") is not None
+        assert cog.store.get("alpha") is not None
+        assert (sounds_dir / "beta.mp3").read_bytes() == b"beta-bytes"
+        assert existing_path.read_bytes() == b"alpha-bytes"
 
 
 class TestAddSoundCacheInvalidation:

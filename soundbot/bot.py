@@ -332,6 +332,20 @@ class Soundboard(commands.Cog):
 
     # -- CRUD commands --
 
+    def _find_existing_by_path(self, path: Path) -> str | None:
+        """Return the name of any store entry whose file is `path`, or None.
+
+        Used by addsound to refuse an upload that would silently overwrite
+        another sound's file. Pre-fix bug: two sounds with the same
+        uploaded filename (different names) would both land at the same
+        dest on disk. The second upload would clobber the first's bytes,
+        corrupting the first entry even though no exception was raised.
+        """
+        for existing_name, existing_entry in self.store.list_sounds():
+            if Path(existing_entry["file"]) == path:
+                return existing_name
+        return None
+
     @app_commands.command(name="addsound", description="Add a new sound")
     @app_commands.describe(
         name="Sound name",
@@ -361,6 +375,24 @@ class Soundboard(commands.Cog):
         if not dest.resolve().is_relative_to(config.SOUNDS_DIR.resolve()):
             await interaction.followup.send("Invalid filename.", ephemeral=True)
             return
+        # Must come before file.save: we never want to write to a path that
+        # another entry already owns. Catches both same-name re-uploads
+        # (refuse, tell user to remove first) and different-name same-filename
+        # collisions (would otherwise corrupt the existing entry).
+        owner = self._find_existing_by_path(dest)
+        if owner is not None:
+            if owner == name.lower():
+                msg = (
+                    f"Sound **{owner}** already uses `{dest.name}`. "
+                    "Remove it first if you want to replace it."
+                )
+            else:
+                msg = (
+                    f"Cannot upload: `{dest.name}` is already in use by sound "
+                    f"**{owner}**. Remove that sound first or rename your upload."
+                )
+            await interaction.followup.send(msg, ephemeral=True)
+            return
         await file.save(dest)
         try:
             if has_video_stream(dest):
@@ -369,6 +401,19 @@ class Soundboard(commands.Cog):
                     dest.unlink(missing_ok=True)
                     await interaction.followup.send(
                         f"A file named `{audio_dest.name}` already exists.",
+                        ephemeral=True,
+                    )
+                    return
+                # Same no-clobber guard as the pre-save check, but for the
+                # extracted audio destination. Covers the case where a store
+                # entry references a file path that was manually deleted off
+                # disk — the .exists() check above would miss it.
+                audio_owner = self._find_existing_by_path(audio_dest)
+                if audio_owner is not None:
+                    dest.unlink(missing_ok=True)
+                    await interaction.followup.send(
+                        f"Cannot upload: `{audio_dest.name}` is already in use "
+                        f"by sound **{audio_owner}**. Remove that sound first.",
                         ephemeral=True,
                     )
                     return
@@ -389,6 +434,11 @@ class Soundboard(commands.Cog):
             # Single save after the batch — add_tag mutates only in-memory state.
             self.store.save()
         except ValueError as exc:
+            # Safe to unlink: _find_existing_by_path above guarantees no
+            # other entry references this path, and the same check fires
+            # for audio_dest post-extraction. (Concurrent /addsound calls
+            # could race around the file.save yield point — that's a
+            # pre-existing TOCTOU limitation, not introduced by this.)
             dest.unlink(missing_ok=True)
             await interaction.followup.send(str(exc), ephemeral=True)
             return
