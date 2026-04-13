@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 from pathlib import Path
@@ -11,6 +12,7 @@ from .audio import extract_audio, has_video_stream, validate_sound
 from .migration import run_migration_if_needed
 from .mixer import MixerSource
 from .pagination import paginate
+from .pcm_cache import CachedPCMSource, PCMCache
 from .store import SoundStore, parse_tags
 
 logger = logging.getLogger("soundbot")
@@ -87,6 +89,7 @@ class Soundboard(commands.Cog):
         self.store = store
         self.mixer: MixerSource | None = None
         self.volume: float = config.DEFAULT_VOLUME / 100.0
+        self.pcm_cache = PCMCache()
 
     async def cog_load(self) -> None:
         self._save_loop.start()
@@ -115,7 +118,7 @@ class Soundboard(commands.Cog):
             await interaction.guild.voice_client.move_to(channel)
         else:
             vc = await channel.connect()
-            self.mixer = MixerSource()
+            self.mixer = MixerSource(volume=self.volume)
             vc.play(self.mixer)
         await interaction.response.send_message(f"Joined **{channel.name}**.")
 
@@ -159,12 +162,21 @@ class Soundboard(commands.Cog):
             )
             return
 
-        source = discord.FFmpegPCMAudio(
-            entry["file"],
-            options=f"-filter:a volume={self.volume}",
-        )
+        # First play for a file pays the ffmpeg decode cost; every subsequent
+        # press is an in-memory slice. Done via to_thread so a cold miss
+        # doesn't block the event loop.
+        try:
+            pcm_bytes = await asyncio.to_thread(self.pcm_cache.get, entry["file"])
+        except ValueError as exc:
+            logger.warning("decode failed for %s: %s", name, exc)
+            await interaction.response.send_message(
+                f"Failed to decode **{name}**.", ephemeral=True
+            )
+            return
+
+        source = CachedPCMSource(pcm_bytes)
         if self.mixer is None:
-            self.mixer = MixerSource()
+            self.mixer = MixerSource(volume=self.volume)
         self.mixer.add(source)
 
         self.store.increment_play_count(name)
@@ -278,6 +290,10 @@ class Soundboard(commands.Cog):
             )
             return
         self.volume = level / 100.0
+        # Mixer holds its own copy so read() can apply volume without
+        # reaching back into the cog on every frame.
+        if self.mixer is not None:
+            self.mixer.volume = self.volume
         await interaction.response.send_message(f"Volume set to **{level}%**.")
 
     # -- Board --
@@ -369,6 +385,7 @@ class Soundboard(commands.Cog):
     async def removesound(
         self, interaction: discord.Interaction, name: str
     ) -> None:
+        entry = self.store.get(name)
         try:
             self.store.remove(name)
             self.store.save()
@@ -377,6 +394,11 @@ class Soundboard(commands.Cog):
                 f"Sound **{name}** not found.", ephemeral=True
             )
             return
+        # Drop any cached PCM so a re-add under the same filename doesn't
+        # serve stale bytes. `entry` was fetched before remove(), so we
+        # still have the path even though the store entry is gone.
+        if entry is not None:
+            self.pcm_cache.invalidate(entry["file"])
         await interaction.response.send_message(f"Removed sound **{name}**.")
 
     @app_commands.command(name="renamesound", description="Rename a sound")
