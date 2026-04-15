@@ -17,7 +17,7 @@ from .store import SoundStore, parse_tags
 
 logger = logging.getLogger("soundbot")
 
-SOUNDS_PER_BOARD_PAGE = 20  # 5 rows * 5 cols - 1 row for nav = 4*5
+SOUNDS_PER_BOARD = 25  # Discord's hard cap: 5 action rows * 5 buttons per row
 DISCORD_IMPORT_CATEGORY = "discord-import"
 _MAX_SUMMARY_LENGTH = 1900  # Leave headroom under Discord's 2000-char limit
 
@@ -325,10 +325,15 @@ class Soundboard(commands.Cog):
                 "No sounds in the library.", ephemeral=True
             )
             return
-        pages = paginate(sounds, per_page=SOUNDS_PER_BOARD_PAGE)
-        view = BoardView(self, pages, page=0)
-        embed = view.make_embed()
-        await interaction.response.send_message(embed=embed, view=view)
+        pages = paginate(sounds, per_page=SOUNDS_PER_BOARD)
+        # Defer so we can send multiple followup messages, one per board chunk.
+        await interaction.response.defer()
+        for idx, page_sounds in enumerate(pages, start=1):
+            view = BoardView(self, page_sounds)
+            embed = discord.Embed(
+                title="Soundboard" if len(pages) == 1 else f"Soundboard ({idx}/{len(pages)})",
+            )
+            await interaction.followup.send(embed=embed, view=view)
 
     # -- CRUD commands --
 
@@ -749,55 +754,23 @@ class Soundboard(commands.Cog):
 
 
 class BoardView(discord.ui.View):
-    def __init__(self, cog: Soundboard, pages, page: int = 0) -> None:
+    def __init__(self, cog: Soundboard, sounds) -> None:
         # timeout=None: buttons stay active until the bot restarts. Views aren't
         # persistent, so any existing boards go dead on restart — users re-run /board.
         super().__init__(timeout=None)
         self.cog = cog
-        self.pages = pages
-        self.page = page
-        self._build_buttons()
-
-    def _build_buttons(self) -> None:
-        self.clear_items()
-        for name, _ in self.pages[self.page]:
+        for name, _ in sounds:
             btn = discord.ui.Button(label=name, style=discord.ButtonStyle.primary)
             btn.callback = self._make_callback(name)
             self.add_item(btn)
-
-        if len(self.pages) > 1:
-            if self.page > 0:
-                prev_btn = discord.ui.Button(label="Previous", style=discord.ButtonStyle.secondary)
-                prev_btn.callback = self._prev
-                self.add_item(prev_btn)
-            if self.page < len(self.pages) - 1:
-                next_btn = discord.ui.Button(label="Next", style=discord.ButtonStyle.secondary)
-                next_btn.callback = self._next
-                self.add_item(next_btn)
-
-    def make_embed(self) -> discord.Embed:
-        return discord.Embed(
-            title="Soundboard",
-            description=f"Page {self.page + 1}/{len(self.pages)}",
-        )
 
     def _make_callback(self, name: str):
         async def callback(interaction: discord.Interaction):
             await self.cog._play_sound(interaction, name, suppress_reply=True)
             if not interaction.response.is_done():
-                await interaction.response.edit_message(embed=self.make_embed(), view=self)
+                await interaction.response.defer()
 
         return callback
-
-    async def _prev(self, interaction: discord.Interaction) -> None:
-        self.page -= 1
-        self._build_buttons()
-        await interaction.response.edit_message(embed=self.make_embed(), view=self)
-
-    async def _next(self, interaction: discord.Interaction) -> None:
-        self.page += 1
-        self._build_buttons()
-        await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
 
 def create_bot() -> commands.Bot:
