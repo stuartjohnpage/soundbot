@@ -43,7 +43,7 @@ A Discord bot that replaces Discord's built-in soundboard, removing the limitati
 
 - `/addsound name:<name> [category:<category>] file:<attachment>` — Upload an audio file directly in Discord.
 - Accepts any audio format that FFmpeg can decode (mp3, wav, ogg, m4a, flac, opus, webm, etc.).
-- Validates duration is **<= 6 seconds**. Rejects with an ephemeral error if exceeded.
+- Validates duration is **<= 6.4 seconds**. Rejects with an ephemeral error if exceeded.
 - Sound names must be unique (case-insensitive). Rejects duplicates.
 - Sound names must be alphanumeric + hyphens + underscores only, max 32 characters.
 - Category is optional. If omitted, the sound is uncategorized.

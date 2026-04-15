@@ -71,7 +71,7 @@ Create a role in your Discord server called **Soundbot Admin** (or whatever you 
 | `/random [category]` | Play a random sound |
 | `/board` | Show clickable button board of all sounds |
 | `/volume <0-100>` | Set playback volume (default: 50) |
-| `/addsound <name> <file> [category]` | Upload a new sound (max 6 seconds) |
+| `/addsound <name> <file> [category]` | Upload a new sound (max 6.4 seconds) |
 | `/removesound <name>` | Delete a sound |
 | `/renamesound <old> <new>` | Rename a sound |
 | `/listsounds [category] [page]` | List all sounds with play counts |
@@ -80,7 +80,7 @@ Create a role in your Discord server called **Soundbot Admin** (or whatever you 
 
 ### Via Discord
 
-Use `/addsound` and attach an audio file. Any format FFmpeg supports works (mp3, wav, ogg, m4a, flac, opus, etc.). Clips must be 6 seconds or shorter.
+Use `/addsound` and attach an audio file. Any format FFmpeg supports works (mp3, wav, ogg, m4a, flac, opus, etc.). Clips must be 6.4 seconds or shorter.
 
 ```
 /addsound name:airhorn category:memes file:[attach audio]
@@ -170,4 +170,4 @@ docker compose logs -f
 
 **"You don't have permission":** Make sure you have the admin role (default: `Soundbot Admin`). The role name is case-sensitive and must match `ADMIN_ROLE` in `.env` exactly.
 
-**Sound rejected as too long:** Clips must be 6 seconds or shorter. Trim your audio before uploading.
+**Sound rejected as too long:** Clips must be 6.4 seconds or shorter. Trim your audio before uploading.
