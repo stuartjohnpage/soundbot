@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from soundbot.bot import Soundboard
+from soundbot.bot import Soundboard, deploy_commands, sync_guild_commands
 from soundbot.mixer import MixerSource
 from soundbot.pcm_cache import CachedPCMSource, PCMCache
 from soundbot.store import SoundStore
@@ -529,3 +529,63 @@ class TestAddSoundCacheInvalidation:
         )
 
         assert cache_key not in cog.pcm_cache
+
+
+class TestCommandSync:
+    """Per-guild command deployment (replaces the old single-GUILD_ID sync).
+
+    Guild-scoped syncs are instant, so we copy the global command set into
+    every connected guild individually and then wipe Discord's *global*
+    registrations once — leaving the in-memory tree intact so a guild joined
+    later (on_guild_join) can still copy from it.
+    """
+
+    def test_sync_guild_commands_copies_then_syncs_that_guild(self):
+        tree = MagicMock()
+        tree.sync = AsyncMock()
+        guild = MagicMock()
+
+        asyncio.run(sync_guild_commands(tree, guild))
+
+        tree.copy_global_to.assert_called_once_with(guild=guild)
+        tree.sync.assert_awaited_once_with(guild=guild)
+
+    def test_deploy_syncs_every_guild_then_wipes_global_once(self):
+        tree = MagicMock()
+        tree.sync = AsyncMock()
+        http = MagicMock()
+        http.bulk_upsert_global_commands = AsyncMock()
+        guilds = [MagicMock(), MagicMock(), MagicMock()]
+
+        asyncio.run(deploy_commands(tree, http, 42, guilds))
+
+        assert tree.copy_global_to.call_count == 3
+        synced = [call.kwargs["guild"] for call in tree.sync.await_args_list]
+        assert synced == guilds
+        # Empty payload = delete all global commands, so they don't double up
+        # next to the per-guild copies. Exactly once.
+        http.bulk_upsert_global_commands.assert_awaited_once_with(42, [])
+
+    def test_deploy_does_not_clear_in_memory_tree(self):
+        """The global wipe must go through HTTP, not tree.clear_commands —
+        clearing the in-memory tree would strand later guild joins."""
+        tree = MagicMock()
+        tree.sync = AsyncMock()
+        http = MagicMock()
+        http.bulk_upsert_global_commands = AsyncMock()
+
+        asyncio.run(deploy_commands(tree, http, 1, [MagicMock()]))
+
+        tree.clear_commands.assert_not_called()
+
+    def test_deploy_with_no_guilds_still_wipes_stale_global(self):
+        tree = MagicMock()
+        tree.sync = AsyncMock()
+        http = MagicMock()
+        http.bulk_upsert_global_commands = AsyncMock()
+
+        asyncio.run(deploy_commands(tree, http, 7, []))
+
+        tree.copy_global_to.assert_not_called()
+        tree.sync.assert_not_awaited()
+        http.bulk_upsert_global_commands.assert_awaited_once_with(7, [])

@@ -45,7 +45,7 @@ DISCORD_TOKEN=your-bot-token-here
 docker compose up -d
 ```
 
-That's it. The bot will sync its slash commands with Discord on first startup (can take up to an hour for global commands to propagate).
+That's it. The bot syncs its slash commands to each server it's in on startup, and to any new server the moment it's invited. Guild-scoped syncs apply immediately — no waiting for global propagation.
 
 ### 4. Invite the bot to your server
 
@@ -120,7 +120,7 @@ All settings are environment variables, configured in `.env`:
 | `METADATA_FILE` | `./sounds.json` | Path to the metadata JSON file |
 | `DEFAULT_VOLUME` | `50` | Playback volume on startup (0-100) |
 | `LOG_FILE` | `./soundbot.log` | Log file path (rotating, 5MB, 3 backups) |
-| `SYNC_COMMANDS` | `true` | Sync slash commands on startup. Set to `false` after first run to avoid rate limits. |
+| `SYNC_COMMANDS` | `true` | Sync slash commands per-guild on startup and on join. Set to `false` to skip syncing entirely. |
 
 ## Data and Persistence
 
@@ -164,7 +164,7 @@ docker compose logs -f
 
 ## Troubleshooting
 
-**Commands not showing up:** Slash commands can take up to an hour to propagate globally. Wait, or restart with `SYNC_COMMANDS=true`.
+**Commands not showing up:** Commands sync per-guild and should appear within seconds. Make sure the bot is actually a member of the server (it must be invited with the `bot` scope, not just `applications.commands`), `SYNC_COMMANDS` is `true`, and try refreshing your Discord client (Ctrl+R).
 
 **Bot joins but no sound plays:** Make sure FFmpeg is installed in the container (it is by default in the Docker image). If running outside Docker, install FFmpeg manually.
 
