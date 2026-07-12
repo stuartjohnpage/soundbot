@@ -389,16 +389,7 @@ class TestAddSoundClobberPrevention:
     """
 
     def _setup(self, tmp_path, monkeypatch):
-        from soundbot import config
-
-        cog = _make_cog(tmp_path)
-        sounds_dir = Path(cog.store._sounds_dir)
-        monkeypatch.setattr(config, "SOUNDS_DIR", sounds_dir)
-        monkeypatch.setattr(config, "MAX_DURATION", 60)
-        monkeypatch.setattr("soundbot.bot.has_video_stream", lambda p: False)
-        monkeypatch.setattr("soundbot.bot.validate_sound", lambda p, d: None)
-        monkeypatch.setattr("soundbot.bot.normalize_loudness", lambda p, t: None)
-        return cog, sounds_dir
+        return _setup_addsound(tmp_path, monkeypatch)
 
     def test_different_name_same_filename_is_refused(
         self, tmp_path, monkeypatch
@@ -508,12 +499,7 @@ class TestAddSoundCacheInvalidation:
         filename land at the same dest on disk. If the first one was
         played, its PCM is in the cache — and the second add must wipe
         that entry or the new sound serves the old bytes."""
-        from soundbot import config
-
-        cog = _make_cog(tmp_path)
-        sounds_dir = Path(cog.store._sounds_dir)
-        monkeypatch.setattr(config, "SOUNDS_DIR", sounds_dir)
-        monkeypatch.setattr(config, "MAX_DURATION", 60)
+        cog, sounds_dir = _setup_addsound(tmp_path, monkeypatch)
 
         dest = sounds_dir / "thing.mp3"
         cache_key = str(dest)
@@ -528,10 +514,6 @@ class TestAddSoundCacheInvalidation:
             Path(path).write_bytes(b"new-file")
 
         attachment.save = fake_save
-
-        monkeypatch.setattr("soundbot.bot.has_video_stream", lambda p: False)
-        monkeypatch.setattr("soundbot.bot.validate_sound", lambda p, d: None)
-        monkeypatch.setattr("soundbot.bot.normalize_loudness", lambda p, t: None)
 
         interaction = _make_interaction()
         asyncio.run(
@@ -719,6 +701,45 @@ class TestAddSoundNormalization:
         args, _ = interaction.followup.send.call_args
         assert "Added sound" in args[0]
         assert "Normalized" not in args[0]
+
+
+class TestImportSoundsNormalization:
+    def test_downloaded_sound_is_normalized(self, tmp_path, monkeypatch):
+        """The upload-time normalization must fire for /importsounds
+        downloads too — imported soundboard sounds arrive at whatever
+        level they were uploaded to Discord at."""
+        from soundbot import config
+
+        calls = []
+
+        def fake_normalize(path, target):
+            calls.append((Path(path), target))
+            return -2.0
+
+        cog, sounds_dir = _setup_addsound(
+            tmp_path, monkeypatch, normalize=fake_normalize
+        )
+
+        sound = MagicMock()
+        sound.name = "fresh"
+        sound.id = 99
+
+        async def fake_save(path):
+            Path(path).write_bytes(b"ogg-bytes")
+
+        sound.save = fake_save
+
+        guild = MagicMock()
+        guild.name = "Test Guild"
+        guild.fetch_soundboard_sounds = AsyncMock(return_value=[sound])
+
+        interaction = _make_interaction()
+        interaction.guild = guild
+
+        asyncio.run(Soundboard.importsounds.callback(cog, interaction))
+
+        assert calls == [(sounds_dir / "fresh.ogg", config.TARGET_LUFS)]
+        assert cog.store.get("fresh") is not None
 
 
 class TestCommandSync:

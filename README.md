@@ -75,6 +75,7 @@ Create a role in your Discord server called **Soundbot Admin** (or whatever you 
 | `/removesound <name>` | Delete a sound |
 | `/renamesound <old> <new>` | Rename a sound |
 | `/listsounds [category] [page]` | List all sounds with play counts |
+| `/importsounds` | Import this server's Discord soundboard sounds (auto-tagged, loudness-normalized) |
 
 ## Adding Sounds
 

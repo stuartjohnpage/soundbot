@@ -261,3 +261,25 @@ class TestNormalizeLoudnessNoFfmpeg:
         f.write_bytes(b"fake")
         with pytest.raises(ValueError, match="unsupported format"):
             normalize_loudness(f, target_lufs=-16.0)
+
+    def test_encode_args_cover_every_tracked_extension(self):
+        """Pin _ENCODE_ARGS ⊇ store._AUDIO_EXTS so a new tracked format
+        can't silently become un-normalizable."""
+        from soundbot.audio import _ENCODE_ARGS
+        from soundbot.store import _AUDIO_EXTS
+
+        assert set(_ENCODE_ARGS) >= _AUDIO_EXTS
+
+
+@_skip_no_ffmpeg
+class TestNormalizeLoudnessReplaceFailure:
+    def test_locked_destination_raises_valueerror_and_cleans_up(self, loud_wav):
+        """On Windows the destination can be transiently locked (antivirus,
+        indexer) — os.replace raising must surface as the documented
+        ValueError, leave the original intact, and not leak the temp file."""
+        before = loud_wav.read_bytes()
+        with patch("soundbot.audio.os.replace", side_effect=PermissionError("locked")):
+            with pytest.raises(ValueError, match="Failed to normalize"):
+                normalize_loudness(loud_wav, target_lufs=-16.0)
+        assert loud_wav.read_bytes() == before
+        assert list(loud_wav.parent.glob("*__norm_tmp__*")) == []

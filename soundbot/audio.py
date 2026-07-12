@@ -9,9 +9,11 @@ from pathlib import Path
 _INTEGRATED_RE = re.compile(r"Integrated loudness:\s*\n\s*I:\s*(-?\d+\.\d+) LUFS")
 _TRUE_PEAK_RE = re.compile(r"True peak:\s*\n\s*Peak:\s*(-?\d+\.\d+) dBFS")
 
-# Re-encode settings per container for in-place normalization. Keys must
-# cover store._AUDIO_EXTS — an upload that passed validation should never
-# be rejected here for its extension.
+# Re-encode settings per container for in-place normalization. Covers every
+# extension scan_folder tracks (store._AUDIO_EXTS, pinned by test) — but
+# /addsound accepts anything ffprobe can read, so an unknown extension
+# degrades to an un-normalized upload rather than a rejected one
+# (normalize_upload catches the ValueError and keeps the file).
 _ENCODE_ARGS: dict[str, list[str]] = {
     ".ogg": ["-c:a", "libopus", "-b:a", "96k", "-vbr", "on"],
     ".opus": ["-c:a", "libopus", "-b:a", "96k", "-vbr", "on"],
@@ -201,11 +203,19 @@ def normalize_loudness(file_path: Path, target_lufs: float) -> float | None:
                 str(tmp),
             ],
             capture_output=True,
+            text=True,
             check=True,
             timeout=60,
         )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        # The replace lives inside the guard: on Windows a transient lock
+        # on the destination (antivirus, indexer) raises OSError, and this
+        # function's contract is ValueError-or-success — callers like
+        # normalize_upload catch exactly that.
+        os.replace(tmp, file_path)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        # OSError subsumes FileNotFoundError (ffmpeg not installed).
         tmp.unlink(missing_ok=True)
-        raise ValueError(f"Failed to normalize: {file_path}") from exc
-    os.replace(tmp, file_path)
+        stderr = getattr(exc, "stderr", None)
+        detail = f": {stderr[-300:]}" if stderr else ""
+        raise ValueError(f"Failed to normalize {file_path}{detail}") from exc
     return gain

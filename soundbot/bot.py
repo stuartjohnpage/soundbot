@@ -457,7 +457,8 @@ class Soundboard(commands.Cog):
                     tag_list.append(guild_tag)
             except ValueError:
                 logger.warning(
-                    "guild name %r could not be sanitized into a tag; adding without auto-tag",
+                    "guild name %r could not be sanitized into a tag; "
+                    "sound will be added without the guild auto-tag",
                     interaction.guild.name,
                 )
         # Sanitize filename to prevent path traversal
