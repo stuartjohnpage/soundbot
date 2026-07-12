@@ -773,6 +773,41 @@ class BoardView(discord.ui.View):
         return callback
 
 
+async def sync_guild_commands(
+    tree: app_commands.CommandTree, guild: discord.abc.Snowflake
+) -> None:
+    """Copy the global command set into one guild and push it.
+
+    Guild-scoped syncs take effect immediately, unlike global syncs which can
+    take up to an hour to propagate. This is what makes the bot's commands show
+    up in a server the moment it is present there — at startup and the instant
+    the bot is invited to a new server (see ``on_guild_join``).
+    """
+    tree.copy_global_to(guild=guild)
+    await tree.sync(guild=guild)
+
+
+async def deploy_commands(
+    tree: app_commands.CommandTree,
+    http: "discord.http.HTTPClient",
+    application_id: int,
+    guilds: "list[discord.abc.Snowflake]",
+) -> None:
+    """Make commands available instantly across every connected guild.
+
+    Each guild is synced individually (instant), then any leftover *global*
+    registrations are deleted so commands don't appear twice. The global wipe
+    goes through the HTTP layer rather than ``tree.clear_commands(guild=None)``
+    on purpose: clearing the in-memory global tree would leave
+    ``copy_global_to`` with nothing to copy for guilds joined later at runtime.
+    This deletes Discord's global copies while keeping the in-memory command
+    set intact so ``sync_guild_commands`` keeps working for future joins.
+    """
+    for guild in guilds:
+        await sync_guild_commands(tree, guild)
+    await http.bulk_upsert_global_commands(application_id, [])
+
+
 def create_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
@@ -788,23 +823,27 @@ def create_bot() -> commands.Bot:
         store.scan_folder()
         store.save()
         await bot.add_cog(Soundboard(bot, store))
-        if config.SYNC_COMMANDS:
-            if config.GUILD_ID:
-                guild = discord.Object(id=config.GUILD_ID)
-                bot.tree.copy_global_to(guild=guild)
-                await bot.tree.sync(guild=guild)
-                # Wipe any leftover global registrations from prior non-guild
-                # syncs so commands don't appear twice in the guild.
-                bot.tree.clear_commands(guild=None)
-                await bot.tree.sync()
-            else:
-                await bot.tree.sync()
+        # Command sync happens in on_ready, not here: bot.guilds is empty until
+        # the gateway delivers guild data after READY, and we sync per-guild.
 
     bot.setup_hook = setup_hook
 
+    commands_deployed = False
+
     @bot.event
     async def on_ready():
+        nonlocal commands_deployed
         logger.info("Connected as %s", bot.user)
+        # on_ready fires again on every reconnect; only deploy commands once.
+        if config.SYNC_COMMANDS and not commands_deployed:
+            try:
+                await deploy_commands(
+                    bot.tree, bot.http, bot.application_id, list(bot.guilds)
+                )
+                commands_deployed = True
+                logger.info("deployed commands to %d guild(s)", len(bot.guilds))
+            except Exception:
+                logger.exception("command deploy failed; will retry on next ready")
         # One-shot v1 -> v2 tag backfill against connected soundboards.
         try:
             await run_migration_if_needed(store, list(bot.guilds))
@@ -813,6 +852,16 @@ def create_bot() -> commands.Bot:
                 "tag migration failed; startup snapshot was v%d, will retry next startup",
                 store.startup_version,
             )
+
+    @bot.event
+    async def on_guild_join(guild: discord.Guild):
+        # Sync the moment we're invited so commands appear without a restart.
+        logger.info("joined guild %s (id=%s); syncing commands", guild.name, guild.id)
+        if config.SYNC_COMMANDS:
+            try:
+                await sync_guild_commands(bot.tree, guild)
+            except Exception:
+                logger.exception("failed to sync commands to new guild id=%s", guild.id)
 
     @bot.event
     async def on_close():
