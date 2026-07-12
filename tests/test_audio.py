@@ -5,7 +5,14 @@ from unittest.mock import patch
 
 import pytest
 
-from soundbot.audio import extract_audio, get_duration, has_video_stream, validate_sound
+from soundbot.audio import (
+    extract_audio,
+    get_duration,
+    has_video_stream,
+    measure_loudness,
+    normalize_loudness,
+    validate_sound,
+)
 
 _has_ffmpeg = shutil.which("ffprobe") is not None
 _skip_no_ffmpeg = pytest.mark.skipif(not _has_ffmpeg, reason="FFmpeg/ffprobe not installed")
@@ -148,3 +155,131 @@ class TestFfprobeTimeout:
             mock_run.side_effect = subprocess.TimeoutExpired(cmd="ffprobe", timeout=10)
             with pytest.raises(ValueError, match="timed out"):
                 get_duration(fake_file)
+
+
+@pytest.fixture()
+def loud_wav(tmp_path):
+    """Generate a 2-second sine well above the -16 LUFS target (~-7 LUFS).
+
+    lavfi's sine source is NOT full-scale — it lands around -21.8 LUFS,
+    i.e. quieter than the target — so tests that need attenuation to
+    actually fire must boost it first.
+    """
+    out = tmp_path / "loud.wav"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "sine=frequency=440:duration=2",
+            "-af", "volume=15dB",
+            str(out),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return out
+
+
+@pytest.fixture()
+def quiet_wav(tmp_path):
+    """Generate a 2-second sine wave well below any sane loudness target."""
+    out = tmp_path / "quiet.wav"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "sine=frequency=440:duration=2",
+            "-af", "volume=-30dB",
+            str(out),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return out
+
+
+@_skip_no_ffmpeg
+class TestMeasureLoudness:
+    def test_default_sine_measures_expected_level(self, short_wav):
+        lufs, true_peak = measure_loudness(short_wav)
+        # lavfi's default sine measures ~-21.8 LUFS / -18.1 dBFS true peak.
+        assert -25.0 <= lufs <= -18.0
+        assert -21.0 <= true_peak <= -15.0
+
+    def test_quiet_file_measures_quiet(self, quiet_wav, short_wav):
+        quiet_lufs, _ = measure_loudness(quiet_wav)
+        base_lufs, _ = measure_loudness(short_wav)
+        assert quiet_lufs < base_lufs - 25
+
+    def test_non_audio_raises(self, tmp_path):
+        bad = tmp_path / "junk.mp3"
+        bad.write_bytes(b"not audio")
+        with pytest.raises(ValueError):
+            measure_loudness(bad)
+
+
+class TestMeasureLoudnessTimeout:
+    """No ffmpeg required."""
+
+    def test_timeout_raises_valueerror(self, tmp_path):
+        fake_file = tmp_path / "stuck.mp3"
+        fake_file.write_bytes(b"fake")
+        with patch("soundbot.audio.subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd="ffmpeg", timeout=30)
+            with pytest.raises(ValueError, match="timed out"):
+                measure_loudness(fake_file)
+
+
+@_skip_no_ffmpeg
+class TestNormalizeLoudness:
+    def test_loud_file_attenuated_to_target(self, loud_wav):
+        gain = normalize_loudness(loud_wav, target_lufs=-16.0)
+        assert gain is not None
+        assert gain < 0  # attenuation only, never boost
+        lufs, _ = measure_loudness(loud_wav)
+        assert abs(lufs - (-16.0)) <= 1.5
+        # Temp file from the atomic-replace dance must not survive.
+        assert list(loud_wav.parent.glob("*__norm_tmp__*")) == []
+
+    def test_quiet_file_left_untouched(self, quiet_wav):
+        before = quiet_wav.read_bytes()
+        assert normalize_loudness(quiet_wav, target_lufs=-16.0) is None
+        assert quiet_wav.read_bytes() == before
+
+    def test_file_within_threshold_left_untouched(self, loud_wav):
+        # Normalize once, then re-normalizing to the same target must be a
+        # no-op — the file is now within the skip threshold of the target.
+        assert normalize_loudness(loud_wav, target_lufs=-16.0) is not None
+        before = loud_wav.read_bytes()
+        assert normalize_loudness(loud_wav, target_lufs=-16.0) is None
+        assert loud_wav.read_bytes() == before
+
+
+class TestNormalizeLoudnessNoFfmpeg:
+    """No ffmpeg required."""
+
+    def test_unsupported_extension_raises(self, tmp_path):
+        f = tmp_path / "sound.aiff"
+        f.write_bytes(b"fake")
+        with pytest.raises(ValueError, match="unsupported format"):
+            normalize_loudness(f, target_lufs=-16.0)
+
+    def test_encode_args_cover_every_tracked_extension(self):
+        """Pin _ENCODE_ARGS ⊇ store._AUDIO_EXTS so a new tracked format
+        can't silently become un-normalizable."""
+        from soundbot.audio import _ENCODE_ARGS
+        from soundbot.store import _AUDIO_EXTS
+
+        assert set(_ENCODE_ARGS) >= _AUDIO_EXTS
+
+
+@_skip_no_ffmpeg
+class TestNormalizeLoudnessReplaceFailure:
+    def test_locked_destination_raises_valueerror_and_cleans_up(self, loud_wav):
+        """On Windows the destination can be transiently locked (antivirus,
+        indexer) — os.replace raising must surface as the documented
+        ValueError, leave the original intact, and not leak the temp file."""
+        before = loud_wav.read_bytes()
+        with patch("soundbot.audio.os.replace", side_effect=PermissionError("locked")):
+            with pytest.raises(ValueError, match="Failed to normalize"):
+                normalize_loudness(loud_wav, target_lufs=-16.0)
+        assert loud_wav.read_bytes() == before
+        assert list(loud_wav.parent.glob("*__norm_tmp__*")) == []

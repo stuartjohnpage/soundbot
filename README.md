@@ -71,10 +71,11 @@ Create a role in your Discord server called **Soundbot Admin** (or whatever you 
 | `/random [category]` | Play a random sound |
 | `/board` | Show clickable button board of all sounds |
 | `/volume <0-100>` | Set playback volume (default: 50) |
-| `/addsound <name> <file> [category]` | Upload a new sound (max 6.4 seconds) |
+| `/addsound <name> <file> [category] [tags]` | Upload a new sound (max 6.4 seconds; loudness-normalized and auto-tagged with the server's tag) |
 | `/removesound <name>` | Delete a sound |
 | `/renamesound <old> <new>` | Rename a sound |
 | `/listsounds [category] [page]` | List all sounds with play counts |
+| `/importsounds` | Import this server's Discord soundboard sounds (auto-tagged, loudness-normalized) |
 
 ## Adding Sounds
 
@@ -119,6 +120,7 @@ All settings are environment variables, configured in `.env`:
 | `SOUNDS_DIR` | `./sounds` | Directory for audio files |
 | `METADATA_FILE` | `./sounds.json` | Path to the metadata JSON file |
 | `DEFAULT_VOLUME` | `50` | Playback volume on startup (0-100) |
+| `TARGET_LUFS` | `-16` | Loudness target for uploads. Sounds louder than this are turned down on upload (never boosted). |
 | `LOG_FILE` | `./soundbot.log` | Log file path (rotating, 5MB, 3 backups) |
 | `SYNC_COMMANDS` | `true` | Sync slash commands per-guild on startup and on join. Set to `false` to skip syncing entirely. |
 

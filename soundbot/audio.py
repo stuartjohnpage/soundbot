@@ -1,6 +1,32 @@
 import json
+import os
+import re
 import subprocess
 from pathlib import Path
+
+# ebur128 prints a summary block on stderr; these pull the integrated
+# loudness and true peak out of it. Same patterns as scripts/measure_loudness.py.
+_INTEGRATED_RE = re.compile(r"Integrated loudness:\s*\n\s*I:\s*(-?\d+\.\d+) LUFS")
+_TRUE_PEAK_RE = re.compile(r"True peak:\s*\n\s*Peak:\s*(-?\d+\.\d+) dBFS")
+
+# Re-encode settings per container for in-place normalization. Covers every
+# extension scan_folder tracks (store._AUDIO_EXTS, pinned by test) — but
+# /addsound accepts anything ffprobe can read, so an unknown extension
+# degrades to an un-normalized upload rather than a rejected one
+# (normalize_upload catches the ValueError and keeps the file).
+_ENCODE_ARGS: dict[str, list[str]] = {
+    ".ogg": ["-c:a", "libopus", "-b:a", "96k", "-vbr", "on"],
+    ".opus": ["-c:a", "libopus", "-b:a", "96k", "-vbr", "on"],
+    ".webm": ["-c:a", "libopus", "-b:a", "96k", "-vbr", "on"],
+    ".mp3": ["-c:a", "libmp3lame", "-b:a", "128k"],
+    ".m4a": ["-c:a", "aac", "-b:a", "128k"],
+    ".flac": ["-c:a", "flac"],
+    ".wav": ["-c:a", "pcm_s16le"],
+}
+
+# Don't bother re-encoding for a trim smaller than this — the lossy
+# re-encode would cost more fidelity than the level correction gains.
+_SKIP_THRESHOLD_DB = 0.3
 
 
 def get_duration(file_path: Path) -> float:
@@ -111,3 +137,85 @@ def validate_sound(file_path: Path, max_duration: float) -> None:
         raise ValueError(
             f"Sound duration {duration:.1f}s exceeds maximum {max_duration:.1f}s"
         )
+
+
+def measure_loudness(file_path: Path) -> tuple[float, float]:
+    """Return (integrated LUFS, true peak dBFS) of an audio file.
+
+    Raises ValueError if ffmpeg is unavailable, fails, or produces no
+    parseable ebur128 summary (e.g. the file is silent or too short for
+    the meter to gate a single block).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-nostats", "-hide_banner",
+                "-i", str(file_path),
+                "-af", "ebur128=peak=true",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("Loudness measurement timed out") from exc
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise ValueError(f"Cannot read audio file: {file_path}") from exc
+
+    integrated = _INTEGRATED_RE.search(result.stderr)
+    true_peak = _TRUE_PEAK_RE.search(result.stderr)
+    if not integrated or not true_peak:
+        raise ValueError(f"Cannot measure loudness of: {file_path}")
+    return float(integrated.group(1)), float(true_peak.group(1))
+
+
+def normalize_loudness(file_path: Path, target_lufs: float) -> float | None:
+    """Attenuate an over-loud file in place down to target_lufs.
+
+    Only ever applies *negative* gain — a file quieter than the target is
+    left untouched (boosting would amplify the noise floor and risk
+    clipping). Returns the gain applied in dB, or None if the file was
+    already at/below target (or within _SKIP_THRESHOLD_DB of it).
+
+    The re-encode goes through a temp file + atomic replace so a crash
+    mid-encode can't leave a truncated sound behind. Raises ValueError on
+    measurement or encode failure; the original file is intact either way.
+    """
+    encode_args = _ENCODE_ARGS.get(file_path.suffix.lower())
+    if encode_args is None:
+        raise ValueError(f"Cannot normalize unsupported format: {file_path.suffix}")
+
+    lufs, _ = measure_loudness(file_path)
+    gain = target_lufs - lufs
+    if gain >= -_SKIP_THRESHOLD_DB:
+        return None
+
+    tmp = file_path.with_name(file_path.stem + ".__norm_tmp__" + file_path.suffix)
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-nostats", "-hide_banner",
+                "-i", str(file_path),
+                "-af", f"volume={gain:.2f}dB",
+                *encode_args,
+                str(tmp),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+        # The replace lives inside the guard: on Windows a transient lock
+        # on the destination (antivirus, indexer) raises OSError, and this
+        # function's contract is ValueError-or-success — callers like
+        # normalize_upload catch exactly that.
+        os.replace(tmp, file_path)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        # OSError subsumes FileNotFoundError (ffmpeg not installed).
+        tmp.unlink(missing_ok=True)
+        stderr = getattr(exc, "stderr", None)
+        detail = f": {stderr[-300:]}" if stderr else ""
+        raise ValueError(f"Failed to normalize {file_path}{detail}") from exc
+    return gain

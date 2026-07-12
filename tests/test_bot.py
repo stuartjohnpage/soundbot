@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from soundbot.bot import Soundboard, deploy_commands, sync_guild_commands
+from soundbot.bot import (
+    Soundboard,
+    deploy_commands,
+    duplicate_sound_message,
+    sync_guild_commands,
+)
 from soundbot.mixer import MixerSource
 from soundbot.pcm_cache import CachedPCMSource, PCMCache
 from soundbot.store import SoundStore
@@ -34,6 +39,9 @@ def _make_cog(tmp_path: Path) -> Soundboard:
 def _make_interaction(*, voice_client=None, response_done: bool = False):
     interaction = MagicMock()
     interaction.guild = MagicMock()
+    # Plain attribute assignment: MagicMock(name=...) would set the mock's
+    # own name, not the guild.name attribute the auto-tag code reads.
+    interaction.guild.name = "Test Guild"
     interaction.guild.voice_client = voice_client
     interaction.response = MagicMock()
     interaction.response.is_done.return_value = response_done
@@ -381,15 +389,7 @@ class TestAddSoundClobberPrevention:
     """
 
     def _setup(self, tmp_path, monkeypatch):
-        from soundbot import config
-
-        cog = _make_cog(tmp_path)
-        sounds_dir = Path(cog.store._sounds_dir)
-        monkeypatch.setattr(config, "SOUNDS_DIR", sounds_dir)
-        monkeypatch.setattr(config, "MAX_DURATION", 60)
-        monkeypatch.setattr("soundbot.bot.has_video_stream", lambda p: False)
-        monkeypatch.setattr("soundbot.bot.validate_sound", lambda p, d: None)
-        return cog, sounds_dir
+        return _setup_addsound(tmp_path, monkeypatch)
 
     def test_different_name_same_filename_is_refused(
         self, tmp_path, monkeypatch
@@ -499,12 +499,7 @@ class TestAddSoundCacheInvalidation:
         filename land at the same dest on disk. If the first one was
         played, its PCM is in the cache — and the second add must wipe
         that entry or the new sound serves the old bytes."""
-        from soundbot import config
-
-        cog = _make_cog(tmp_path)
-        sounds_dir = Path(cog.store._sounds_dir)
-        monkeypatch.setattr(config, "SOUNDS_DIR", sounds_dir)
-        monkeypatch.setattr(config, "MAX_DURATION", 60)
+        cog, sounds_dir = _setup_addsound(tmp_path, monkeypatch)
 
         dest = sounds_dir / "thing.mp3"
         cache_key = str(dest)
@@ -520,15 +515,231 @@ class TestAddSoundCacheInvalidation:
 
         attachment.save = fake_save
 
-        monkeypatch.setattr("soundbot.bot.has_video_stream", lambda p: False)
-        monkeypatch.setattr("soundbot.bot.validate_sound", lambda p, d: None)
-
         interaction = _make_interaction()
         asyncio.run(
             Soundboard.addsound.callback(cog, interaction, "thing", attachment)
         )
 
         assert cache_key not in cog.pcm_cache
+
+
+def _setup_addsound(tmp_path, monkeypatch, *, normalize=lambda p, t: None):
+    """Shared harness for addsound handler tests: real store + tmp sounds
+    dir, audio helpers stubbed so no ffmpeg runs."""
+    from soundbot import config
+
+    cog = _make_cog(tmp_path)
+    sounds_dir = Path(cog.store._sounds_dir)
+    monkeypatch.setattr(config, "SOUNDS_DIR", sounds_dir)
+    monkeypatch.setattr(config, "MAX_DURATION", 60)
+    monkeypatch.setattr("soundbot.bot.has_video_stream", lambda p: False)
+    monkeypatch.setattr("soundbot.bot.validate_sound", lambda p, d: None)
+    monkeypatch.setattr("soundbot.bot.normalize_loudness", normalize)
+    return cog, sounds_dir
+
+
+def _make_attachment(filename: str) -> MagicMock:
+    attachment = MagicMock(spec=discord.Attachment)
+    attachment.filename = filename
+
+    async def fake_save(path):
+        Path(path).write_bytes(b"audio-bytes")
+
+    attachment.save = MagicMock(side_effect=fake_save)
+    return attachment
+
+
+class TestDuplicateSoundMessage:
+    """Pure-function coverage for the name-collision wording (bug: the old
+    bare "already exists" gave no hint that the sound was merely invisible
+    on the guild's tag-filtered board)."""
+
+    def test_untagged_entry_explains_board_invisibility(self):
+        msg = duplicate_sound_message("What", {"tags": []})
+        assert "what" in msg
+        assert "no tags" in msg
+        assert "/board" in msg
+
+    def test_tagged_entry_lists_tags_sorted(self):
+        msg = duplicate_sound_message("boop", {"tags": ["zeta", "alpha"]})
+        assert "`alpha`, `zeta`" in msg
+        assert "/board" in msg
+
+
+class TestAddSoundDuplicateNamePrecheck:
+    def test_refused_before_file_io_with_tag_hint(self, tmp_path, monkeypatch):
+        cog, sounds_dir = _setup_addsound(tmp_path, monkeypatch)
+        existing_path = sounds_dir / "orig.mp3"
+        existing_path.write_bytes(b"orig")
+        cog.store.add("dupe", existing_path)
+
+        attachment = _make_attachment("unrelated.mp3")
+        interaction = _make_interaction()
+        asyncio.run(
+            Soundboard.addsound.callback(cog, interaction, "dupe", attachment)
+        )
+
+        # Refused before any file I/O — the upload never touched disk.
+        attachment.save.assert_not_called()
+        args, kwargs = interaction.followup.send.call_args
+        assert "no tags" in args[0]
+        assert kwargs.get("ephemeral") is True
+
+
+class TestAddSoundGuildAutoTag:
+    def test_upload_is_tagged_with_guild_and_user_tags(self, tmp_path, monkeypatch):
+        cog, _ = _setup_addsound(tmp_path, monkeypatch)
+        interaction = _make_interaction()  # guild.name = "Test Guild"
+
+        asyncio.run(
+            Soundboard.addsound.callback(
+                cog, interaction, "boop", _make_attachment("boop.mp3"),
+                tags="meme,funny",
+            )
+        )
+
+        assert set(cog.store.get("boop")["tags"]) == {"meme", "funny", "test-guild"}
+        args, _ = interaction.followup.send.call_args
+        assert "`test-guild`" in args[0]
+
+    def test_guild_tag_not_duplicated_when_user_supplies_it(self, tmp_path, monkeypatch):
+        cog, _ = _setup_addsound(tmp_path, monkeypatch)
+        interaction = _make_interaction()
+
+        asyncio.run(
+            Soundboard.addsound.callback(
+                cog, interaction, "boop", _make_attachment("boop.mp3"),
+                tags="test-guild",
+            )
+        )
+
+        assert cog.store.get("boop")["tags"] == ["test-guild"]
+
+    def test_dm_upload_gets_no_guild_tag(self, tmp_path, monkeypatch):
+        cog, _ = _setup_addsound(tmp_path, monkeypatch)
+        interaction = _make_interaction()
+        interaction.guild = None
+
+        asyncio.run(
+            Soundboard.addsound.callback(
+                cog, interaction, "boop", _make_attachment("boop.mp3")
+            )
+        )
+
+        assert cog.store.get("boop")["tags"] == []
+
+    def test_unsanitizable_guild_name_skips_tag_but_uploads(self, tmp_path, monkeypatch):
+        cog, _ = _setup_addsound(tmp_path, monkeypatch)
+        interaction = _make_interaction()
+        interaction.guild.name = "!!!"
+
+        asyncio.run(
+            Soundboard.addsound.callback(
+                cog, interaction, "boop", _make_attachment("boop.mp3")
+            )
+        )
+
+        assert cog.store.get("boop")["tags"] == []
+
+
+class TestAddSoundNormalization:
+    def test_applied_gain_reported_in_message(self, tmp_path, monkeypatch):
+        calls = []
+
+        def fake_normalize(path, target):
+            calls.append((Path(path), target))
+            return -4.5
+
+        cog, sounds_dir = _setup_addsound(
+            tmp_path, monkeypatch, normalize=fake_normalize
+        )
+        interaction = _make_interaction()
+
+        asyncio.run(
+            Soundboard.addsound.callback(
+                cog, interaction, "boop", _make_attachment("boop.mp3")
+            )
+        )
+
+        from soundbot import config
+
+        assert calls == [(sounds_dir / "boop.mp3", config.TARGET_LUFS)]
+        args, _ = interaction.followup.send.call_args
+        assert "Normalized -4.5 dB" in args[0]
+
+    def test_normalization_failure_keeps_upload(self, tmp_path, monkeypatch):
+        def broken_normalize(path, target):
+            raise ValueError("ffmpeg exploded")
+
+        cog, _ = _setup_addsound(
+            tmp_path, monkeypatch, normalize=broken_normalize
+        )
+        interaction = _make_interaction()
+
+        asyncio.run(
+            Soundboard.addsound.callback(
+                cog, interaction, "boop", _make_attachment("boop.mp3")
+            )
+        )
+
+        # A sound that can't be normalized is still a playable sound.
+        assert cog.store.get("boop") is not None
+        args, _ = interaction.followup.send.call_args
+        assert "Added sound" in args[0]
+        assert "Normalized" not in args[0]
+
+    def test_already_at_target_reports_no_gain(self, tmp_path, monkeypatch):
+        cog, _ = _setup_addsound(tmp_path, monkeypatch)  # normalize -> None
+        interaction = _make_interaction()
+
+        asyncio.run(
+            Soundboard.addsound.callback(
+                cog, interaction, "boop", _make_attachment("boop.mp3")
+            )
+        )
+
+        args, _ = interaction.followup.send.call_args
+        assert "Added sound" in args[0]
+        assert "Normalized" not in args[0]
+
+
+class TestImportSoundsNormalization:
+    def test_downloaded_sound_is_normalized(self, tmp_path, monkeypatch):
+        """The upload-time normalization must fire for /importsounds
+        downloads too — imported soundboard sounds arrive at whatever
+        level they were uploaded to Discord at."""
+        from soundbot import config
+
+        calls = []
+
+        def fake_normalize(path, target):
+            calls.append((Path(path), target))
+            return -2.0
+
+        cog, sounds_dir = _setup_addsound(
+            tmp_path, monkeypatch, normalize=fake_normalize
+        )
+
+        sound = MagicMock()
+        sound.name = "fresh"
+        sound.id = 99
+
+        async def fake_save(path):
+            Path(path).write_bytes(b"ogg-bytes")
+
+        sound.save = fake_save
+
+        guild = MagicMock()
+        guild.name = "Test Guild"
+        guild.fetch_soundboard_sounds = AsyncMock(return_value=[sound])
+
+        interaction = _make_interaction()
+        interaction.guild = guild
+
+        asyncio.run(Soundboard.importsounds.callback(cog, interaction))
+
+        assert calls == [(sounds_dir / "fresh.ogg", config.TARGET_LUFS)]
+        assert cog.store.get("fresh") is not None
 
 
 class TestCommandSync:
