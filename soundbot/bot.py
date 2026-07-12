@@ -8,7 +8,12 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from . import config
-from .audio import extract_audio, has_video_stream, validate_sound
+from .audio import (
+    extract_audio,
+    has_video_stream,
+    normalize_loudness,
+    validate_sound,
+)
 from .migration import run_migration_if_needed
 from .mixer import MixerSource
 from .pagination import paginate
@@ -59,6 +64,51 @@ def classify_import_sound(
     if dest_exists:
         return "file_conflict"
     return "needs_download"
+
+
+def duplicate_sound_message(name: str, entry: dict) -> str:
+    """Explain a name collision in terms of where the existing sound is visible.
+
+    Names are unique across the whole library, but boards are usually
+    tag-filtered — so "already exists" alone reads as a lie when the
+    existing sound carries no tag for (or a different tag than) the guild
+    the uploader is looking at. Spell out the tags so the user can find it.
+    Pure function so the wording is unit-testable without an Interaction.
+    """
+    # Direct subscript: SoundStore.load() guarantees the tags key exists
+    # on every entry (same invariant classify_import_sound relies on).
+    tags = entry["tags"]
+    if tags:
+        tag_list = ", ".join(f"`{t}`" for t in sorted(tags))
+        return (
+            f"A sound named **{name.lower()}** already exists, tagged {tag_list}. "
+            f"It only shows on boards filtered by those tags — run `/board` with "
+            f"no filter to see it, or pick another name."
+        )
+    return (
+        f"A sound named **{name.lower()}** already exists but has **no tags**, "
+        f"so it never appears on tag-filtered boards. Run `/board` with no "
+        f"filter to see it, `/tag add` to tag it for this server, or pick "
+        f"another name."
+    )
+
+
+def normalize_upload(dest: Path, target_lufs: float) -> float | None:
+    """Best-effort loudness normalization for a just-saved upload.
+
+    Returns the gain applied in dB (or None if the file was already at or
+    below target). Never raises: a sound that can't be normalized is still
+    a playable sound, so measurement/encode failures degrade to keeping
+    the original file rather than refusing the upload.
+    """
+    try:
+        return normalize_loudness(dest, target_lufs)
+    except ValueError:
+        logger.warning(
+            "loudness normalization failed for %s; keeping original", dest,
+            exc_info=True,
+        )
+        return None
 
 
 def _admin_check() -> app_commands.check:
@@ -387,6 +437,29 @@ class Soundboard(commands.Cog):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
+        # Name-collision check before any file I/O. store.add would catch
+        # this too, but by then the upload is already on disk — and its
+        # bare "already exists" doesn't explain why the sound is invisible
+        # on tag-filtered boards (the usual reason the user re-uploads it).
+        existing = self.store.get(name)
+        if existing is not None:
+            await interaction.followup.send(
+                duplicate_sound_message(name, existing), ephemeral=True
+            )
+            return
+        # Auto-tag with the guild so the new sound shows up on this
+        # server's tag-filtered board immediately. Same convention as
+        # /importsounds; explicit user tags ride along unchanged.
+        if interaction.guild is not None:
+            try:
+                guild_tag = SoundStore.sanitize_tag(interaction.guild.name)
+                if guild_tag not in tag_list:
+                    tag_list.append(guild_tag)
+            except ValueError:
+                logger.warning(
+                    "guild name %r could not be sanitized into a tag; adding without auto-tag",
+                    interaction.guild.name,
+                )
         # Sanitize filename to prevent path traversal
         safe_name = Path(file.filename).name
         dest = config.SOUNDS_DIR / safe_name
@@ -439,6 +512,9 @@ class Soundboard(commands.Cog):
                 dest.unlink(missing_ok=True)
                 dest = audio_dest
             validate_sound(dest, config.MAX_DURATION)
+            # Normalize before the cache invalidation below so no consumer
+            # can cache the pre-normalization bytes.
+            gain = normalize_upload(dest, config.TARGET_LUFS)
             # Drop any stale cached PCM for this path before the new entry
             # is added. Two distinct sound names uploaded with the same
             # filename land at the same dest on disk, and a previous /play
@@ -461,6 +537,8 @@ class Soundboard(commands.Cog):
             await interaction.followup.send(str(exc), ephemeral=True)
             return
         msg = f"Added sound **{name}**."
+        if gain is not None:
+            msg += f" Normalized {gain:+.1f} dB."
         if tag_list:
             msg += f" Tagged: {', '.join(f'`{t}`' for t in tag_list)}."
         await interaction.followup.send(msg)
@@ -585,6 +663,10 @@ class Soundboard(commands.Cog):
             try:
                 await sound.save(dest)
                 validate_sound(dest, config.MAX_DURATION)
+                # Same upload-time normalization as /addsound — imported
+                # soundboard sounds arrive at whatever level they were
+                # uploaded to Discord at.
+                normalize_upload(dest, config.TARGET_LUFS)
                 self.store.add(
                     key,
                     dest,
