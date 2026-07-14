@@ -8,6 +8,7 @@ A Discord soundboard bot with no limits. Play sound clips in voice channels usin
 - Unlimited simultaneous sound overlap (no queue, no cap)
 - Interactive `/board` with paginated buttons for quick access
 - Upload sounds directly in Discord or bulk-load from a folder
+- Bind emoji to sounds — a reaction anywhere plays the sound (while the bot is in voice)
 - Optional categories for organization
 - Global volume control
 - Play count tracking and file logging
@@ -76,6 +77,9 @@ Create a role in your Discord server called **Soundbot Admin** (or whatever you 
 | `/renamesound <old> <new>` | Rename a sound |
 | `/listsounds [category] [page]` | List all sounds with play counts |
 | `/importsounds` | Import this server's Discord soundboard sounds (auto-tagged, loudness-normalized) |
+| `/bindemoji <sound> <emoji>` | Bind an emoji: anyone reacting with it plays the sound (bindings are per-server) |
+| `/unbindemoji <emoji>` | Remove an emoji binding |
+| `/listbindings` | List this server's emoji-to-sound bindings |
 
 ## Adding Sounds
 
