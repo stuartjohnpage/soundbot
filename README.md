@@ -9,6 +9,7 @@ A Discord soundboard bot with no limits. Play sound clips in voice channels usin
 - Interactive `/board` with paginated buttons for quick access
 - Upload sounds directly in Discord or bulk-load from a folder
 - Bind emoji to sounds — a reaction anywhere plays the sound (while the bot is in voice)
+- Playback requires being in the bot's voice channel, like Discord's native soundboard — no remote-spamming voice from a text channel
 - Optional categories for organization
 - Global volume control
 - Play count tracking and file logging
