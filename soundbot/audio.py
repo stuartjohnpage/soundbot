@@ -139,6 +139,42 @@ def validate_sound(file_path: Path, max_duration: float) -> None:
         )
 
 
+def trim_audio(file_path: Path, max_duration: float) -> None:
+    """Truncate an audio file in place to its first max_duration seconds.
+
+    Stream-copies rather than re-encoding (no quality loss, works for any
+    container ffmpeg can read), so the cut lands on a packet boundary and
+    can overshoot by one packet (~20ms). Callers treat max_duration as a
+    cap with headroom already built in, so the overshoot is acceptable —
+    nothing re-validates the duration strictly after a trim.
+
+    Temp-file + atomic replace, same contract as normalize_loudness:
+    raises ValueError on failure with the original file intact.
+    """
+    tmp = file_path.with_name(file_path.stem + ".__trim_tmp__" + file_path.suffix)
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-nostats", "-hide_banner",
+                "-i", str(file_path),
+                "-t", f"{max_duration:.3f}",
+                "-c", "copy",
+                str(tmp),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+        os.replace(tmp, file_path)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        # OSError subsumes FileNotFoundError (ffmpeg not installed).
+        tmp.unlink(missing_ok=True)
+        stderr = getattr(exc, "stderr", None)
+        detail = f": {stderr[-300:]}" if stderr else ""
+        raise ValueError(f"Failed to trim {file_path}{detail}") from exc
+
+
 def measure_loudness(file_path: Path) -> tuple[float, float]:
     """Return (integrated LUFS, true peak dBFS) of an audio file.
 

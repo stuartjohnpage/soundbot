@@ -11,6 +11,7 @@ from soundbot.audio import (
     has_video_stream,
     measure_loudness,
     normalize_loudness,
+    trim_audio,
     validate_sound,
 )
 
@@ -72,6 +73,29 @@ class TestValidateSound:
         bad_file.write_text("this is not audio")
         with pytest.raises(ValueError):
             validate_sound(bad_file, max_duration=6.0)
+
+
+@_skip_no_ffmpeg
+class TestTrimAudio:
+    def test_trims_in_place_to_cap(self, long_wav):
+        trim_audio(long_wav, 6.4)
+        # Stream-copy cut lands on a packet boundary; allow slack.
+        assert get_duration(long_wav) <= 6.7
+
+    def test_short_file_unharmed_by_trim_to_longer_cap(self, short_wav):
+        trim_audio(short_wav, 6.4)
+        assert 1.9 <= get_duration(short_wav) <= 2.1
+
+    def test_failure_leaves_original_intact(self, tmp_path):
+        bad = tmp_path / "junk.wav"
+        bad.write_bytes(b"this is not audio")
+
+        with pytest.raises(ValueError, match="Failed to trim"):
+            trim_audio(bad, 6.4)
+
+        assert bad.read_bytes() == b"this is not audio"
+        # No temp file left behind
+        assert not list(tmp_path.glob("*__trim_tmp__*"))
 
 
 @pytest.fixture()

@@ -38,7 +38,7 @@ class TestProcessUploadHappyPath:
         store, sounds_dir = _make_store(tmp_path)
         dest = make_wav(sounds_dir / "horn.wav")
 
-        final, gain = process_upload(
+        final, gain, trimmed_from = process_upload(
             dest,
             store=store,
             pcm_cache=PCMCache(),
@@ -54,6 +54,8 @@ class TestProcessUploadHappyPath:
         assert dest.exists()
         # A ~-3 LUFS tone against a -16 target must be attenuated.
         assert gain is not None and gain < 0
+        # 1s file under a 6.4s cap: no trim
+        assert trimmed_from is None
         entry = store.get("horn")
         assert entry is not None
         assert entry["file"] == str(dest)
@@ -68,7 +70,7 @@ class TestProcessUploadVideoBranch:
         store, sounds_dir = _make_store(tmp_path)
         dest = make_mp4(sounds_dir / "clip.mp4")
 
-        final, _gain = process_upload(
+        final, _gain, _trimmed = process_upload(
             dest,
             store=store,
             pcm_cache=PCMCache(),
@@ -166,11 +168,37 @@ class TestProcessUploadRejection:
         assert store.get("bad") is None
 
     @_skip_no_ffmpeg
-    def test_over_length_file_raises_and_is_deleted(self, tmp_path):
-        store, sounds_dir = _make_store(tmp_path)
-        dest = make_wav(sounds_dir / "long.wav", duration=2.0)
+    def test_over_length_file_is_trimmed_not_rejected(self, tmp_path):
+        """Issue #20: an upload past the cap is cut to the first
+        max_duration seconds and registered, instead of erroring."""
+        from soundbot.audio import get_duration
 
-        with pytest.raises(ValueError, match="exceeds maximum"):
+        store, sounds_dir = _make_store(tmp_path)
+        dest = make_wav(sounds_dir / "long.wav", duration=3.0)
+
+        final, _gain, trimmed_from = process_upload(
+            dest, **{**self._kwargs(store), "max_duration": 1.0}
+        )
+
+        assert final.exists()
+        assert store.get("bad") is not None
+        assert trimmed_from == pytest.approx(3.0, abs=0.1)
+        # Stream-copy cut can overshoot by ~a packet; allow slack.
+        assert get_duration(final) <= 1.3
+
+    @_skip_no_ffmpeg
+    def test_trim_failure_rejects_and_deletes(self, tmp_path, monkeypatch):
+        """If the trim itself fails, behavior matches the old over-length
+        rejection: ValueError, file gone, nothing registered."""
+        store, sounds_dir = _make_store(tmp_path)
+        dest = make_wav(sounds_dir / "long.wav", duration=3.0)
+
+        def boom(path, max_duration):
+            raise ValueError(f"Failed to trim {path}")
+
+        monkeypatch.setattr("soundbot.ingest.trim_audio", boom)
+
+        with pytest.raises(ValueError, match="Failed to trim"):
             process_upload(dest, **{**self._kwargs(store), "max_duration": 1.0})
 
         assert not dest.exists()
