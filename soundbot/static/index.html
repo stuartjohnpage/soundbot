@@ -166,7 +166,10 @@ let currentAudio = null;
 async function preview(name) {
   // <audio src> can't send auth headers, so fetch the bytes and play a blob.
   const blob = await (await api(`/api/sounds/${encodeURIComponent(name)}/audio`)).blob();
-  if (currentAudio) currentAudio.pause();
+  if (currentAudio) {
+    currentAudio.pause();
+    URL.revokeObjectURL(currentAudio.src); // don't pin old previews in memory
+  }
   currentAudio = new Audio(URL.createObjectURL(blob));
   currentAudio.play();
 }
@@ -240,7 +243,11 @@ $("login-btn").addEventListener("click", async () => {
     await api("/api/sounds");
     localStorage.setItem("soundbot-token", token);
     await showMain();
-  } catch (err) { /* showLogin already ran on 401 */ }
+  } catch (err) {
+    // 401 already routed through showLogin; surface anything else
+    // (bot unreachable, 500) instead of silently doing nothing.
+    if (err.message !== "unauthorized") setStatus(err.message);
+  }
 });
 $("token-input").addEventListener("keydown", (event) => {
   if (event.key === "Enter") $("login-btn").click();

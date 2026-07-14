@@ -19,6 +19,7 @@ without re-adding to_thread around the blocking work. Cross-thread
 store.save() calls are serialized by the store's internal lock.
 """
 import contextlib
+import logging
 import secrets
 from pathlib import Path
 
@@ -30,6 +31,8 @@ from pydantic import BaseModel
 from .ingest import process_upload
 from .pcm_cache import PCMCache
 from .store import SoundStore, parse_tags
+
+logger = logging.getLogger("soundbot")
 
 TOKEN_HEADER = "X-Auth-Token"
 
@@ -95,7 +98,12 @@ def _auth_dependency(token: str):
             scheme, _, value = authorization.partition(" ")
             if scheme.lower() == "bearer":
                 supplied = value.strip()
-        if supplied is None or not secrets.compare_digest(supplied, token):
+        # Compare as bytes: compare_digest(str, str) raises TypeError on
+        # non-ASCII input, and starlette decodes header bytes as latin-1
+        # — a raw client could turn an unauthenticated request into a 500.
+        if supplied is None or not secrets.compare_digest(
+            supplied.encode("utf-8"), token.encode("utf-8")
+        ):
             raise HTTPException(status_code=401, detail="Invalid or missing token")
 
     return require_token
@@ -109,6 +117,7 @@ def create_web_app(
     sounds_dir: Path,
     max_duration: float,
     target_lufs: float,
+    max_upload_bytes: int = MAX_UPLOAD_BYTES,
 ) -> FastAPI:
     """Build the admin panel app. Raises ValueError if token is empty —
     an unauthenticated panel must never exist."""
@@ -174,9 +183,10 @@ def create_web_app(
         # Same pre-checks as /addsound, in the same order: fail cleanly
         # on bad input before any file I/O.
         try:
+            SoundStore.validate_name(name)
             tag_list = parse_tags(tags)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=exc.args[0])
+            raise HTTPException(status_code=400, detail=str(exc))
         existing = store.get(name)
         if existing is not None:
             raise HTTPException(
@@ -201,23 +211,23 @@ def create_web_app(
                     f"upload."
                 ),
             )
-        written = 0
-        with dest.open("wb") as out:
-            while chunk := file.file.read(64 * 1024):
-                written += len(chunk)
-                if written > MAX_UPLOAD_BYTES:
-                    break
-                out.write(chunk)
-        if written > MAX_UPLOAD_BYTES:
-            dest.unlink(missing_ok=True)
-            raise HTTPException(
-                status_code=413,
-                detail=f"Upload exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit",
-            )
         try:
+            written = 0
+            with dest.open("wb") as out:
+                while chunk := file.file.read(64 * 1024):
+                    written += len(chunk)
+                    if written > max_upload_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                f"Upload exceeds "
+                                f"{max_upload_bytes // (1024 * 1024)}MB limit"
+                            ),
+                        )
+                    out.write(chunk)
             # Shared ingest pipeline — the exact code path /addsound runs
             # (video-extract, validate, normalize, cache-invalidate,
-            # register). On ValueError it has already unlinked dest.
+            # register).
             final_dest, gain = process_upload(
                 dest,
                 store=store,
@@ -230,7 +240,19 @@ def create_web_app(
                 target_lufs=target_lufs,
             )
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=exc.args[0])
+            # The pipeline already unlinked dest on its own failures.
+            raise HTTPException(status_code=400, detail=str(exc))
+        except BaseException:
+            # Anything else — 413 above, disk full mid-write, a transient
+            # AV lock on Windows (a failure mode normalize_loudness
+            # explicitly documents) — must not orphan a partial file in
+            # sounds_dir, where the next scan_folder() would register it
+            # as a broken sound. Safe to unlink: the find_by_path guard
+            # above proved no other entry owns this path. Only after
+            # process_upload returns is the file owned by a store entry,
+            # and from there it must survive.
+            dest.unlink(missing_ok=True)
+            raise
         store.save()
         return {
             "name": name.lower(),
@@ -263,9 +285,10 @@ def create_web_app(
         try:
             store.rename(name, body.new_name)
         except ValueError as exc:
-            # Invalid new name. exc.args[0] over str(exc) — consistent
-            # with the bot's error propagation convention.
-            raise HTTPException(status_code=400, detail=exc.args[0])
+            # Invalid new name. str(exc), not exc.args[0]: ValueError
+            # renders cleanly (only KeyError has the repr-quoting trap)
+            # and an argless ValueError would make args[0] an IndexError.
+            raise HTTPException(status_code=400, detail=str(exc))
         store.save()
         # No pcm_cache interaction needed: rename swaps the metadata key
         # but the file (the cache key) stays at the same path.
@@ -281,7 +304,7 @@ def create_web_app(
         try:
             new_tags = parse_tags(",".join(body.tags))
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=exc.args[0])
+            raise HTTPException(status_code=400, detail=str(exc))
         for tag in store.list_tags(name):
             if tag not in new_tags:
                 store.remove_tag(name, tag)
@@ -331,10 +354,31 @@ class _EmbeddedServer(uvicorn.Server):
 
 def build_web_server(app: FastAPI, *, host: str, port: int) -> uvicorn.Server:
     """Build the uvicorn server for the panel. Start it with
-    `asyncio.create_task(server.serve())` on the bot's running loop."""
+    `asyncio.create_task(serve_web_app(server))` on the bot's running loop."""
     return _EmbeddedServer(
         uvicorn.Config(app, host=host, port=port, log_level="warning")
     )
+
+
+async def serve_web_app(server: uvicorn.Server) -> None:
+    """Run the panel server; never let a startup failure kill the bot.
+
+    uvicorn's Server.startup() calls sys.exit(STARTUP_FAILURE) when the
+    bind fails (port in use, bad host). Raised inside a task on the
+    bot's event loop, that SystemExit escapes asyncio.run and takes the
+    whole Discord bot down — under docker `restart: unless-stopped`
+    that's a crash loop. The panel is optional; the bot is not.
+    """
+    host, port = server.config.host, server.config.port
+    try:
+        await server.serve()
+    except SystemExit:
+        logger.error(
+            "web admin panel failed to start on %s:%d (port already in "
+            "use?); bot continues without the panel",
+            host,
+            port,
+        )
 
 
 def maybe_create_web_app(

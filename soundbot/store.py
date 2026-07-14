@@ -1,3 +1,4 @@
+import functools
 import json
 import re
 import threading
@@ -55,17 +56,38 @@ def parse_tags(raw: str | None) -> list[str]:
     return out
 
 
+def _locked(method):
+    """Run a SoundStore method while holding the store's lock.
+
+    The lock is reentrant so locked methods can call each other
+    (search -> list_sounds, scan_folder -> add).
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class SoundStore:
     def __init__(self, metadata_path: Path, sounds_dir: Path) -> None:
+        # The store is accessed from two kinds of threads at once: the
+        # bot's event-loop thread (commands, 60s save loop, autocomplete)
+        # and the web panel's FastAPI threadpool. Every public method
+        # holds this lock so a threadpool mutation can't resize _sounds
+        # while the loop thread iterates it ("dictionary changed size
+        # during iteration" — which would permanently stop the save
+        # loop), and so concurrent save() calls can't collide on the
+        # shared .tmp file (PermissionError on Windows). Entry dicts
+        # returned to callers are shared references: field reads outside
+        # the lock may be momentarily stale, which is acceptable — the
+        # lock protects the *structure*, not snapshot isolation.
+        self._lock = threading.RLock()
         self._metadata_path = metadata_path
         self._sounds_dir = sounds_dir
         self._sounds: dict[str, dict] = {}
-        # save() can be called from the bot's event-loop thread (60s
-        # save-loop, command handlers) and from the web panel's
-        # threadpool concurrently. Every save writes the same .tmp path,
-        # so unserialized writers collide on the os.replace (Windows
-        # raises PermissionError) or interleave partial JSON.
-        self._save_lock = threading.Lock()
         # Version of the file on disk at the moment load() was called. Set
         # exactly once here and NEVER mutated by subsequent writes — the
         # migration gate needs a frozen "what did we open?" snapshot so a
@@ -75,7 +97,10 @@ class SoundStore:
         self.load()
 
     @staticmethod
-    def _validate_name(name: str) -> None:
+    def validate_name(name: str) -> None:
+        """Raise ValueError (with a user-facing message) for an invalid
+        sound name. Public so upload entry points can fail fast before
+        any file I/O — add()/rename() still enforce it themselves."""
         if not name or len(name) > _MAX_NAME_LENGTH or not _NAME_RE.match(name):
             raise ValueError(f"Sound name '{name}' is invalid: must be 1-{_MAX_NAME_LENGTH} alphanumeric/hyphen/underscore characters")
 
@@ -95,6 +120,7 @@ class SoundStore:
             raise ValueError(f"Cannot derive a valid tag from '{raw}'")
         return sanitized
 
+    @_locked
     def add(
         self,
         name: str,
@@ -102,7 +128,7 @@ class SoundStore:
         category: str | None = None,
         uploaded_by: str | None = None,
     ) -> None:
-        self._validate_name(name)
+        self.validate_name(name)
         key = name.lower()
         if key in self._sounds:
             raise ValueError(f"Sound '{name}' already exists")
@@ -115,6 +141,7 @@ class SoundStore:
             "tags": [],
         }
 
+    @_locked
     def add_tag(self, name: str, tag: str) -> None:
         # Lenient case handling: canonicalize at the entry point so MEME, meme,
         # and Meme all collapse to "meme". Matches what parse_tags already does
@@ -130,6 +157,7 @@ class SoundStore:
             tags.append(canonical)
             tags.sort()
 
+    @_locked
     def remove_tag(self, name: str, tag: str) -> None:
         canonical = (tag or "").strip().lower()
         key = name.lower()
@@ -140,12 +168,14 @@ class SoundStore:
             raise ValueError(f"Tag '{canonical}' not present on sound '{name}'")
         tags.remove(canonical)
 
+    @_locked
     def list_tags(self, name: str) -> list[str]:
         key = name.lower()
         if key not in self._sounds:
             raise KeyError(f"Sound '{name}' not found")
         return list(self._sounds[key].get("tags", []))
 
+    @_locked
     def global_tags(self) -> list[tuple[str, int]]:
         """Return all tags with usage counts, sorted by count desc then name asc."""
         counts: dict[str, int] = {}
@@ -154,8 +184,9 @@ class SoundStore:
                 counts[tag] = counts.get(tag, 0) + 1
         return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
+    @_locked
     def rename(self, old_name: str, new_name: str) -> None:
-        self._validate_name(new_name)
+        self.validate_name(new_name)
         old_key = old_name.lower()
         new_key = new_name.lower()
         if old_key not in self._sounds:
@@ -164,6 +195,7 @@ class SoundStore:
             raise ValueError(f"Sound '{new_name}' already exists")
         self._sounds[new_key] = self._sounds.pop(old_key)
 
+    @_locked
     def remove(self, name: str) -> None:
         key = name.lower()
         if key not in self._sounds:
@@ -173,9 +205,11 @@ class SoundStore:
         if file_path.exists():
             file_path.unlink()
 
+    @_locked
     def get(self, name: str) -> dict | None:
         return self._sounds.get(name.lower())
 
+    @_locked
     def find_by_path(self, path: Path) -> str | None:
         """Return the name of any entry whose file is `path`, or None.
 
@@ -201,6 +235,7 @@ class SoundStore:
                 continue
         return None
 
+    @_locked
     def list_sounds(
         self, category: str | None = None, tag: str | None = None
     ) -> list[tuple[str, dict]]:
@@ -213,6 +248,7 @@ class SoundStore:
             results.append((name, entry))
         return sorted(results, key=lambda x: x[0])
 
+    @_locked
     def search(self, query: str) -> list[tuple[str, dict]]:
         query_lower = query.lower()
         if not query_lower:
@@ -228,12 +264,14 @@ class SoundStore:
         substring_matches.sort(key=lambda x: x[0])
         return prefix_matches + substring_matches
 
+    @_locked
     def increment_play_count(self, name: str) -> None:
         key = name.lower()
         if key not in self._sounds:
             raise KeyError(f"Sound '{name}' not found")
         self._sounds[key]["play_count"] += 1
 
+    @_locked
     def replace_sounds(self, sounds: dict) -> None:
         """Public hook for swapping the in-memory sounds dict wholesale.
 
@@ -247,6 +285,7 @@ class SoundStore:
         """
         self._sounds = sounds
 
+    @_locked
     def raw_sounds(self) -> dict:
         """Read accessor for the underlying sounds dict.
 
@@ -258,17 +297,18 @@ class SoundStore:
         """
         return dict(self._sounds)
 
+    @_locked
     def save(self) -> None:
-        with self._save_lock:
-            data = {"sounds": self._sounds, "version": CURRENT_SCHEMA_VERSION}
-            tmp = self._metadata_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, indent=2))
-            tmp.replace(self._metadata_path)
+        data = {"sounds": self._sounds, "version": CURRENT_SCHEMA_VERSION}
+        tmp = self._metadata_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(self._metadata_path)
         # Intentionally does NOT mutate self.startup_version — that field is a
         # frozen snapshot of the on-disk version at load time, used by the
         # migration gate. Writing a new file to disk doesn't change what the
         # store was constructed against.
 
+    @_locked
     def load(self) -> None:
         if self._metadata_path.exists():
             data = json.loads(self._metadata_path.read_text())
@@ -282,6 +322,7 @@ class SoundStore:
             if "tags" not in entry:
                 entry["tags"] = []
 
+    @_locked
     def scan_folder(self) -> None:
         tracked_files = {Path(entry["file"]).resolve() for entry in self._sounds.values()}
         for path in sorted(self._sounds_dir.rglob("*")):
@@ -301,6 +342,7 @@ class SoundStore:
                 # Invalid name from filename - skip silently
                 continue
 
+    @_locked
     def categories(self) -> list[str]:
         cats = {entry["category"] for entry in self._sounds.values() if entry.get("category")}
         return sorted(cats)

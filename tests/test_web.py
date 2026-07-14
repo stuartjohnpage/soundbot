@@ -5,7 +5,6 @@ store. The app factory takes every dependency explicitly (store, cache,
 token, sounds_dir, limits) so tests never monkeypatch config.
 """
 import asyncio
-import shutil
 import signal
 from pathlib import Path
 
@@ -20,13 +19,13 @@ from soundbot.web import (
     build_web_server,
     create_web_app,
     maybe_create_web_app,
+    serve_web_app,
 )
-from tests.test_ingest import make_wav
+from tests.helpers import make_wav, skip_no_ffmpeg
 
 TOKEN = "test-secret-token"
 
-_has_ffmpeg = shutil.which("ffprobe") is not None
-_skip_no_ffmpeg = pytest.mark.skipif(not _has_ffmpeg, reason="FFmpeg/ffprobe not installed")
+_skip_no_ffmpeg = skip_no_ffmpeg
 
 
 def _make_store(tmp_path) -> tuple[SoundStore, Path]:
@@ -40,7 +39,7 @@ def _make_store(tmp_path) -> tuple[SoundStore, Path]:
 
 
 def _make_client(
-    tmp_path, pcm_cache: PCMCache | None = None
+    tmp_path, pcm_cache: PCMCache | None = None, **app_kwargs
 ) -> tuple[TestClient, SoundStore, Path]:
     store, sounds_dir = _make_store(tmp_path)
     app = create_web_app(
@@ -50,6 +49,7 @@ def _make_client(
         sounds_dir=sounds_dir,
         max_duration=6.4,
         target_lufs=-16.0,
+        **app_kwargs,
     )
     client = TestClient(app)
     client.headers[TOKEN_HEADER] = TOKEN
@@ -111,6 +111,20 @@ class TestAuth:
         client, _, _ = _make_client(tmp_path)
         client.headers[TOKEN_HEADER] = "wrong-token"
         assert client.get("/api/sounds").status_code == 401
+
+    def test_non_ascii_token_is_401_not_500(self, tmp_path):
+        """secrets.compare_digest(str, str) raises TypeError on
+        non-ASCII input; starlette decodes header bytes as latin-1, so a
+        raw client can reach the comparison with 'café' and turn an
+        unauthenticated request into a 500."""
+        client, _, _ = _make_client(tmp_path)
+        del client.headers[TOKEN_HEADER]
+
+        resp = client.get(
+            "/api/sounds", headers=[(b"x-auth-token", b"caf\xe9")]
+        )
+
+        assert resp.status_code == 401
 
     def test_correct_token_is_accepted(self, tmp_path):
         client, _, _ = _make_client(tmp_path)
@@ -452,6 +466,22 @@ class TestUpload:
         # ...and nowhere above it.
         assert not (tmp_path / "escapee.wav").exists()
 
+    def test_invalid_name_rejected_before_write(self, tmp_path):
+        """Without a pre-check, an invalid name sails through the file
+        write and the whole ffmpeg pipeline before store.add finally
+        raises — contradicting the route's fail-before-I/O contract."""
+        client, store, sounds_dir = _make_client(tmp_path)
+
+        resp = _upload(
+            client, name="bad name!", filename="horn.wav", content=b"x"
+        )
+
+        assert resp.status_code == 400
+        # The *name* validation message — not the pipeline's "Cannot
+        # read audio file" that fires only after the write.
+        assert resp.json()["detail"].startswith("Sound name")
+        assert not (sounds_dir / "horn.wav").exists()
+
     def test_invalid_tags_rejected_before_write(self, tmp_path):
         client, store, sounds_dir = _make_client(tmp_path)
 
@@ -496,11 +526,27 @@ class TestUpload:
         assert resp.status_code == 201
         assert dest_key not in cache
 
-    def test_oversized_upload_is_413_and_leaves_no_file(self, tmp_path, monkeypatch):
+    def test_unexpected_error_does_not_orphan_partial_file(self, tmp_path, monkeypatch):
+        """A non-ValueError failure (disk full, transient AV lock on
+        Windows) must not leave a partial file in sounds_dir, where the
+        next scan_folder() would register it as a broken sound."""
+
+        def explode(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("soundbot.web.process_upload", explode)
+        client, store, sounds_dir = _make_client(tmp_path)
+
+        with pytest.raises(OSError):
+            _upload(client, name="doomed", filename="doomed.wav", content=b"x")
+
+        assert store.get("doomed") is None
+        assert not (sounds_dir / "doomed.wav").exists()
+
+    def test_oversized_upload_is_413_and_leaves_no_file(self, tmp_path):
         """Discord caps attachment sizes; the web route needs its own
         cap or an authed user could fill the disk before validation."""
-        monkeypatch.setattr("soundbot.web.MAX_UPLOAD_BYTES", 1024)
-        client, store, sounds_dir = _make_client(tmp_path)
+        client, store, sounds_dir = _make_client(tmp_path, max_upload_bytes=1024)
 
         resp = _upload(
             client, name="big", filename="big.wav", content=b"\x00" * 2048
@@ -591,6 +637,41 @@ class TestEmbeddedServer:
         resp = asyncio.run(scenario())
         assert resp.status_code == 200
         assert resp.json() == []
+
+
+class TestServeStartupFailure:
+    def test_port_conflict_does_not_kill_the_event_loop(self, tmp_path):
+        """uvicorn's Server.startup() calls sys.exit(3) when the bind
+        fails. Raised inside a bot-loop task, that SystemExit escapes
+        asyncio.run and kills the whole Discord bot — a stale process on
+        WEB_PORT must degrade to a logged error, not a crash loop."""
+        import socket
+
+        store, sounds_dir = _make_store(tmp_path)
+        app = create_web_app(
+            store,
+            PCMCache(),
+            token=TOKEN,
+            sounds_dir=sounds_dir,
+            max_duration=6.4,
+            target_lufs=-16.0,
+        )
+
+        blocker = socket.socket()
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        port = blocker.getsockname()[1]
+        try:
+
+            async def scenario():
+                server = build_web_server(app, host="127.0.0.1", port=port)
+                task = asyncio.create_task(serve_web_app(server))
+                await task  # must complete without raising
+                return "loop survived"
+
+            assert asyncio.run(scenario()) == "loop survived"
+        finally:
+            blocker.close()
 
 
 class TestIndexPage:

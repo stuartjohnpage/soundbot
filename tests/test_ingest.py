@@ -10,10 +10,6 @@ Happy-path tests use real WAV files generated with the stdlib `wave`
 module and run real ffmpeg/ffprobe — skipped when FFmpeg is not
 installed, same convention as test_audio.py.
 """
-import math
-import shutil
-import struct
-import wave
 from pathlib import Path
 
 import pytest
@@ -21,26 +17,9 @@ import pytest
 from soundbot.ingest import process_upload
 from soundbot.pcm_cache import PCMCache
 from soundbot.store import SoundStore
+from tests.helpers import make_mp4, make_wav, skip_no_ffmpeg
 
-_has_ffmpeg = shutil.which("ffprobe") is not None
-_skip_no_ffmpeg = pytest.mark.skipif(not _has_ffmpeg, reason="FFmpeg/ffprobe not installed")
-
-
-def make_wav(path: Path, duration: float = 1.0, amplitude: float = 0.9) -> Path:
-    """Write a mono 48kHz sine-tone WAV. Loud by default (~-3 LUFS) so
-    upload-time normalization has something to attenuate."""
-    rate = 48000
-    n_frames = int(rate * duration)
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        frames = bytearray()
-        for i in range(n_frames):
-            sample = int(amplitude * 32767 * math.sin(2 * math.pi * 440 * i / rate))
-            frames += struct.pack("<h", sample)
-        w.writeframes(bytes(frames))
-    return path
+_skip_no_ffmpeg = skip_no_ffmpeg
 
 
 def _make_store(tmp_path) -> tuple[SoundStore, Path]:
@@ -81,25 +60,6 @@ class TestProcessUploadHappyPath:
         assert entry["category"] == "memes"
         assert entry["uploaded_by"] == "web-admin"
         assert set(entry["tags"]) == {"loud", "meme"}
-
-
-def make_mp4(path: Path, duration: float = 1.0) -> Path:
-    """Render a tiny real video (test pattern + sine audio) with ffmpeg."""
-    import subprocess
-
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-v", "error",
-            "-f", "lavfi", "-i", f"testsrc=size=64x64:rate=10:duration={duration}",
-            "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
-            "-shortest",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
-        timeout=60,
-    )
-    return path
 
 
 class TestProcessUploadVideoBranch:

@@ -14,7 +14,7 @@ from .mixer import MixerSource
 from .pagination import paginate
 from .pcm_cache import CachedPCMSource, PCMCache
 from .store import SoundStore, parse_tags
-from .web import build_web_server, maybe_create_web_app
+from .web import build_web_server, maybe_create_web_app, serve_web_app
 
 logger = logging.getLogger("soundbot")
 
@@ -391,8 +391,11 @@ class Soundboard(commands.Cog):
         tags: str | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
-        # Validate tags before any file I/O so we fail cleanly on bad input.
+        # Validate name and tags before any file I/O so we fail cleanly
+        # on bad input (otherwise an invalid name isn't caught until
+        # store.add, after the download and the whole ffmpeg pipeline).
         try:
+            SoundStore.validate_name(name)
             tag_list = parse_tags(tags)
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
@@ -869,19 +872,21 @@ def create_bot() -> commands.Bot:
             )
 
             def log_web_exit(task: asyncio.Task) -> None:
-                # Surface startup failures (port already bound, etc.) —
-                # otherwise the task exception is swallowed and the panel
-                # is silently missing.
+                # Surface mid-serve crashes — otherwise the task
+                # exception is swallowed and the panel silently goes
+                # missing. (Startup failures like a bound port are
+                # handled inside serve_web_app, which must contain
+                # uvicorn's SystemExit before it reaches the loop.)
                 if not task.cancelled() and task.exception() is not None:
                     logger.error(
                         "web admin panel stopped", exc_info=task.exception()
                     )
 
             # Keep a reference on the bot so the task isn't GC'd.
-            bot.web_server_task = asyncio.create_task(server.serve())
+            bot.web_server_task = asyncio.create_task(serve_web_app(server))
             bot.web_server_task.add_done_callback(log_web_exit)
             logger.info(
-                "web admin panel listening on %s:%d",
+                "starting web admin panel on %s:%d",
                 config.WEB_HOST,
                 config.WEB_PORT,
             )
