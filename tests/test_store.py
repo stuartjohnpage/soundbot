@@ -1221,3 +1221,46 @@ class TestEmojiBindings:
         store.save()
         data = json.loads((tmp_path / "sounds.json").read_text())
         assert data["emoji_bindings"] == {}
+
+
+class TestPlayStats:
+    def _make_store_with_plays(self, tmp_path, plays: dict[str, int]):
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        for name, count in plays.items():
+            f = sounds_dir / f"{name}.mp3"
+            f.write_bytes(b"x")
+            store.add(name, f)
+            for _ in range(count):
+                store.increment_play_count(name)
+        return store
+
+    def test_empty_library(self, tmp_path):
+        store = self._make_store_with_plays(tmp_path, {})
+        assert store.play_stats() == (0, [])
+
+    def test_totals_and_ordering_with_name_tiebreak(self, tmp_path):
+        store = self._make_store_with_plays(
+            tmp_path, {"bravo": 3, "alpha": 3, "charlie": 7}
+        )
+        total, top = store.play_stats()
+        assert total == 13
+        assert top == [("charlie", 7), ("alpha", 3), ("bravo", 3)]
+
+    def test_never_played_excluded_from_top(self, tmp_path):
+        store = self._make_store_with_plays(tmp_path, {"silent": 0, "hit": 2})
+        total, top = store.play_stats()
+        assert total == 2
+        assert top == [("hit", 2)]
+
+    def test_top_n_cap(self, tmp_path):
+        store = self._make_store_with_plays(
+            tmp_path, {f"s{i:02d}": i + 1 for i in range(12)}
+        )
+        _, top = store.play_stats(top_n=10)
+        assert len(top) == 10
+        assert top[0] == ("s11", 12)

@@ -77,6 +77,7 @@ Create a role in your Discord server called **Soundbot Admin** (or whatever you 
 | `/removesound <name>` | Delete a sound |
 | `/renamesound <old> <new>` | Rename a sound |
 | `/listsounds [category] [page]` | List all sounds with play counts |
+| `/stats` | Top 10 most played sounds and total play count |
 | `/importsounds` | Import this server's Discord soundboard sounds (auto-tagged, loudness-normalized) |
 | `/bindemoji <sound> <emoji>` | Bind an emoji: anyone reacting with it plays the sound (bindings are per-server) |
 | `/unbindemoji <emoji>` | Remove an emoji binding |

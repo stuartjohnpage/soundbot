@@ -1205,3 +1205,36 @@ class TestSameVoiceChannelGate:
         args, kwargs = interaction.response.send_message.call_args
         assert "Use `/join` first" in args[0]
         assert kwargs.get("ephemeral") is True
+
+
+class TestStatsCommand:
+    def test_no_plays_yet_message(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "alpha")
+        interaction = _make_interaction()
+
+        asyncio.run(Soundboard.stats.callback(cog, interaction))
+
+        args, kwargs = interaction.response.send_message.call_args
+        assert "No plays" in args[0]
+        assert kwargs.get("ephemeral") is True
+
+    def test_embed_lists_top_sounds_and_totals(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "alpha")
+        _add_sound(cog, "bravo", "bravo.ogg")
+        _add_sound(cog, "silent", "silent.ogg")
+        for _ in range(3):
+            cog.store.increment_play_count("bravo")
+        cog.store.increment_play_count("alpha")
+        interaction = _make_interaction()
+
+        asyncio.run(Soundboard.stats.callback(cog, interaction))
+
+        _, kwargs = interaction.response.send_message.call_args
+        embed = kwargs["embed"]
+        assert "1. `bravo` — 3 plays" in embed.description
+        assert "2. `alpha` — 1 play" in embed.description
+        assert "silent" not in embed.description
+        assert "3 sounds" in embed.footer.text
+        assert "4 total plays" in embed.footer.text
