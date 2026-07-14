@@ -1,0 +1,1 @@
+- [Project stack](project_stack.md) — discord.py + ffmpeg PCM at 48kHz; cog handlers tested via .callback() + mock Interaction in tests/test_bot.py
