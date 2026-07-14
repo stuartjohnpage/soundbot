@@ -585,7 +585,7 @@ class Soundboard(commands.Cog):
             # above guarantees no other entry references this path.
             # (Concurrent /addsound calls could race around the file.save
             # yield point — that's a pre-existing TOCTOU limitation.)
-            dest, gain = await asyncio.to_thread(
+            dest, gain, trimmed_from = await asyncio.to_thread(
                 process_upload,
                 dest,
                 store=self.store,
@@ -603,6 +603,11 @@ class Soundboard(commands.Cog):
             await interaction.followup.send(str(exc), ephemeral=True)
             return
         msg = f"Added sound **{name}**."
+        if trimmed_from is not None:
+            msg += (
+                f" Trimmed to the first {config.MAX_DURATION:.1f}s"
+                f" (was {trimmed_from:.1f}s)."
+            )
         if gain is not None:
             msg += f" Normalized {gain:+.1f} dB."
         if tag_list:

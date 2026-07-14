@@ -14,9 +14,10 @@ from pathlib import Path
 
 from .audio import (
     extract_audio,
+    get_duration,
     has_video_stream,
     normalize_loudness,
-    validate_sound,
+    trim_audio,
 )
 from .pcm_cache import PCMCache
 from .store import SoundStore
@@ -53,11 +54,14 @@ def process_upload(
     uploaded_by: str | None,
     max_duration: float,
     target_lufs: float,
-) -> tuple[Path, float | None]:
-    """Validate, normalize, and register a file already saved at `dest`.
+) -> tuple[Path, float | None, float | None]:
+    """Validate, trim, normalize, and register a file already saved at `dest`.
 
-    Returns (final_path, gain_db) — gain_db is None when no attenuation
-    was applied. Raises ValueError with a user-facing message on failure;
+    Returns (final_path, gain_db, trimmed_from_seconds) — gain_db is None
+    when no attenuation was applied; trimmed_from_seconds is the original
+    duration when the upload exceeded max_duration and was auto-trimmed
+    to the cap (issue #20), else None.
+    Raises ValueError with a user-facing message on failure;
     the file at `dest` is deleted so a rejected upload leaves nothing
     behind. Callers must ensure no *other* store entry owns `dest`
     before saving bytes there (store.find_by_path) — otherwise the
@@ -84,7 +88,15 @@ def process_upload(
             extract_audio(dest, audio_dest)
             dest.unlink(missing_ok=True)
             dest = audio_dest
-        validate_sound(dest, max_duration)
+        # get_duration doubles as the is-this-readable-audio check that
+        # validate_sound used to provide. Over-length uploads are trimmed
+        # to the cap instead of rejected (issue #20); a trim failure still
+        # rejects, same as the old over-length error path.
+        duration = get_duration(dest)
+        trimmed_from: float | None = None
+        if duration > max_duration:
+            trim_audio(dest, max_duration)
+            trimmed_from = duration
         # Normalize before the cache invalidation below so no consumer
         # can cache the pre-normalization bytes.
         gain = normalize_upload(dest, target_lufs)
@@ -99,4 +111,4 @@ def process_upload(
     except ValueError:
         dest.unlink(missing_ok=True)
         raise
-    return dest, gain
+    return dest, gain, trimmed_from

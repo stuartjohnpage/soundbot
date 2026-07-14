@@ -228,7 +228,7 @@ def create_web_app(
             # Shared ingest pipeline — the exact code path /addsound runs
             # (video-extract, validate, normalize, cache-invalidate,
             # register).
-            final_dest, gain = process_upload(
+            final_dest, gain, trimmed_from = process_upload(
                 dest,
                 store=store,
                 pcm_cache=pcm_cache,
@@ -258,6 +258,7 @@ def create_web_app(
             "name": name.lower(),
             "filename": final_dest.name,
             "gain_db": gain,
+            "trimmed_from_seconds": trimmed_from,
             "tags": store.list_tags(name),
         }
 

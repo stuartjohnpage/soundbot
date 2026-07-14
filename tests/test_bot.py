@@ -539,7 +539,9 @@ def _setup_addsound(tmp_path, monkeypatch, *, normalize=lambda p, t: None):
     # The audio helpers live in soundbot.ingest since the pipeline was
     # extracted there (shared with the web panel's upload route).
     monkeypatch.setattr("soundbot.ingest.has_video_stream", lambda p: False)
-    monkeypatch.setattr("soundbot.ingest.validate_sound", lambda p, d: None)
+    # 1.0s stub duration: always under the (also-stubbed) 60s cap, so the
+    # trim branch never triggers in these handler tests.
+    monkeypatch.setattr("soundbot.ingest.get_duration", lambda p: 1.0)
     monkeypatch.setattr("soundbot.ingest.normalize_loudness", normalize)
     return cog, sounds_dir
 

@@ -227,9 +227,10 @@ $("upload-form").addEventListener("submit", async (event) => {
   setStatus("Uploading...");
   try {
     const result = await (await api("/api/sounds", { method: "POST", body: data })).json();
-    setStatus(result.gain_db == null
-      ? `Added '${result.name}'.`
-      : `Added '${result.name}' (normalized ${result.gain_db.toFixed(1)} dB).`);
+    const notes = [];
+    if (result.trimmed_from_seconds != null) notes.push(`trimmed from ${result.trimmed_from_seconds.toFixed(1)}s`);
+    if (result.gain_db != null) notes.push(`normalized ${result.gain_db.toFixed(1)} dB`);
+    setStatus(notes.length ? `Added '${result.name}' (${notes.join(", ")}).` : `Added '${result.name}'.`);
     $("upload-form").reset();
     await Promise.all([refreshSounds(), refreshFilters()]);
   } catch (err) {

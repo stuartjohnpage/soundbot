@@ -73,7 +73,7 @@ Create a role in your Discord server called **Soundbot Admin** (or whatever you 
 | `/random [category]` | Play a random sound |
 | `/board` | Show clickable button board of all sounds |
 | `/volume <0-100>` | Set playback volume (default: 50) |
-| `/addsound <name> <file> [category] [tags]` | Upload a new sound (max 6.4 seconds; loudness-normalized and auto-tagged with the server's tag) |
+| `/addsound <name> <file> [category] [tags]` | Upload a new sound (sounds over 6.4s are trimmed to the first 6.4s; loudness-normalized and auto-tagged with the server's tag) |
 | `/removesound <name>` | Delete a sound |
 | `/renamesound <old> <new>` | Rename a sound |
 | `/listsounds [category] [page]` | List all sounds with play counts |
