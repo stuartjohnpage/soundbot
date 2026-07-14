@@ -802,3 +802,322 @@ class TestCommandSync:
         tree.copy_global_to.assert_not_called()
         tree.sync.assert_not_awaited()
         http.bulk_upsert_global_commands.assert_awaited_once_with(7, [])
+
+
+# -- Emoji reaction playback (issue #9) --
+
+from soundbot.bot import parse_emoji_key  # noqa: E402
+
+
+class TestParseEmojiKey:
+    def test_unicode_emoji_passes_through(self):
+        assert parse_emoji_key("🎺") == "🎺"
+
+    def test_whitespace_stripped(self):
+        assert parse_emoji_key(" 🎺 ") == "🎺"
+
+    def test_custom_emoji_canonicalized(self):
+        assert parse_emoji_key("<:pog:1122334455667788>") == "<:pog:1122334455667788>"
+
+    def test_animated_custom_emoji(self):
+        assert parse_emoji_key("<a:dance:1122334455667789>") == "<a:dance:1122334455667789>"
+
+    def test_keycap_emoji_allowed_and_vs16_stripped(self):
+        # "1️⃣" is "1" + VS16 + combining keycap; the key drops the VS16
+        assert parse_emoji_key("1️⃣") == "1⃣"
+
+    def test_vs16_variants_collapse_to_same_key(self):
+        # ❤ (U+2764) and ❤️ (U+2764 U+FE0F) are the same emoji; clients
+        # disagree about sending the variation selector.
+        assert parse_emoji_key("❤") == parse_emoji_key("❤️") == "❤"
+
+    def test_bare_keycap_base_rejected(self):
+        # A lone "5" can never match a reaction (payloads carry 5️⃣),
+        # so binding it would create a dead binding with a success message.
+        with pytest.raises(ValueError, match="doesn't look like an emoji"):
+            parse_emoji_key("5")
+
+    def test_zwj_sequence_allowed(self):
+        family = "👨‍👩‍👧‍👦"
+        assert parse_emoji_key(family) == family
+
+    def test_plain_word_rejected(self):
+        with pytest.raises(ValueError, match="doesn't look like an emoji"):
+            parse_emoji_key("airhorn")
+
+    def test_empty_rejected(self):
+        with pytest.raises(ValueError, match="cannot be empty"):
+            parse_emoji_key("   ")
+
+    def test_overlong_sequence_rejected(self):
+        with pytest.raises(ValueError, match="single emoji"):
+            parse_emoji_key("🎺" * 17)
+
+
+GUILD_ID = 555
+BOT_USER_ID = 999
+
+
+def _make_reaction_cog(tmp_path, *, in_voice=True):
+    """Cog wired for reaction tests: real store, fake decoder, live mixer."""
+    cog = _make_cog(tmp_path)
+    _add_sound(cog, "airhorn")
+    cog.pcm_cache = PCMCache(decoder=lambda p: b"\x00" * 7680)
+    cog.mixer = MixerSource()
+    cog.bot.user.id = BOT_USER_ID
+    guild = MagicMock()
+    guild.voice_client = _connected_vc() if in_voice else None
+    cog.bot.get_guild.return_value = guild
+    return cog
+
+
+def _make_payload(*, guild_id=GUILD_ID, user_id=1, emoji="🎺"):
+    payload = MagicMock()
+    payload.guild_id = guild_id
+    payload.user_id = user_id
+    payload.emoji = emoji  # str() of a plain str is itself, like PartialEmoji
+    return payload
+
+
+class TestReactionPlayback:
+    def test_bound_emoji_plays_sound(self, tmp_path):
+        cog = _make_reaction_cog(tmp_path)
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+
+        asyncio.run(cog.on_raw_reaction_add(_make_payload()))
+
+        assert len(cog.mixer._sources) == 1
+        assert cog.store.get("airhorn")["play_count"] == 1
+
+    def test_unbound_emoji_is_ignored(self, tmp_path):
+        cog = _make_reaction_cog(tmp_path)
+
+        asyncio.run(cog.on_raw_reaction_add(_make_payload(emoji="💀")))
+
+        assert cog.mixer._sources == []
+        assert cog.store.get("airhorn")["play_count"] == 0
+
+    def test_binding_in_other_guild_is_ignored(self, tmp_path):
+        cog = _make_reaction_cog(tmp_path)
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+
+        asyncio.run(cog.on_raw_reaction_add(_make_payload(guild_id=777)))
+
+        assert cog.mixer._sources == []
+
+    def test_dm_reaction_is_ignored(self, tmp_path):
+        cog = _make_reaction_cog(tmp_path)
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+
+        asyncio.run(cog.on_raw_reaction_add(_make_payload(guild_id=None)))
+
+        assert cog.mixer._sources == []
+
+    def test_bots_own_reaction_is_ignored(self, tmp_path):
+        cog = _make_reaction_cog(tmp_path)
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+
+        asyncio.run(cog.on_raw_reaction_add(_make_payload(user_id=BOT_USER_ID)))
+
+        assert cog.mixer._sources == []
+
+    def test_bot_not_in_voice_silently_ignored(self, tmp_path):
+        cog = _make_reaction_cog(tmp_path, in_voice=False)
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+
+        asyncio.run(cog.on_raw_reaction_add(_make_payload()))
+
+        assert cog.mixer._sources == []
+        assert cog.store.get("airhorn")["play_count"] == 0
+
+    def test_no_mixer_silently_ignored(self, tmp_path):
+        cog = _make_reaction_cog(tmp_path)
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+        cog.mixer = None
+
+        asyncio.run(cog.on_raw_reaction_add(_make_payload()))
+
+        assert cog.store.get("airhorn")["play_count"] == 0
+
+    def test_stale_binding_missing_sound_is_silent(self, tmp_path):
+        """A binding whose sound vanished (e.g. hand-edited JSON) must not
+        raise inside the listener — just log and stay quiet."""
+        cog = _make_reaction_cog(tmp_path)
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+        # Drop the sound while keeping the binding (bypasses remove()'s cascade)
+        cog.store.replace_sounds({})
+
+        asyncio.run(cog.on_raw_reaction_add(_make_payload()))
+
+        assert cog.mixer._sources == []
+
+    def test_vs16_in_payload_still_matches_binding(self, tmp_path):
+        """Binding stored without VS16 (parse_emoji_key strips it) must match
+        a reaction payload that carries the selector, and vice versa."""
+        cog = _make_reaction_cog(tmp_path)
+        cog.store.bind_emoji(GUILD_ID, "❤", "airhorn")  # bare heart
+
+        asyncio.run(
+            cog.on_raw_reaction_add(_make_payload(emoji="❤️"))
+        )
+
+        assert len(cog.mixer._sources) == 1
+
+    def test_bot_user_none_fails_closed(self, tmp_path):
+        cog = _make_reaction_cog(tmp_path)
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+        cog.bot.user = None
+
+        asyncio.run(cog.on_raw_reaction_add(_make_payload()))
+
+        assert cog.mixer._sources == []
+
+    def test_custom_emoji_binding_matches_payload(self, tmp_path):
+        cog = _make_reaction_cog(tmp_path)
+        cog.store.bind_emoji(GUILD_ID, "<:pog:1122334455667788>", "airhorn")
+        payload = _make_payload(
+            emoji=discord.PartialEmoji(name="pog", id=1122334455667788)
+        )
+
+        asyncio.run(cog.on_raw_reaction_add(payload))
+
+        assert len(cog.mixer._sources) == 1
+
+
+def _make_guild_interaction(**kwargs):
+    interaction = _make_interaction(**kwargs)
+    interaction.guild.id = GUILD_ID
+    return interaction
+
+
+class TestBindEmojiCommand:
+    def test_bind_happy_path_persists(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "airhorn")
+        interaction = _make_guild_interaction()
+
+        asyncio.run(
+            Soundboard.bindemoji.callback(cog, interaction, "airhorn", "🎺")
+        )
+
+        assert cog.store.get_emoji_binding(GUILD_ID, "🎺") == "airhorn"
+        args, _ = interaction.response.send_message.call_args
+        assert "Bound" in args[0]
+        # Persisted to disk, not just in memory
+        reloaded = SoundStore(
+            metadata_path=cog.store._metadata_path,
+            sounds_dir=cog.store._sounds_dir,
+        )
+        assert reloaded.get_emoji_binding(GUILD_ID, "🎺") == "airhorn"
+
+    def test_bind_invalid_emoji_rejected(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "airhorn")
+        interaction = _make_guild_interaction()
+
+        asyncio.run(
+            Soundboard.bindemoji.callback(cog, interaction, "airhorn", "oops")
+        )
+
+        assert cog.store.get_emoji_binding(GUILD_ID, "oops") is None
+        args, kwargs = interaction.response.send_message.call_args
+        assert "doesn't look like an emoji" in args[0]
+        assert kwargs.get("ephemeral") is True
+
+    def test_bind_unknown_sound_rejected(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        interaction = _make_guild_interaction()
+
+        asyncio.run(
+            Soundboard.bindemoji.callback(cog, interaction, "ghost", "🎺")
+        )
+
+        args, kwargs = interaction.response.send_message.call_args
+        assert "not found" in args[0]
+        assert kwargs.get("ephemeral") is True
+
+    def test_rebind_reports_previous_sound(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "airhorn")
+        _add_sound(cog, "bruh", "bruh.ogg")
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+        interaction = _make_guild_interaction()
+
+        asyncio.run(
+            Soundboard.bindemoji.callback(cog, interaction, "bruh", "🎺")
+        )
+
+        assert cog.store.get_emoji_binding(GUILD_ID, "🎺") == "bruh"
+        args, _ = interaction.response.send_message.call_args
+        assert "Rebound" in args[0]
+        assert "airhorn" in args[0]
+
+
+class TestUnbindEmojiCommand:
+    def test_unbind_happy_path(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "airhorn")
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+        interaction = _make_guild_interaction()
+
+        asyncio.run(Soundboard.unbindemoji.callback(cog, interaction, "🎺"))
+
+        assert cog.store.get_emoji_binding(GUILD_ID, "🎺") is None
+        args, _ = interaction.response.send_message.call_args
+        assert "Unbound" in args[0]
+        assert "airhorn" in args[0]
+
+    def test_unbind_works_even_if_key_fails_shape_heuristic(self, tmp_path):
+        """A stored binding must always be removable: if the shape heuristic
+        tightens and rejects an old key, /unbindemoji falls back to the raw
+        string instead of erroring before the store is consulted."""
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "airhorn")
+        # Simulate a legacy key the current heuristic would reject
+        cog.store.bind_emoji(GUILD_ID, "oldkey", "airhorn")
+        interaction = _make_guild_interaction()
+
+        asyncio.run(Soundboard.unbindemoji.callback(cog, interaction, "oldkey"))
+
+        assert cog.store.get_emoji_binding(GUILD_ID, "oldkey") is None
+        args, _ = interaction.response.send_message.call_args
+        assert "Unbound" in args[0]
+
+    def test_unbind_not_bound_reports_cleanly(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        interaction = _make_guild_interaction()
+
+        asyncio.run(Soundboard.unbindemoji.callback(cog, interaction, "🎺"))
+
+        args, kwargs = interaction.response.send_message.call_args
+        assert "not bound" in args[0]
+        # No KeyError repr quotes leaking into the user-facing message
+        assert not args[0].startswith('"')
+        assert kwargs.get("ephemeral") is True
+
+
+class TestListBindingsCommand:
+    def test_empty_bindings_message(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        interaction = _make_guild_interaction()
+
+        asyncio.run(Soundboard.listbindings.callback(cog, interaction))
+
+        args, kwargs = interaction.response.send_message.call_args
+        assert "No emoji bindings" in args[0]
+        assert kwargs.get("ephemeral") is True
+
+    def test_lists_bindings_in_embed(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "airhorn")
+        _add_sound(cog, "bruh", "bruh.ogg")
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+        cog.store.bind_emoji(GUILD_ID, "💀", "bruh")
+        interaction = _make_guild_interaction()
+
+        asyncio.run(Soundboard.listbindings.callback(cog, interaction))
+
+        _, kwargs = interaction.response.send_message.call_args
+        embed = kwargs["embed"]
+        assert "airhorn" in embed.description
+        assert "💀" in embed.description

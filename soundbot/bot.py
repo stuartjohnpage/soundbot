@@ -89,6 +89,66 @@ def duplicate_sound_message(name: str, entry: dict) -> str:
     )
 
 
+# Keycap emoji (1️⃣, #️⃣, …) start with a plain ASCII char before the
+# combining enclosing keycap — the one legitimate ASCII in an emoji key.
+_KEYCAP_BASES = set("0123456789#*")
+_MAX_EMOJI_KEY_LENGTH = 16  # ZWJ family sequences run ~11 code points
+_VS16 = "️"  # variation selector: "emoji presentation", semantically inert
+
+
+def normalize_emoji_key(emoji: str) -> str:
+    """Normalize an emoji string into the canonical binding-lookup key.
+
+    Strips U+FE0F (variation selector 16): clients disagree about sending
+    it — ❤ and ❤️ are the same emoji with and without VS16 — so both the
+    bind path (parse_emoji_key) and the reaction path (on_raw_reaction_add)
+    must collapse the two forms or a binding can silently never match.
+    Custom-emoji keys ("<:name:id>") contain no VS16; this is a no-op there.
+    """
+    return emoji.replace(_VS16, "")
+
+
+def parse_emoji_key(raw: str) -> str:
+    """Canonicalize user-typed emoji text into a binding key, or raise ValueError.
+
+    The key must equal the reaction-time lookup key, so custom emoji
+    round-trip through PartialEmoji (yielding ``<:name:id>`` /
+    ``<a:name:id>``) and unicode emoji are stored VS16-normalized
+    (see normalize_emoji_key).
+
+    Unicode validation is a shape heuristic, not a Unicode-database check:
+    every char must sit above the plain-ASCII range words are written in
+    (letters, digits, punctuation), except keycap bases — and at least one
+    char must be a genuine high codepoint, so a bare keycap base like "5"
+    (which only ever arrives from reactions as 5⃣) can't become a binding
+    that never fires. This rejects the realistic failure mode — someone
+    typing a word like "airhorn" into the emoji field — while accepting
+    flags, skin tones, ZWJ sequences, and keycaps. An exotic non-emoji
+    symbol slipping through is harmless: the binding just never matches
+    a real reaction.
+    """
+    candidate = normalize_emoji_key(raw.strip())
+    if not candidate:
+        raise ValueError("Emoji cannot be empty.")
+    partial = discord.PartialEmoji.from_str(candidate)
+    if partial.id is not None:
+        return str(partial)
+    if len(candidate) > _MAX_EMOJI_KEY_LENGTH:
+        raise ValueError(f"'{raw}' doesn't look like a single emoji.")
+    for ch in candidate:
+        if ord(ch) < 0x2000 and ch not in _KEYCAP_BASES:
+            raise ValueError(
+                f"'{raw}' doesn't look like an emoji. Use a standard emoji "
+                "or a custom emoji from this server."
+            )
+    if not any(ord(ch) >= 0x2000 for ch in candidate):
+        raise ValueError(
+            f"'{raw}' doesn't look like an emoji. Use a standard emoji "
+            "or a custom emoji from this server."
+        )
+    return candidate
+
+
 def _admin_check() -> app_commands.check:
     """Check that the invoking user has the configured admin role."""
 
@@ -174,6 +234,39 @@ class Soundboard(commands.Cog):
             raise ValueError("Bot is not in a voice channel. Use `/join` first.")
         return vc
 
+    async def _start_playback(self, vc: discord.VoiceClient, name: str) -> str | None:
+        """Decode `name` and feed it to the live mixer.
+
+        Returns None on success, or a short user-facing failure reason.
+        Shared core between interaction-driven playback (_play_sound turns
+        the reason into an ephemeral reply) and reaction-triggered playback
+        (which logs the reason and stays silent, per issue #9).
+        """
+        entry = self.store.get(name)
+        if not entry:
+            return f"Sound **{name}** not found."
+
+        # First play for a file pays the ffmpeg decode cost; every subsequent
+        # press is an in-memory slice. Done via to_thread so a cold miss
+        # doesn't block the event loop.
+        try:
+            pcm_bytes = await asyncio.to_thread(self.pcm_cache.get, entry["file"])
+        except ValueError as exc:
+            logger.warning("decode failed for %s: %s", name, exc)
+            return f"Failed to decode **{name}**."
+
+        # The to_thread await above is a yield point: a concurrent /leave can
+        # tear down the mixer and disconnect the voice client before we get
+        # back here. Re-check before touching self.mixer — otherwise we'd
+        # silently drop the sound and leak an orphan mixer.
+        if self.mixer is None or not vc.is_connected():
+            logger.info("voice torn down during decode, dropping sound=%s", name)
+            return "Voice connection lost while loading sound."
+
+        self.mixer.add(CachedPCMSource(pcm_bytes))
+        self.store.increment_play_count(name)
+        return None
+
     async def _play_sound(
         self, interaction: discord.Interaction, name: str, *, suppress_reply: bool = False
     ) -> None:
@@ -183,45 +276,17 @@ class Soundboard(commands.Cog):
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
 
-        entry = self.store.get(name)
-        if not entry:
-            await interaction.response.send_message(
-                f"Sound **{name}** not found.", ephemeral=True
-            )
-            return
-
-        # First play for a file pays the ffmpeg decode cost; every subsequent
-        # press is an in-memory slice. Done via to_thread so a cold miss
-        # doesn't block the event loop.
-        try:
-            pcm_bytes = await asyncio.to_thread(self.pcm_cache.get, entry["file"])
-        except ValueError as exc:
-            logger.warning("decode failed for %s: %s", name, exc)
-            await interaction.response.send_message(
-                f"Failed to decode **{name}**.", ephemeral=True
-            )
-            return
-
-        # The to_thread await above is a yield point: a concurrent /leave can
-        # tear down the mixer and disconnect the voice client before we get
-        # back here. Re-check before touching self.mixer — otherwise we'd
-        # silently drop the sound and leak an orphan mixer.
-        if self.mixer is None or not vc.is_connected():
-            logger.info("voice torn down during decode, dropping sound=%s", name)
+        error = await self._start_playback(vc, name)
+        if error is not None:
             if not interaction.response.is_done():
                 try:
-                    await interaction.response.send_message(
-                        "Voice connection lost while loading sound.",
-                        ephemeral=True,
-                    )
+                    await interaction.response.send_message(error, ephemeral=True)
                 except discord.HTTPException:
-                    pass
+                    logger.warning(
+                        "failed to send error reply for sound=%s: %s", name, error
+                    )
             return
 
-        source = CachedPCMSource(pcm_bytes)
-        self.mixer.add(source)
-
-        self.store.increment_play_count(name)
         logger.info(
             "play sound=%s user=%s guild=%s channel=%s",
             name,
@@ -233,6 +298,46 @@ class Soundboard(commands.Cog):
             await interaction.response.send_message(
                 f"Playing **{name}**", ephemeral=True
             )
+
+    # -- Reaction-triggered playback (issue #9) --
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(
+        self, payload: discord.RawReactionActionEvent
+    ) -> None:
+        """Play the bound sound when a bound emoji reaction is added.
+
+        Every early-out is silent by design (issue #9): reactions carry no
+        interaction to reply to, and a binding miss is the overwhelmingly
+        common case — most reactions have nothing to do with the bot.
+        """
+        if payload.guild_id is None:
+            return
+        # Fail closed while the user cache is unpopulated: better to drop a
+        # reaction during the not-ready window than let the bot's own
+        # reaction self-trigger playback.
+        if self.bot.user is None or payload.user_id == self.bot.user.id:
+            return
+        name = self.store.get_emoji_binding(
+            payload.guild_id, normalize_emoji_key(str(payload.emoji))
+        )
+        if name is None:
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        vc = guild.voice_client if guild is not None else None
+        if vc is None or not vc.is_connected() or self.mixer is None:
+            return  # bot not in voice -> ignore silently
+        error = await self._start_playback(vc, name)
+        if error is not None:
+            logger.info(
+                "reaction play failed sound=%s guild_id=%s: %s",
+                name, payload.guild_id, error,
+            )
+            return
+        logger.info(
+            "play sound=%s trigger=reaction emoji=%s user_id=%s guild_id=%s",
+            name, payload.emoji, payload.user_id, payload.guild_id,
+        )
 
     # -- Sound name autocomplete --
 
@@ -772,6 +877,111 @@ class Soundboard(commands.Cog):
         lines = [f"`{t}` ({n})" for t, n in all_tags]
         embed = discord.Embed(
             title="Tags",
+            description="\n".join(lines),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # -- Emoji binding commands (issue #9) --
+
+    async def _bound_emoji_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete /unbindemoji from this guild's current bindings.
+
+        Choices display as "emoji → sound" but the submitted value is the
+        bare emoji key, matching what unbind_emoji expects.
+        """
+        if interaction.guild is None:
+            return []
+        current_lower = current.lower()
+        return [
+            app_commands.Choice(name=f"{emoji} → {sound}", value=emoji)
+            for emoji, sound in self.store.list_emoji_bindings(interaction.guild.id)
+            if current_lower in sound or current_lower in emoji
+        ][:25]
+
+    @app_commands.command(
+        name="bindemoji",
+        description="Bind an emoji so reacting with it plays a sound",
+    )
+    @app_commands.describe(
+        sound="Sound to play",
+        emoji="Emoji to bind (standard or this server's custom emoji)",
+    )
+    @app_commands.autocomplete(sound=_sound_autocomplete)
+    @app_commands.guild_only()
+    @_admin_check()
+    async def bindemoji(
+        self, interaction: discord.Interaction, sound: str, emoji: str
+    ) -> None:
+        try:
+            emoji_key = parse_emoji_key(emoji)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        try:
+            previous = self.store.bind_emoji(interaction.guild.id, emoji_key, sound)
+            self.store.save()
+        except KeyError:
+            await interaction.response.send_message(
+                f"Sound **{sound}** not found.", ephemeral=True
+            )
+            return
+        if previous is not None and previous != sound.lower():
+            msg = f"Rebound {emoji_key} from **{previous}** to **{sound.lower()}**."
+        else:
+            msg = (
+                f"Bound {emoji_key} to **{sound.lower()}**. "
+                "Reacting with it on any message plays the sound."
+            )
+        await interaction.response.send_message(msg)
+
+    @app_commands.command(
+        name="unbindemoji", description="Remove an emoji-to-sound binding"
+    )
+    @app_commands.describe(emoji="Bound emoji to remove")
+    @app_commands.autocomplete(emoji=_bound_emoji_autocomplete)
+    @app_commands.guild_only()
+    @_admin_check()
+    async def unbindemoji(
+        self, interaction: discord.Interaction, emoji: str
+    ) -> None:
+        # Unlike bind, a parse failure falls back to the raw string: an
+        # already-stored binding must always be removable, even if the
+        # shape heuristic tightens later and would no longer accept its key.
+        try:
+            emoji_key = parse_emoji_key(emoji)
+        except ValueError:
+            emoji_key = normalize_emoji_key(emoji.strip())
+        try:
+            sound = self.store.unbind_emoji(interaction.guild.id, emoji_key)
+            self.store.save()
+        except KeyError as exc:
+            # exc.args[0], not str(exc): KeyError.__str__ wraps the message
+            # in an extra layer of quotes.
+            await interaction.response.send_message(exc.args[0], ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Unbound {emoji_key} (was **{sound}**)."
+        )
+
+    @app_commands.command(
+        name="listbindings",
+        description="List this server's emoji-to-sound bindings",
+    )
+    @app_commands.guild_only()
+    @_admin_check()
+    async def listbindings(self, interaction: discord.Interaction) -> None:
+        bindings = self.store.list_emoji_bindings(interaction.guild.id)
+        if not bindings:
+            await interaction.response.send_message(
+                "No emoji bindings yet. Use `/bindemoji` to create one.",
+                ephemeral=True,
+            )
+            return
+        lines = [f"{emoji} → **{sound}**" for emoji, sound in bindings]
+        embed = discord.Embed(
+            title="Emoji Bindings",
             description="\n".join(lines),
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)

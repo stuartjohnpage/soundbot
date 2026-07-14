@@ -1,2 +1,3 @@
 - [project_soundbot.md](project_soundbot.md) - Soundbot project structure, testing framework, and TDD patterns
 - [project_discordpy_gotchas.md](project_discordpy_gotchas.md) - discord.py Namespace and KeyError behaviors when extending slash commands
+- [project_embedded_server_gotchas.md](project_embedded_server_gotchas.md) - uvicorn-in-bot-loop signal traps, asyncio.run SIGINT baseline, threadpool save-lock invariant

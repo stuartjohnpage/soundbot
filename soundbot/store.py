@@ -88,6 +88,10 @@ class SoundStore:
         self._metadata_path = metadata_path
         self._sounds_dir = sounds_dir
         self._sounds: dict[str, dict] = {}
+        # guild id (stringified — JSON object keys) -> {emoji key -> sound key}.
+        # Emoji keys are whatever str(discord.PartialEmoji) yields: the bare
+        # character for unicode emoji, "<:name:id>"/"<a:name:id>" for custom.
+        self._emoji_bindings: dict[str, dict[str, str]] = {}
         # Version of the file on disk at the moment load() was called. Set
         # exactly once here and NEVER mutated by subsequent writes — the
         # migration gate needs a frozen "what did we open?" snapshot so a
@@ -194,6 +198,12 @@ class SoundStore:
         if new_key in self._sounds:
             raise ValueError(f"Sound '{new_name}' already exists")
         self._sounds[new_key] = self._sounds.pop(old_key)
+        # Bindings reference sounds by name, so follow the rename — a bound
+        # emoji must keep working after /renamesound (issue #9 constraint).
+        for guild_bindings in self._emoji_bindings.values():
+            for emoji, sound in guild_bindings.items():
+                if sound == old_key:
+                    guild_bindings[emoji] = new_key
 
     @_locked
     def remove(self, name: str) -> None:
@@ -201,6 +211,15 @@ class SoundStore:
         if key not in self._sounds:
             raise KeyError(f"Sound '{name}' not found")
         entry = self._sounds.pop(key)
+        # Drop any emoji bindings pointing at the removed sound (all guilds)
+        # so reactions don't dangle. Empty per-guild dicts are pruned to keep
+        # the persisted JSON from accumulating husks.
+        for guild_id in list(self._emoji_bindings):
+            guild_bindings = self._emoji_bindings[guild_id]
+            for emoji in [e for e, s in guild_bindings.items() if s == key]:
+                del guild_bindings[emoji]
+            if not guild_bindings:
+                del self._emoji_bindings[guild_id]
         file_path = Path(entry["file"])
         if file_path.exists():
             file_path.unlink()
@@ -264,6 +283,51 @@ class SoundStore:
         substring_matches.sort(key=lambda x: x[0])
         return prefix_matches + substring_matches
 
+    # -- Emoji bindings (issue #9) --
+
+    @_locked
+    def bind_emoji(self, guild_id: int, emoji: str, sound_name: str) -> str | None:
+        """Bind an emoji to a sound for one guild.
+
+        Returns the sound key the emoji was previously bound to in this
+        guild, or None. Rebinding overwrites — one emoji maps to exactly
+        one sound per guild. Raises KeyError if the sound doesn't exist.
+        The caller is responsible for canonicalizing `emoji` (the bot layer
+        uses parse_emoji_key so bind-time keys match reaction-time keys).
+        """
+        key = sound_name.lower()
+        if key not in self._sounds:
+            raise KeyError(f"Sound '{sound_name}' not found")
+        guild_bindings = self._emoji_bindings.setdefault(str(guild_id), {})
+        previous = guild_bindings.get(emoji)
+        guild_bindings[emoji] = key
+        return previous
+
+    @_locked
+    def unbind_emoji(self, guild_id: int, emoji: str) -> str:
+        """Remove a binding and return the sound key it pointed at.
+
+        Raises KeyError (with a user-facing message) if the emoji isn't
+        bound in this guild.
+        """
+        guild_bindings = self._emoji_bindings.get(str(guild_id), {})
+        if emoji not in guild_bindings:
+            raise KeyError(f"{emoji} is not bound to any sound")
+        sound = guild_bindings.pop(emoji)
+        if not guild_bindings:
+            self._emoji_bindings.pop(str(guild_id), None)
+        return sound
+
+    @_locked
+    def get_emoji_binding(self, guild_id: int, emoji: str) -> str | None:
+        return self._emoji_bindings.get(str(guild_id), {}).get(emoji)
+
+    @_locked
+    def list_emoji_bindings(self, guild_id: int) -> list[tuple[str, str]]:
+        """(emoji, sound) pairs for a guild, sorted by sound then emoji."""
+        guild_bindings = self._emoji_bindings.get(str(guild_id), {})
+        return sorted(guild_bindings.items(), key=lambda kv: (kv[1], kv[0]))
+
     @_locked
     def increment_play_count(self, name: str) -> None:
         key = name.lower()
@@ -299,7 +363,11 @@ class SoundStore:
 
     @_locked
     def save(self) -> None:
-        data = {"sounds": self._sounds, "version": CURRENT_SCHEMA_VERSION}
+        data = {
+            "sounds": self._sounds,
+            "version": CURRENT_SCHEMA_VERSION,
+            "emoji_bindings": self._emoji_bindings,
+        }
         tmp = self._metadata_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(self._metadata_path)
@@ -313,9 +381,11 @@ class SoundStore:
         if self._metadata_path.exists():
             data = json.loads(self._metadata_path.read_text())
             self._sounds = data.get("sounds", {})
+            self._emoji_bindings = data.get("emoji_bindings", {})
             self.startup_version = data.get("version", 1)
         else:
             self._sounds = {}
+            self._emoji_bindings = {}
             self.startup_version = CURRENT_SCHEMA_VERSION
         # Ensure every entry has a tags field (backfill on load for v1)
         for entry in self._sounds.values():

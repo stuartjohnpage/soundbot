@@ -1093,3 +1093,131 @@ class TestParseTags:
     def test_rejects_too_long_element(self):
         with pytest.raises(ValueError, match="invalid"):
             parse_tags("meme," + "a" * 33)
+
+
+class TestEmojiBindings:
+    def _make_store(self, tmp_path):
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir(exist_ok=True)
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        for name in ("airhorn", "bruh"):
+            f = sounds_dir / f"{name}.mp3"
+            f.write_bytes(b"fake audio")
+            store.add(name, f)
+        return store
+
+    GUILD = 1234
+
+    def test_bind_and_get(self, tmp_path):
+        store = self._make_store(tmp_path)
+        previous = store.bind_emoji(self.GUILD, "🎺", "airhorn")
+        assert previous is None
+        assert store.get_emoji_binding(self.GUILD, "🎺") == "airhorn"
+
+    def test_bind_normalizes_sound_name_case(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.bind_emoji(self.GUILD, "🎺", "AirHorn")
+        assert store.get_emoji_binding(self.GUILD, "🎺") == "airhorn"
+
+    def test_bind_unknown_sound_raises(self, tmp_path):
+        store = self._make_store(tmp_path)
+        with pytest.raises(KeyError, match="not found"):
+            store.bind_emoji(self.GUILD, "🎺", "ghost")
+
+    def test_rebind_overwrites_and_returns_previous(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.bind_emoji(self.GUILD, "🎺", "airhorn")
+        previous = store.bind_emoji(self.GUILD, "🎺", "bruh")
+        assert previous == "airhorn"
+        assert store.get_emoji_binding(self.GUILD, "🎺") == "bruh"
+
+    def test_bindings_are_guild_scoped(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.bind_emoji(1111, "🎺", "airhorn")
+        store.bind_emoji(2222, "🎺", "bruh")
+        assert store.get_emoji_binding(1111, "🎺") == "airhorn"
+        assert store.get_emoji_binding(2222, "🎺") == "bruh"
+        assert store.get_emoji_binding(3333, "🎺") is None
+
+    def test_unbind_returns_sound_and_clears(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.bind_emoji(self.GUILD, "🎺", "airhorn")
+        assert store.unbind_emoji(self.GUILD, "🎺") == "airhorn"
+        assert store.get_emoji_binding(self.GUILD, "🎺") is None
+
+    def test_unbind_unknown_emoji_raises(self, tmp_path):
+        store = self._make_store(tmp_path)
+        with pytest.raises(KeyError, match="not bound"):
+            store.unbind_emoji(self.GUILD, "🎺")
+
+    def test_list_bindings_sorted_by_sound(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.bind_emoji(self.GUILD, "💀", "bruh")
+        store.bind_emoji(self.GUILD, "🎺", "airhorn")
+        assert store.list_emoji_bindings(self.GUILD) == [
+            ("🎺", "airhorn"),
+            ("💀", "bruh"),
+        ]
+
+    def test_list_bindings_empty_guild(self, tmp_path):
+        store = self._make_store(tmp_path)
+        assert store.list_emoji_bindings(self.GUILD) == []
+
+    def test_remove_sound_cascades_to_bindings_across_guilds(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.bind_emoji(1111, "🎺", "airhorn")
+        store.bind_emoji(2222, "📯", "airhorn")
+        store.bind_emoji(2222, "💀", "bruh")
+        store.remove("airhorn")
+        assert store.get_emoji_binding(1111, "🎺") is None
+        assert store.get_emoji_binding(2222, "📯") is None
+        # Unrelated binding untouched
+        assert store.get_emoji_binding(2222, "💀") == "bruh"
+
+    def test_rename_sound_follows_binding(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.bind_emoji(self.GUILD, "🎺", "airhorn")
+        store.rename("airhorn", "trumpet")
+        assert store.get_emoji_binding(self.GUILD, "🎺") == "trumpet"
+
+    def test_custom_emoji_key_round_trips(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.bind_emoji(self.GUILD, "<:pog:112233>", "airhorn")
+        assert store.get_emoji_binding(self.GUILD, "<:pog:112233>") == "airhorn"
+
+    def test_bindings_persist_across_save_and_load(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.bind_emoji(self.GUILD, "🎺", "airhorn")
+        store.save()
+
+        reloaded = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=tmp_path / "sounds",
+        )
+        assert reloaded.get_emoji_binding(self.GUILD, "🎺") == "airhorn"
+
+    def test_load_file_without_bindings_key(self, tmp_path):
+        """Metadata written before this feature has no emoji_bindings key."""
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        (tmp_path / "sounds.json").write_text(
+            json.dumps({"sounds": {}, "version": 2})
+        )
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        assert store.list_emoji_bindings(self.GUILD) == []
+
+    def test_empty_guild_dict_pruned_after_remove(self, tmp_path):
+        """remove() drops a guild's dict entirely once its last binding dies,
+        keeping the persisted JSON free of empty husks."""
+        store = self._make_store(tmp_path)
+        store.bind_emoji(self.GUILD, "🎺", "airhorn")
+        store.remove("airhorn")
+        store.save()
+        data = json.loads((tmp_path / "sounds.json").read_text())
+        assert data["emoji_bindings"] == {}
