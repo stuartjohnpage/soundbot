@@ -229,9 +229,26 @@ class Soundboard(commands.Cog):
     # -- Playback helpers --
 
     def _ensure_voice(self, interaction: discord.Interaction) -> discord.VoiceClient:
+        """Return the live voice client, or raise ValueError with a
+        user-facing reason.
+
+        Beyond "is the bot connected?", the invoking user must be in the
+        bot's own voice channel (issue #17) — same rule as Discord's native
+        soundboard. Otherwise anyone in the guild could remote-spam sounds
+        from a text channel at whoever is actually sitting in voice.
+        """
         vc = interaction.guild.voice_client
         if not vc or not vc.is_connected():
             raise ValueError("Bot is not in a voice channel. Use `/join` first.")
+        user_voice = getattr(interaction.user, "voice", None)
+        user_channel = user_voice.channel if user_voice else None
+        if user_channel is None:
+            raise ValueError("You need to be in a voice channel to play sounds.")
+        if user_channel != vc.channel:
+            raise ValueError(
+                f"You need to be in #{vc.channel.name} to play sounds — "
+                f"you're in #{user_channel.name}."
+            )
         return vc
 
     async def _start_playback(self, vc: discord.VoiceClient, name: str) -> str | None:
@@ -327,6 +344,11 @@ class Soundboard(commands.Cog):
         vc = guild.voice_client if guild is not None else None
         if vc is None or not vc.is_connected() or self.mixer is None:
             return  # bot not in voice -> ignore silently
+        # Same-VC gate (issue #17), silent like every other reaction-path
+        # miss. channel.members is voice-state-cache backed, so it lists
+        # exactly who is sitting in the bot's channel right now.
+        if not any(m.id == payload.user_id for m in vc.channel.members):
+            return
         error = await self._start_playback(vc, name)
         if error is not None:
             logger.info(

@@ -53,6 +53,10 @@ def _make_interaction(*, voice_client=None, response_done: bool = False):
     interaction.user.__str__ = MagicMock(return_value="test-user")
     interaction.user.voice = MagicMock()
     interaction.user.voice.channel = MagicMock()
+    # Default to the happy path for the same-VC gate (issue #17): the
+    # user sits in the bot's channel. Gate tests override one side.
+    if voice_client is not None:
+        voice_client.channel = interaction.user.voice.channel
     return interaction
 
 
@@ -858,15 +862,24 @@ GUILD_ID = 555
 BOT_USER_ID = 999
 
 
-def _make_reaction_cog(tmp_path, *, in_voice=True):
-    """Cog wired for reaction tests: real store, fake decoder, live mixer."""
+def _make_reaction_cog(tmp_path, *, in_voice=True, reactor_in_vc=True):
+    """Cog wired for reaction tests: real store, fake decoder, live mixer.
+
+    By default the reacting user (id=1, _make_payload's default) is a member
+    of the bot's voice channel, satisfying the same-VC gate (issue #17).
+    """
     cog = _make_cog(tmp_path)
     _add_sound(cog, "airhorn")
     cog.pcm_cache = PCMCache(decoder=lambda p: b"\x00" * 7680)
     cog.mixer = MixerSource()
     cog.bot.user.id = BOT_USER_ID
     guild = MagicMock()
-    guild.voice_client = _connected_vc() if in_voice else None
+    if in_voice:
+        vc = _connected_vc()
+        vc.channel.members = [MagicMock(id=1)] if reactor_in_vc else []
+        guild.voice_client = vc
+    else:
+        guild.voice_client = None
     cog.bot.get_guild.return_value = guild
     return cog
 
@@ -982,6 +995,16 @@ class TestReactionPlayback:
         asyncio.run(cog.on_raw_reaction_add(payload))
 
         assert len(cog.mixer._sources) == 1
+
+    def test_reactor_outside_bot_vc_silently_ignored(self, tmp_path):
+        """Issue #17: the reacting user must be in the bot's voice channel."""
+        cog = _make_reaction_cog(tmp_path, reactor_in_vc=False)
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+
+        asyncio.run(cog.on_raw_reaction_add(_make_payload()))
+
+        assert cog.mixer._sources == []
+        assert cog.store.get("airhorn")["play_count"] == 0
 
 
 def _make_guild_interaction(**kwargs):
@@ -1121,3 +1144,62 @@ class TestListBindingsCommand:
         embed = kwargs["embed"]
         assert "airhorn" in embed.description
         assert "💀" in embed.description
+
+
+class TestSameVoiceChannelGate:
+    """Issue #17: playback requires the invoking user in the bot's VC."""
+
+    def _gated_cog(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "alpha")
+        cog.pcm_cache = PCMCache(decoder=lambda p: b"\x00" * 7680)
+        cog.mixer = MixerSource()
+        return cog
+
+    def test_user_not_in_voice_blocked(self, tmp_path):
+        cog = self._gated_cog(tmp_path)
+        interaction = _make_interaction(voice_client=_connected_vc())
+        interaction.user.voice = None
+
+        asyncio.run(cog._play_sound(interaction, "alpha"))
+
+        args, kwargs = interaction.response.send_message.call_args
+        assert "need to be in a voice channel" in args[0]
+        assert kwargs.get("ephemeral") is True
+        assert cog.mixer._sources == []
+        assert cog.store.get("alpha")["play_count"] == 0
+
+    def test_user_in_different_channel_blocked_with_both_names(self, tmp_path):
+        cog = self._gated_cog(tmp_path)
+        vc = _connected_vc()
+        interaction = _make_interaction(voice_client=vc)
+        vc.channel = MagicMock()
+        vc.channel.name = "General"
+        interaction.user.voice.channel.name = "AFK"
+
+        asyncio.run(cog._play_sound(interaction, "alpha"))
+
+        args, kwargs = interaction.response.send_message.call_args
+        assert "#General" in args[0]
+        assert "#AFK" in args[0]
+        assert kwargs.get("ephemeral") is True
+        assert cog.mixer._sources == []
+
+    def test_user_in_same_channel_allowed(self, tmp_path):
+        cog = self._gated_cog(tmp_path)
+        interaction = _make_interaction(voice_client=_connected_vc())
+
+        asyncio.run(cog._play_sound(interaction, "alpha"))
+
+        assert len(cog.mixer._sources) == 1
+        assert cog.store.get("alpha")["play_count"] == 1
+
+    def test_bot_not_in_voice_message_unchanged(self, tmp_path):
+        cog = self._gated_cog(tmp_path)
+        interaction = _make_interaction(voice_client=None)
+
+        asyncio.run(cog._play_sound(interaction, "alpha"))
+
+        args, kwargs = interaction.response.send_message.call_args
+        assert "Use `/join` first" in args[0]
+        assert kwargs.get("ephemeral") is True
