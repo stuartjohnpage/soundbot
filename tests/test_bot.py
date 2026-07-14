@@ -532,9 +532,11 @@ def _setup_addsound(tmp_path, monkeypatch, *, normalize=lambda p, t: None):
     sounds_dir = Path(cog.store._sounds_dir)
     monkeypatch.setattr(config, "SOUNDS_DIR", sounds_dir)
     monkeypatch.setattr(config, "MAX_DURATION", 60)
-    monkeypatch.setattr("soundbot.bot.has_video_stream", lambda p: False)
-    monkeypatch.setattr("soundbot.bot.validate_sound", lambda p, d: None)
-    monkeypatch.setattr("soundbot.bot.normalize_loudness", normalize)
+    # The audio helpers live in soundbot.ingest since the pipeline was
+    # extracted there (shared with the web panel's upload route).
+    monkeypatch.setattr("soundbot.ingest.has_video_stream", lambda p: False)
+    monkeypatch.setattr("soundbot.ingest.validate_sound", lambda p, d: None)
+    monkeypatch.setattr("soundbot.ingest.normalize_loudness", normalize)
     return cog, sounds_dir
 
 

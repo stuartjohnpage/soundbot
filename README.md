@@ -109,6 +109,24 @@ Restart the bot after adding files to the folder:
 docker compose restart
 ```
 
+## Web Admin Panel
+
+An optional browser UI for managing the sound library — browse with search and tag/category filters, upload, rename, delete, edit tags, and preview sounds in the browser.
+
+**Disabled by default.** To enable it, set a token in `.env`:
+
+```
+WEB_TOKEN=some-long-random-string
+```
+
+Generate one with e.g. `openssl rand -hex 32`. If `WEB_TOKEN` is empty or unset, the web server never starts.
+
+Then restart (`docker compose up -d --build`) and open `http://<host>:8000` on your LAN. Enter the token on the login screen; it's stored in your browser and sent with every request. Uploads go through the same pipeline as `/addsound` (duration limit, loudness normalization), so sounds added from the browser behave exactly like sounds added from Discord.
+
+The panel runs inside the bot process and shares its sound library state. Change the port with `WEB_PORT` in `.env`.
+
+> **Note:** the token is sent over plain HTTP, so treat the panel as LAN-only. Don't port-forward it to the open internet without putting a reverse proxy with TLS in front.
+
 ## Configuration
 
 All settings are environment variables, configured in `.env`:
@@ -123,6 +141,9 @@ All settings are environment variables, configured in `.env`:
 | `TARGET_LUFS` | `-16` | Loudness target for uploads. Sounds louder than this are turned down on upload (never boosted). |
 | `LOG_FILE` | `./soundbot.log` | Log file path (rotating, 5MB, 3 backups) |
 | `SYNC_COMMANDS` | `true` | Sync slash commands per-guild on startup and on join. Set to `false` to skip syncing entirely. |
+| `WEB_TOKEN` | *(empty)* | Auth token for the web admin panel. Empty = panel disabled. |
+| `WEB_HOST` | `0.0.0.0` | Interface the web panel binds to inside the container. |
+| `WEB_PORT` | `8000` | Port for the web admin panel. |
 
 ## Data and Persistence
 

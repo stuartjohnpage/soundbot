@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Soundbot Admin</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, sans-serif;
+    margin: 0 auto;
+    max-width: 960px;
+    padding: 1rem;
+  }
+  h1 { font-size: 1.4rem; }
+  section { margin-bottom: 1.5rem; }
+  input, select, button {
+    font: inherit;
+    padding: 0.35rem 0.5rem;
+  }
+  table { border-collapse: collapse; width: 100%; }
+  th, td {
+    border-bottom: 1px solid #8884;
+    padding: 0.4rem 0.5rem;
+    text-align: left;
+    vertical-align: middle;
+  }
+  .tag {
+    background: #8883;
+    border-radius: 0.6rem;
+    display: inline-block;
+    font-size: 0.8rem;
+    margin-right: 0.25rem;
+    padding: 0.05rem 0.5rem;
+  }
+  .actions button { margin-right: 0.25rem; }
+  #status { color: #c33; min-height: 1.2em; }
+  #login-view, #main-view { display: none; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  #upload-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+</style>
+</head>
+<body>
+<h1>Soundbot Admin</h1>
+<p id="status"></p>
+
+<div id="login-view">
+  <p>Enter the admin token (<code>WEB_TOKEN</code> from the bot's <code>.env</code>).</p>
+  <input type="password" id="token-input" placeholder="token" autofocus>
+  <button id="login-btn">Log in</button>
+</div>
+
+<div id="main-view">
+  <section>
+    <h2>Upload</h2>
+    <form id="upload-form">
+      <input type="file" id="up-file" required>
+      <input type="text" id="up-name" placeholder="name" required
+             pattern="[a-zA-Z0-9_\-]{1,32}" title="1-32 letters, digits, - or _">
+      <input type="text" id="up-tags" placeholder="tags (comma-separated)">
+      <input type="text" id="up-category" placeholder="category (optional)">
+      <button type="submit">Upload</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>Library</h2>
+    <div class="toolbar">
+      <input type="search" id="search" placeholder="search...">
+      <select id="tag-filter"><option value="">all tags</option></select>
+      <select id="category-filter"><option value="">all categories</option></select>
+      <button id="logout-btn" type="button">Log out</button>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Name</th><th>Tags</th><th>Category</th><th>Plays</th><th></th></tr>
+      </thead>
+      <tbody id="sound-rows"></tbody>
+    </table>
+  </section>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let token = localStorage.getItem("soundbot-token") || "";
+
+function setStatus(msg) { $("status").textContent = msg || ""; }
+
+async function api(path, options = {}) {
+  const resp = await fetch(path, {
+    ...options,
+    headers: { "X-Auth-Token": token, ...(options.headers || {}) },
+  });
+  if (resp.status === 401) {
+    showLogin("Invalid token.");
+    throw new Error("unauthorized");
+  }
+  if (!resp.ok) {
+    let detail = resp.statusText;
+    try { detail = (await resp.json()).detail || detail; } catch (e) { /* not json */ }
+    throw new Error(detail);
+  }
+  return resp;
+}
+
+function showLogin(msg) {
+  token = "";
+  localStorage.removeItem("soundbot-token");
+  $("main-view").style.display = "none";
+  $("login-view").style.display = "block";
+  setStatus(msg);
+}
+
+async function showMain() {
+  $("login-view").style.display = "none";
+  $("main-view").style.display = "block";
+  setStatus("");
+  await Promise.all([refreshSounds(), refreshFilters()]);
+}
+
+async function refreshFilters() {
+  const [tags, categories] = await Promise.all([
+    (await api("/api/tags")).json(),
+    (await api("/api/categories")).json(),
+  ]);
+  const keepTag = $("tag-filter").value, keepCat = $("category-filter").value;
+  $("tag-filter").innerHTML = '<option value="">all tags</option>' +
+    tags.map((t) => `<option>${esc(t.tag)}</option>`).join("");
+  $("category-filter").innerHTML = '<option value="">all categories</option>' +
+    categories.map((c) => `<option>${esc(c)}</option>`).join("");
+  $("tag-filter").value = keepTag;
+  $("category-filter").value = keepCat;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[ch]));
+}
+
+async function refreshSounds() {
+  const params = new URLSearchParams();
+  if ($("search").value) params.set("q", $("search").value);
+  if ($("tag-filter").value) params.set("tag", $("tag-filter").value);
+  if ($("category-filter").value) params.set("category", $("category-filter").value);
+  const sounds = await (await api("/api/sounds?" + params)).json();
+  const rows = sounds.map((s) => `
+    <tr data-name="${esc(s.name)}">
+      <td><strong>${esc(s.name)}</strong></td>
+      <td>${s.tags.map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</td>
+      <td>${esc(s.category ?? "")}</td>
+      <td>${s.play_count}</td>
+      <td class="actions">
+        <button data-act="preview">Play</button>
+        <button data-act="rename">Rename</button>
+        <button data-act="tags">Tags</button>
+        <button data-act="delete">Delete</button>
+      </td>
+    </tr>`);
+  $("sound-rows").innerHTML = rows.join("");
+}
+
+let currentAudio = null;
+async function preview(name) {
+  // <audio src> can't send auth headers, so fetch the bytes and play a blob.
+  const blob = await (await api(`/api/sounds/${encodeURIComponent(name)}/audio`)).blob();
+  if (currentAudio) {
+    currentAudio.pause();
+    URL.revokeObjectURL(currentAudio.src); // don't pin old previews in memory
+  }
+  currentAudio = new Audio(URL.createObjectURL(blob));
+  currentAudio.play();
+}
+
+async function rename(name) {
+  const newName = prompt(`Rename '${name}' to:`, name);
+  if (!newName || newName === name) return;
+  await api(`/api/sounds/${encodeURIComponent(name)}/rename`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ new_name: newName }),
+  });
+  await refreshSounds();
+}
+
+async function editTags(name) {
+  const row = document.querySelector(`tr[data-name="${CSS.escape(name)}"]`);
+  const current = [...row.querySelectorAll(".tag")].map((el) => el.textContent);
+  const answer = prompt(`Tags for '${name}' (comma-separated):`, current.join(","));
+  if (answer === null) return;
+  const tags = answer.split(",").map((t) => t.trim()).filter(Boolean);
+  await api(`/api/sounds/${encodeURIComponent(name)}/tags`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tags }),
+  });
+  await Promise.all([refreshSounds(), refreshFilters()]);
+}
+
+async function remove(name) {
+  if (!confirm(`Delete '${name}'? This also deletes the audio file.`)) return;
+  await api(`/api/sounds/${encodeURIComponent(name)}`, { method: "DELETE" });
+  await Promise.all([refreshSounds(), refreshFilters()]);
+}
+
+$("sound-rows").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-act]");
+  if (!button) return;
+  const name = button.closest("tr").dataset.name;
+  setStatus("");
+  try {
+    await ({ preview, rename, tags: editTags, delete: remove })[button.dataset.act](name);
+  } catch (err) {
+    if (err.message !== "unauthorized") setStatus(err.message);
+  }
+});
+
+$("upload-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const data = new FormData();
+  data.append("file", $("up-file").files[0]);
+  data.append("name", $("up-name").value);
+  if ($("up-tags").value) data.append("tags", $("up-tags").value);
+  if ($("up-category").value) data.append("category", $("up-category").value);
+  setStatus("Uploading...");
+  try {
+    const result = await (await api("/api/sounds", { method: "POST", body: data })).json();
+    setStatus(result.gain_db == null
+      ? `Added '${result.name}'.`
+      : `Added '${result.name}' (normalized ${result.gain_db.toFixed(1)} dB).`);
+    $("upload-form").reset();
+    await Promise.all([refreshSounds(), refreshFilters()]);
+  } catch (err) {
+    if (err.message !== "unauthorized") setStatus(err.message);
+  }
+});
+
+$("login-btn").addEventListener("click", async () => {
+  token = $("token-input").value.trim();
+  try {
+    await api("/api/sounds");
+    localStorage.setItem("soundbot-token", token);
+    await showMain();
+  } catch (err) {
+    // 401 already routed through showLogin; surface anything else
+    // (bot unreachable, 500) instead of silently doing nothing.
+    if (err.message !== "unauthorized") setStatus(err.message);
+  }
+});
+$("token-input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") $("login-btn").click();
+});
+$("logout-btn").addEventListener("click", () => showLogin(""));
+
+let searchTimer = null;
+$("search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => refreshSounds().catch(() => {}), 200);
+});
+for (const id of ["tag-filter", "category-filter"]) {
+  $(id).addEventListener("change", () => refreshSounds().catch(() => {}));
+}
+
+if (token) {
+  showMain().catch(() => {});
+} else {
+  showLogin("");
+}
+</script>
+</body>
+</html>

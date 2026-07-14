@@ -901,6 +901,168 @@ class TestMigrationPureFunction:
         assert v2["sounds"]["airhorn"]["tags"] == ["alpha"]
 
 
+class TestFindByPath:
+    """Path-ownership lookup, hoisted from the Soundboard cog so the web
+    panel's upload route can use the same no-clobber guard as /addsound."""
+
+    def _make_store(self, tmp_path):
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        return SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        ), sounds_dir
+
+    def test_returns_owner_name_for_tracked_path(self, tmp_path):
+        store, sounds_dir = self._make_store(tmp_path)
+        path = sounds_dir / "alpha.mp3"
+        path.write_bytes(b"x")
+        store.add("alpha", path)
+
+        assert store.find_by_path(path) == "alpha"
+
+    def test_returns_none_for_untracked_path(self, tmp_path):
+        store, sounds_dir = self._make_store(tmp_path)
+        path = sounds_dir / "alpha.mp3"
+        path.write_bytes(b"x")
+        store.add("alpha", path)
+
+        assert store.find_by_path(sounds_dir / "other.mp3") is None
+
+    def test_resolves_relative_vs_absolute_mismatch(self, tmp_path, monkeypatch):
+        store, sounds_dir = self._make_store(tmp_path)
+        path = sounds_dir / "alpha.mp3"
+        path.write_bytes(b"x")
+        store.add("alpha", path.resolve())
+
+        monkeypatch.chdir(sounds_dir)
+        assert store.find_by_path(Path("alpha.mp3")) == "alpha"
+
+    def test_missing_file_still_matches_entry(self, tmp_path):
+        """A dangling store entry (file manually deleted) still owns its
+        path — an upload landing there would corrupt the entry."""
+        store, sounds_dir = self._make_store(tmp_path)
+        path = sounds_dir / "ghost.mp3"
+        path.write_bytes(b"x")
+        store.add("ghost", path)
+        path.unlink()
+
+        assert store.find_by_path(path) == "ghost"
+
+
+class TestConcurrentSave:
+    def test_parallel_saves_do_not_collide_or_corrupt(self, tmp_path):
+        """The web panel (issue #1) runs its handlers in a threadpool
+        while the bot's 60s save-loop writes from the event-loop thread.
+        Every save() writes the same .tmp path, so unserialized writers
+        can collide on the os.replace (PermissionError on Windows) or
+        interleave partial JSON. save() must be safe to call from any
+        thread."""
+        import threading
+
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        f = sounds_dir / "a.mp3"
+        f.write_bytes(b"x")
+        store.add("a", f)
+
+        errors: list[Exception] = []
+
+        def hammer():
+            try:
+                for _ in range(200):
+                    store.save()
+            except Exception as exc:  # noqa: BLE001 - recorded for assert
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        # The final file must be complete, valid JSON.
+        data = json.loads((tmp_path / "sounds.json").read_text())
+        assert "a" in data["sounds"]
+
+    def test_mutation_during_save_and_iteration_is_safe(self, tmp_path):
+        """The web panel mutates the store from FastAPI's threadpool
+        while the bot's event-loop thread iterates it (60s save loop,
+        autocomplete via search/list_sounds). An unserialized dict
+        insert/delete during iteration raises 'dictionary changed size
+        during iteration' — and an unhandled exception in a
+        discord.ext.tasks loop stops that loop permanently."""
+        import sys
+        import threading
+
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        # Enough entries that iteration spans a real window, plus an
+        # aggressive GIL switch interval so the interleaving that takes
+        # days to hit in production happens within this test.
+        for i in range(1000):
+            store.add(f"s{i}", sounds_dir / f"s{i}.mp3")
+        switch_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        self._run_hammer(store, sounds_dir)
+        sys.setswitchinterval(switch_interval)
+
+    def _run_hammer(self, store, sounds_dir):
+        import threading
+
+        errors: list[Exception] = []
+        stop = threading.Event()
+
+        def mutator():
+            try:
+                i = 1000
+                while not stop.is_set():
+                    # No file on disk needed: add() records the path
+                    # without touching it, and remove() skips a missing
+                    # file — keeps the mutation loop hot enough to hit
+                    # the iteration window.
+                    store.add(f"m{i}", sounds_dir / f"m{i}.mp3")
+                    store.add_tag(f"m{i}", "hammer")
+                    store.rename(f"m{i}", f"r{i}")
+                    store.remove(f"r{i}")
+                    i += 1
+            except Exception as exc:  # noqa: BLE001 - recorded for assert
+                errors.append(exc)
+
+        def iterator():
+            try:
+                for _ in range(150):
+                    store.save()
+                    store.list_sounds(tag="hammer")
+                    store.search("s")
+                    store.global_tags()
+                    store.find_by_path(sounds_dir / "s0.mp3")
+            except Exception as exc:  # noqa: BLE001 - recorded for assert
+                errors.append(exc)
+            finally:
+                stop.set()
+
+        threads = [
+            threading.Thread(target=mutator),
+            threading.Thread(target=iterator),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+
+
 class TestParseTags:
     def test_parses_comma_separated(self):
         assert set(parse_tags("meme,funny,dave")) == {"dave", "funny", "meme"}
