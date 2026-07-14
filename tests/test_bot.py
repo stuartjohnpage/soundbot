@@ -822,8 +822,20 @@ class TestParseEmojiKey:
     def test_animated_custom_emoji(self):
         assert parse_emoji_key("<a:dance:1122334455667789>") == "<a:dance:1122334455667789>"
 
-    def test_keycap_emoji_allowed(self):
-        assert parse_emoji_key("1️⃣") == "1️⃣"
+    def test_keycap_emoji_allowed_and_vs16_stripped(self):
+        # "1️⃣" is "1" + VS16 + combining keycap; the key drops the VS16
+        assert parse_emoji_key("1️⃣") == "1⃣"
+
+    def test_vs16_variants_collapse_to_same_key(self):
+        # ❤ (U+2764) and ❤️ (U+2764 U+FE0F) are the same emoji; clients
+        # disagree about sending the variation selector.
+        assert parse_emoji_key("❤") == parse_emoji_key("❤️") == "❤"
+
+    def test_bare_keycap_base_rejected(self):
+        # A lone "5" can never match a reaction (payloads carry 5️⃣),
+        # so binding it would create a dead binding with a success message.
+        with pytest.raises(ValueError, match="doesn't look like an emoji"):
+            parse_emoji_key("5")
 
     def test_zwj_sequence_allowed(self):
         family = "👨‍👩‍👧‍👦"
@@ -939,6 +951,27 @@ class TestReactionPlayback:
 
         assert cog.mixer._sources == []
 
+    def test_vs16_in_payload_still_matches_binding(self, tmp_path):
+        """Binding stored without VS16 (parse_emoji_key strips it) must match
+        a reaction payload that carries the selector, and vice versa."""
+        cog = _make_reaction_cog(tmp_path)
+        cog.store.bind_emoji(GUILD_ID, "❤", "airhorn")  # bare heart
+
+        asyncio.run(
+            cog.on_raw_reaction_add(_make_payload(emoji="❤️"))
+        )
+
+        assert len(cog.mixer._sources) == 1
+
+    def test_bot_user_none_fails_closed(self, tmp_path):
+        cog = _make_reaction_cog(tmp_path)
+        cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
+        cog.bot.user = None
+
+        asyncio.run(cog.on_raw_reaction_add(_make_payload()))
+
+        assert cog.mixer._sources == []
+
     def test_custom_emoji_binding_matches_payload(self, tmp_path):
         cog = _make_reaction_cog(tmp_path)
         cog.store.bind_emoji(GUILD_ID, "<:pog:1122334455667788>", "airhorn")
@@ -1033,6 +1066,22 @@ class TestUnbindEmojiCommand:
         args, _ = interaction.response.send_message.call_args
         assert "Unbound" in args[0]
         assert "airhorn" in args[0]
+
+    def test_unbind_works_even_if_key_fails_shape_heuristic(self, tmp_path):
+        """A stored binding must always be removable: if the shape heuristic
+        tightens and rejects an old key, /unbindemoji falls back to the raw
+        string instead of erroring before the store is consulted."""
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "airhorn")
+        # Simulate a legacy key the current heuristic would reject
+        cog.store.bind_emoji(GUILD_ID, "oldkey", "airhorn")
+        interaction = _make_guild_interaction()
+
+        asyncio.run(Soundboard.unbindemoji.callback(cog, interaction, "oldkey"))
+
+        assert cog.store.get_emoji_binding(GUILD_ID, "oldkey") is None
+        args, _ = interaction.response.send_message.call_args
+        assert "Unbound" in args[0]
 
     def test_unbind_not_bound_reports_cleanly(self, tmp_path):
         cog = _make_cog(tmp_path)

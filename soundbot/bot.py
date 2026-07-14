@@ -93,24 +93,41 @@ def duplicate_sound_message(name: str, entry: dict) -> str:
 # combining enclosing keycap — the one legitimate ASCII in an emoji key.
 _KEYCAP_BASES = set("0123456789#*")
 _MAX_EMOJI_KEY_LENGTH = 16  # ZWJ family sequences run ~11 code points
+_VS16 = "️"  # variation selector: "emoji presentation", semantically inert
+
+
+def normalize_emoji_key(emoji: str) -> str:
+    """Normalize an emoji string into the canonical binding-lookup key.
+
+    Strips U+FE0F (variation selector 16): clients disagree about sending
+    it — ❤ and ❤️ are the same emoji with and without VS16 — so both the
+    bind path (parse_emoji_key) and the reaction path (on_raw_reaction_add)
+    must collapse the two forms or a binding can silently never match.
+    Custom-emoji keys ("<:name:id>") contain no VS16; this is a no-op there.
+    """
+    return emoji.replace(_VS16, "")
 
 
 def parse_emoji_key(raw: str) -> str:
     """Canonicalize user-typed emoji text into a binding key, or raise ValueError.
 
-    The key must equal ``str(payload.emoji)`` at reaction time, so custom
-    emoji round-trip through PartialEmoji (yielding ``<:name:id>`` /
-    ``<a:name:id>``) and unicode emoji are stored as the bare character(s).
+    The key must equal the reaction-time lookup key, so custom emoji
+    round-trip through PartialEmoji (yielding ``<:name:id>`` /
+    ``<a:name:id>``) and unicode emoji are stored VS16-normalized
+    (see normalize_emoji_key).
 
     Unicode validation is a shape heuristic, not a Unicode-database check:
     every char must sit above the plain-ASCII range words are written in
-    (letters, digits, punctuation), except keycap bases. That rejects the
-    realistic failure mode — someone typing a word like "airhorn" into the
-    emoji field — while accepting flags, skin tones, ZWJ sequences, and
-    keycaps. An exotic non-emoji symbol slipping through is harmless: the
-    binding just never matches a real reaction.
+    (letters, digits, punctuation), except keycap bases — and at least one
+    char must be a genuine high codepoint, so a bare keycap base like "5"
+    (which only ever arrives from reactions as 5⃣) can't become a binding
+    that never fires. This rejects the realistic failure mode — someone
+    typing a word like "airhorn" into the emoji field — while accepting
+    flags, skin tones, ZWJ sequences, and keycaps. An exotic non-emoji
+    symbol slipping through is harmless: the binding just never matches
+    a real reaction.
     """
-    candidate = raw.strip()
+    candidate = normalize_emoji_key(raw.strip())
     if not candidate:
         raise ValueError("Emoji cannot be empty.")
     partial = discord.PartialEmoji.from_str(candidate)
@@ -124,6 +141,11 @@ def parse_emoji_key(raw: str) -> str:
                 f"'{raw}' doesn't look like an emoji. Use a standard emoji "
                 "or a custom emoji from this server."
             )
+    if not any(ord(ch) >= 0x2000 for ch in candidate):
+        raise ValueError(
+            f"'{raw}' doesn't look like an emoji. Use a standard emoji "
+            "or a custom emoji from this server."
+        )
     return candidate
 
 
@@ -260,7 +282,9 @@ class Soundboard(commands.Cog):
                 try:
                     await interaction.response.send_message(error, ephemeral=True)
                 except discord.HTTPException:
-                    pass
+                    logger.warning(
+                        "failed to send error reply for sound=%s: %s", name, error
+                    )
             return
 
         logger.info(
@@ -289,9 +313,14 @@ class Soundboard(commands.Cog):
         """
         if payload.guild_id is None:
             return
-        if self.bot.user is not None and payload.user_id == self.bot.user.id:
+        # Fail closed while the user cache is unpopulated: better to drop a
+        # reaction during the not-ready window than let the bot's own
+        # reaction self-trigger playback.
+        if self.bot.user is None or payload.user_id == self.bot.user.id:
             return
-        name = self.store.get_emoji_binding(payload.guild_id, str(payload.emoji))
+        name = self.store.get_emoji_binding(
+            payload.guild_id, normalize_emoji_key(str(payload.emoji))
+        )
         if name is None:
             return
         guild = self.bot.get_guild(payload.guild_id)
@@ -880,15 +909,11 @@ class Soundboard(commands.Cog):
         emoji="Emoji to bind (standard or this server's custom emoji)",
     )
     @app_commands.autocomplete(sound=_sound_autocomplete)
+    @app_commands.guild_only()
     @_admin_check()
     async def bindemoji(
         self, interaction: discord.Interaction, sound: str, emoji: str
     ) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "This command can only be used in a server.", ephemeral=True
-            )
-            return
         try:
             emoji_key = parse_emoji_key(emoji)
         except ValueError as exc:
@@ -916,20 +941,18 @@ class Soundboard(commands.Cog):
     )
     @app_commands.describe(emoji="Bound emoji to remove")
     @app_commands.autocomplete(emoji=_bound_emoji_autocomplete)
+    @app_commands.guild_only()
     @_admin_check()
     async def unbindemoji(
         self, interaction: discord.Interaction, emoji: str
     ) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "This command can only be used in a server.", ephemeral=True
-            )
-            return
+        # Unlike bind, a parse failure falls back to the raw string: an
+        # already-stored binding must always be removable, even if the
+        # shape heuristic tightens later and would no longer accept its key.
         try:
             emoji_key = parse_emoji_key(emoji)
-        except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
-            return
+        except ValueError:
+            emoji_key = normalize_emoji_key(emoji.strip())
         try:
             sound = self.store.unbind_emoji(interaction.guild.id, emoji_key)
             self.store.save()
@@ -946,13 +969,9 @@ class Soundboard(commands.Cog):
         name="listbindings",
         description="List this server's emoji-to-sound bindings",
     )
+    @app_commands.guild_only()
     @_admin_check()
     async def listbindings(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "This command can only be used in a server.", ephemeral=True
-            )
-            return
         bindings = self.store.list_emoji_bindings(interaction.guild.id)
         if not bindings:
             await interaction.response.send_message(
