@@ -908,6 +908,33 @@ class Soundboard(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # -- Stats --
+
+    @app_commands.command(
+        name="stats", description="Sound library statistics"
+    )
+    @_admin_check()
+    async def stats(self, interaction: discord.Interaction) -> None:
+        total, top = self.store.play_stats()
+        sound_count = len(self.store.list_sounds())
+        if total == 0:
+            await interaction.response.send_message(
+                "No plays recorded yet.", ephemeral=True
+            )
+            return
+        lines = [
+            f"{idx}. `{name}` — {count} play{'s' if count != 1 else ''}"
+            for idx, (name, count) in enumerate(top, start=1)
+        ]
+        embed = discord.Embed(
+            title="Most Played Sounds",
+            description="\n".join(lines),
+        )
+        embed.set_footer(
+            text=f"{sound_count} sounds • {total} total plays"
+        )
+        await interaction.response.send_message(embed=embed)
+
     # -- Emoji binding commands (issue #9) --
 
     async def _bound_emoji_autocomplete(

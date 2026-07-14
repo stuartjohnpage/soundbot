@@ -329,6 +329,25 @@ class SoundStore:
         return sorted(guild_bindings.items(), key=lambda kv: (kv[1], kv[0]))
 
     @_locked
+    def play_stats(self, top_n: int = 10) -> tuple[int, list[tuple[str, int]]]:
+        """Return (total_plays, top played sounds) for /stats (issue #3).
+
+        The top list is [(name, count)] sorted by count desc then name asc,
+        capped at top_n; never-played sounds are excluded from it (but a
+        library of all-zero counts still reports its total of 0).
+        """
+        counts = [
+            (name, entry.get("play_count", 0))
+            for name, entry in self._sounds.items()
+        ]
+        total = sum(count for _, count in counts)
+        top = sorted(
+            (item for item in counts if item[1] > 0),
+            key=lambda kv: (-kv[1], kv[0]),
+        )[:top_n]
+        return total, top
+
+    @_locked
     def increment_play_count(self, name: str) -> None:
         key = name.lower()
         if key not in self._sounds:
