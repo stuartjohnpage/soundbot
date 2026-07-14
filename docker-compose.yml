@@ -3,6 +3,9 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    ports:
+      # Web admin panel (only listens when WEB_TOKEN is set in .env).
+      - "${WEB_PORT:-8000}:${WEB_PORT:-8000}"
     volumes:
       - ./sounds:/app/sounds
       - ./data:/app/data

@@ -901,6 +901,96 @@ class TestMigrationPureFunction:
         assert v2["sounds"]["airhorn"]["tags"] == ["alpha"]
 
 
+class TestFindByPath:
+    """Path-ownership lookup, hoisted from the Soundboard cog so the web
+    panel's upload route can use the same no-clobber guard as /addsound."""
+
+    def _make_store(self, tmp_path):
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        return SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        ), sounds_dir
+
+    def test_returns_owner_name_for_tracked_path(self, tmp_path):
+        store, sounds_dir = self._make_store(tmp_path)
+        path = sounds_dir / "alpha.mp3"
+        path.write_bytes(b"x")
+        store.add("alpha", path)
+
+        assert store.find_by_path(path) == "alpha"
+
+    def test_returns_none_for_untracked_path(self, tmp_path):
+        store, sounds_dir = self._make_store(tmp_path)
+        path = sounds_dir / "alpha.mp3"
+        path.write_bytes(b"x")
+        store.add("alpha", path)
+
+        assert store.find_by_path(sounds_dir / "other.mp3") is None
+
+    def test_resolves_relative_vs_absolute_mismatch(self, tmp_path, monkeypatch):
+        store, sounds_dir = self._make_store(tmp_path)
+        path = sounds_dir / "alpha.mp3"
+        path.write_bytes(b"x")
+        store.add("alpha", path.resolve())
+
+        monkeypatch.chdir(sounds_dir)
+        assert store.find_by_path(Path("alpha.mp3")) == "alpha"
+
+    def test_missing_file_still_matches_entry(self, tmp_path):
+        """A dangling store entry (file manually deleted) still owns its
+        path — an upload landing there would corrupt the entry."""
+        store, sounds_dir = self._make_store(tmp_path)
+        path = sounds_dir / "ghost.mp3"
+        path.write_bytes(b"x")
+        store.add("ghost", path)
+        path.unlink()
+
+        assert store.find_by_path(path) == "ghost"
+
+
+class TestConcurrentSave:
+    def test_parallel_saves_do_not_collide_or_corrupt(self, tmp_path):
+        """The web panel (issue #1) runs its handlers in a threadpool
+        while the bot's 60s save-loop writes from the event-loop thread.
+        Every save() writes the same .tmp path, so unserialized writers
+        can collide on the os.replace (PermissionError on Windows) or
+        interleave partial JSON. save() must be safe to call from any
+        thread."""
+        import threading
+
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        store = SoundStore(
+            metadata_path=tmp_path / "sounds.json",
+            sounds_dir=sounds_dir,
+        )
+        f = sounds_dir / "a.mp3"
+        f.write_bytes(b"x")
+        store.add("a", f)
+
+        errors: list[Exception] = []
+
+        def hammer():
+            try:
+                for _ in range(200):
+                    store.save()
+            except Exception as exc:  # noqa: BLE001 - recorded for assert
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        # The final file must be complete, valid JSON.
+        data = json.loads((tmp_path / "sounds.json").read_text())
+        assert "a" in data["sounds"]
+
+
 class TestParseTags:
     def test_parses_comma_separated(self):
         assert set(parse_tags("meme,funny,dave")) == {"dave", "funny", "meme"}

@@ -8,17 +8,13 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from . import config
-from .audio import (
-    extract_audio,
-    has_video_stream,
-    normalize_loudness,
-    validate_sound,
-)
+from .ingest import process_upload
 from .migration import run_migration_if_needed
 from .mixer import MixerSource
 from .pagination import paginate
 from .pcm_cache import CachedPCMSource, PCMCache
 from .store import SoundStore, parse_tags
+from .web import build_web_server, maybe_create_web_app
 
 logger = logging.getLogger("soundbot")
 
@@ -91,24 +87,6 @@ def duplicate_sound_message(name: str, entry: dict) -> str:
         f"filter to see it, `/tag add` to tag it for this server, or pick "
         f"another name."
     )
-
-
-def normalize_upload(dest: Path, target_lufs: float) -> float | None:
-    """Best-effort loudness normalization for a just-saved upload.
-
-    Returns the gain applied in dB (or None if the file was already at or
-    below target). Never raises: a sound that can't be normalized is still
-    a playable sound, so measurement/encode failures degrade to keeping
-    the original file rather than refusing the upload.
-    """
-    try:
-        return normalize_loudness(dest, target_lufs)
-    except ValueError:
-        logger.warning(
-            "loudness normalization failed for %s; keeping original", dest,
-            exc_info=True,
-        )
-        return None
 
 
 def _admin_check() -> app_commands.check:
@@ -390,29 +368,11 @@ class Soundboard(commands.Cog):
     def _find_existing_by_path(self, path: Path) -> str | None:
         """Return the name of any store entry whose file is `path`, or None.
 
-        Used by addsound and importsounds to refuse a write that would
-        silently overwrite another sound's file. Pre-fix bug: two sounds
-        with the same destination filename (different names) would both
-        land at the same path on disk. The second write would clobber the
-        first's bytes, corrupting the first entry without raising.
-
-        Both sides are resolved to absolute paths before comparison so a
-        relative-vs-absolute mismatch (e.g. `SOUNDS_DIR=sounds` in config
-        vs `sounds/foo.mp3` already stored absolutely) doesn't defeat the
-        check. `.resolve(strict=False)` doesn't raise on missing files,
-        but we still guard against OSError on path encoding edge cases.
+        Thin delegate to SoundStore.find_by_path — the logic was hoisted
+        into the store so the web panel's upload route can use the same
+        no-clobber guard without reaching into the cog.
         """
-        try:
-            target = Path(path).resolve(strict=False)
-        except OSError:
-            return None
-        for existing_name, existing_entry in self.store.list_sounds():
-            try:
-                if Path(existing_entry["file"]).resolve(strict=False) == target:
-                    return existing_name
-            except OSError:
-                continue
-        return None
+        return self.store.find_by_path(path)
 
     @app_commands.command(name="addsound", description="Add a new sound")
     @app_commands.describe(
@@ -487,54 +447,29 @@ class Soundboard(commands.Cog):
             return
         await file.save(dest)
         try:
-            if has_video_stream(dest):
-                audio_dest = dest.with_suffix(".mp3")
-                if audio_dest.exists():
-                    dest.unlink(missing_ok=True)
-                    await interaction.followup.send(
-                        f"A file named `{audio_dest.name}` already exists.",
-                        ephemeral=True,
-                    )
-                    return
-                # Same no-clobber guard as the pre-save check, but for the
-                # extracted audio destination. Covers the case where a store
-                # entry references a file path that was manually deleted off
-                # disk — the .exists() check above would miss it.
-                audio_owner = self._find_existing_by_path(audio_dest)
-                if audio_owner is not None:
-                    dest.unlink(missing_ok=True)
-                    await interaction.followup.send(
-                        f"Cannot upload: `{audio_dest.name}` is already in use "
-                        f"by sound **{audio_owner}**. Remove that sound first.",
-                        ephemeral=True,
-                    )
-                    return
-                extract_audio(dest, audio_dest)
-                dest.unlink(missing_ok=True)
-                dest = audio_dest
-            validate_sound(dest, config.MAX_DURATION)
-            # Normalize before the cache invalidation below so no consumer
-            # can cache the pre-normalization bytes.
-            gain = normalize_upload(dest, config.TARGET_LUFS)
-            # Drop any stale cached PCM for this path before the new entry
-            # is added. Two distinct sound names uploaded with the same
-            # filename land at the same dest on disk, and a previous /play
-            # may have populated the cache with the old file's bytes.
-            self.pcm_cache.invalidate(dest)
-            self.store.add(
-                name, dest, category=category, uploaded_by=str(interaction.user)
+            # Shared ingest pipeline (video-extract, validate, normalize,
+            # cache-invalidate, register) — same code path as the web
+            # panel's upload route. to_thread keeps the ffmpeg subprocess
+            # work off the event loop. On ValueError the pipeline has
+            # already unlinked dest; safe because _find_existing_by_path
+            # above guarantees no other entry references this path.
+            # (Concurrent /addsound calls could race around the file.save
+            # yield point — that's a pre-existing TOCTOU limitation.)
+            dest, gain = await asyncio.to_thread(
+                process_upload,
+                dest,
+                store=self.store,
+                pcm_cache=self.pcm_cache,
+                name=name,
+                category=category,
+                tags=tag_list,
+                uploaded_by=str(interaction.user),
+                max_duration=config.MAX_DURATION,
+                target_lufs=config.TARGET_LUFS,
             )
-            for tag in tag_list:
-                self.store.add_tag(name, tag)
             # Single save after the batch — add_tag mutates only in-memory state.
             self.store.save()
         except ValueError as exc:
-            # Safe to unlink: _find_existing_by_path above guarantees no
-            # other entry references this path, and the same check fires
-            # for audio_dest post-extraction. (Concurrent /addsound calls
-            # could race around the file.save yield point — that's a
-            # pre-existing TOCTOU limitation, not introduced by this.)
-            dest.unlink(missing_ok=True)
             await interaction.followup.send(str(exc), ephemeral=True)
             return
         msg = f"Added sound **{name}**."
@@ -663,19 +598,22 @@ class Soundboard(commands.Cog):
                 continue
             try:
                 await sound.save(dest)
-                validate_sound(dest, config.MAX_DURATION)
-                # Same upload-time normalization as /addsound — imported
-                # soundboard sounds arrive at whatever level they were
-                # uploaded to Discord at.
-                normalize_upload(dest, config.TARGET_LUFS)
-                self.store.add(
-                    key,
+                # Same ingest pipeline as /addsound — imported soundboard
+                # sounds arrive at whatever level they were uploaded to
+                # Discord at, so they get the same validation and
+                # upload-time normalization.
+                await asyncio.to_thread(
+                    process_upload,
                     dest,
+                    store=self.store,
+                    pcm_cache=self.pcm_cache,
+                    name=key,
                     category=DISCORD_IMPORT_CATEGORY,
+                    tags=[guild_tag] if guild_tag else [],
                     uploaded_by=str(interaction.user),
+                    max_duration=config.MAX_DURATION,
+                    target_lufs=config.TARGET_LUFS,
                 )
-                if guild_tag:
-                    self.store.add_tag(key, guild_tag)
                 imported.append(key)
             except (discord.HTTPException, ValueError, OSError) as exc:
                 dest.unlink(missing_ok=True)
@@ -905,9 +843,48 @@ def create_bot() -> commands.Bot:
         config.SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
         store.scan_folder()
         store.save()
-        await bot.add_cog(Soundboard(bot, store))
+        cog = Soundboard(bot, store)
+        await bot.add_cog(cog)
         # Command sync happens in on_ready, not here: bot.guilds is empty until
         # the gateway delivers guild data after READY, and we sync per-guild.
+
+        # Web admin panel — runs on this same event loop, sharing the
+        # same SoundStore and PCMCache instances (sounds.json has no
+        # cross-process locking, so a separate web process could corrupt
+        # it). No WEB_TOKEN -> maybe_create_web_app returns None and the
+        # panel simply does not exist.
+        web_app = maybe_create_web_app(
+            store,
+            cog.pcm_cache,
+            token=config.WEB_TOKEN,
+            sounds_dir=config.SOUNDS_DIR,
+            max_duration=config.MAX_DURATION,
+            target_lufs=config.TARGET_LUFS,
+        )
+        if web_app is None:
+            logger.info("WEB_TOKEN not set; web admin panel disabled")
+        else:
+            server = build_web_server(
+                web_app, host=config.WEB_HOST, port=config.WEB_PORT
+            )
+
+            def log_web_exit(task: asyncio.Task) -> None:
+                # Surface startup failures (port already bound, etc.) —
+                # otherwise the task exception is swallowed and the panel
+                # is silently missing.
+                if not task.cancelled() and task.exception() is not None:
+                    logger.error(
+                        "web admin panel stopped", exc_info=task.exception()
+                    )
+
+            # Keep a reference on the bot so the task isn't GC'd.
+            bot.web_server_task = asyncio.create_task(server.serve())
+            bot.web_server_task.add_done_callback(log_web_exit)
+            logger.info(
+                "web admin panel listening on %s:%d",
+                config.WEB_HOST,
+                config.WEB_PORT,
+            )
 
     bot.setup_hook = setup_hook
 

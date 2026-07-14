@@ -1,5 +1,6 @@
 import json
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -59,6 +60,12 @@ class SoundStore:
         self._metadata_path = metadata_path
         self._sounds_dir = sounds_dir
         self._sounds: dict[str, dict] = {}
+        # save() can be called from the bot's event-loop thread (60s
+        # save-loop, command handlers) and from the web panel's
+        # threadpool concurrently. Every save writes the same .tmp path,
+        # so unserialized writers collide on the os.replace (Windows
+        # raises PermissionError) or interleave partial JSON.
+        self._save_lock = threading.Lock()
         # Version of the file on disk at the moment load() was called. Set
         # exactly once here and NEVER mutated by subsequent writes — the
         # migration gate needs a frozen "what did we open?" snapshot so a
@@ -169,6 +176,31 @@ class SoundStore:
     def get(self, name: str) -> dict | None:
         return self._sounds.get(name.lower())
 
+    def find_by_path(self, path: Path) -> str | None:
+        """Return the name of any entry whose file is `path`, or None.
+
+        The no-clobber guard shared by /addsound, /importsounds, and the
+        web panel's upload route: refuse any write that would silently
+        overwrite a file another sound entry already owns.
+
+        Both sides are resolved to absolute paths before comparison so a
+        relative-vs-absolute mismatch (e.g. `SOUNDS_DIR=sounds` in config
+        vs `sounds/foo.mp3` already stored absolutely) doesn't defeat the
+        check. `.resolve(strict=False)` doesn't raise on missing files,
+        but we still guard against OSError on path encoding edge cases.
+        """
+        try:
+            target = Path(path).resolve(strict=False)
+        except OSError:
+            return None
+        for name, entry in self._sounds.items():
+            try:
+                if Path(entry["file"]).resolve(strict=False) == target:
+                    return name
+            except OSError:
+                continue
+        return None
+
     def list_sounds(
         self, category: str | None = None, tag: str | None = None
     ) -> list[tuple[str, dict]]:
@@ -227,10 +259,11 @@ class SoundStore:
         return dict(self._sounds)
 
     def save(self) -> None:
-        data = {"sounds": self._sounds, "version": CURRENT_SCHEMA_VERSION}
-        tmp = self._metadata_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        tmp.replace(self._metadata_path)
+        with self._save_lock:
+            data = {"sounds": self._sounds, "version": CURRENT_SCHEMA_VERSION}
+            tmp = self._metadata_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.replace(self._metadata_path)
         # Intentionally does NOT mutate self.startup_version — that field is a
         # frozen snapshot of the on-disk version at load time, used by the
         # migration gate. Writing a new file to disk doesn't change what the
