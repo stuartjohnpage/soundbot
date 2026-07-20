@@ -15,6 +15,9 @@ MAX_DURATION: float = 6.4
 # Uploads louder than this are attenuated down to it (never boosted up).
 TARGET_LUFS: float = float(os.getenv("TARGET_LUFS", "-16"))
 SYNC_COMMANDS: bool = os.getenv("SYNC_COMMANDS", "true").lower() == "true"
+# Seconds the bot may sit alone (no human members) in a voice channel
+# before disconnecting itself. 0 disables auto-leave.
+IDLE_TIMEOUT: float = float(os.getenv("IDLE_TIMEOUT", "600"))
 # Web admin panel (issue #1). Empty token = panel disabled entirely.
 WEB_TOKEN: str = os.getenv("WEB_TOKEN", "")
 WEB_HOST: str = os.getenv("WEB_HOST", "0.0.0.0")

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import time
 from pathlib import Path
 
 import discord
@@ -178,11 +179,17 @@ class Soundboard(commands.Cog):
         self.mixer: MixerSource | None = None
         self.volume: float = config.DEFAULT_VOLUME / 100.0
         self.pcm_cache = PCMCache()
+        # guild id -> monotonic time the bot was first seen alone in its
+        # voice channel. Entries live only while the bot stays alone;
+        # _disconnect_if_idle prunes them the moment company arrives.
+        self._alone_since: dict[int, float] = {}
 
     async def cog_load(self) -> None:
         self._save_loop.start()
+        self._idle_check_loop.start()
 
     async def cog_unload(self) -> None:
+        self._idle_check_loop.cancel()
         self._save_loop.cancel()
         self.store.save()
 
@@ -219,12 +226,59 @@ class Soundboard(commands.Cog):
                 "Not in a voice channel.", ephemeral=True
             )
             return
+        await self._teardown_voice(vc)
+        await interaction.response.send_message("Left the voice channel.")
+
+    async def _teardown_voice(self, vc: discord.VoiceProtocol) -> None:
+        """Stop the mixer and disconnect — the one true voice teardown.
+
+        Shared by /leave and the idle auto-leave so both paths get the
+        mixer-race handling that _start_playback's re-check depends on
+        (mixer set to None *before* the disconnect await).
+        """
         if self.mixer:
             self.mixer.stop()
             self.mixer.cleanup()
             self.mixer = None
         await vc.disconnect()
-        await interaction.response.send_message("Left the voice channel.")
+
+    @tasks.loop(seconds=30)
+    async def _idle_check_loop(self) -> None:
+        await self._disconnect_if_idle(time.monotonic())
+
+    async def _disconnect_if_idle(self, now: float) -> None:
+        """Auto-leave any voice channel the bot has sat alone in too long.
+
+        "Alone" means no non-bot members in the channel — other bots don't
+        count as company. `now` is monotonic time, passed in (rather than
+        read here) so tests can drive the clock explicitly.
+        """
+        if config.IDLE_TIMEOUT <= 0:
+            return
+        alone: set[int] = set()
+        for vc in list(self.bot.voice_clients):
+            channel = getattr(vc, "channel", None)
+            if not vc.is_connected() or channel is None:
+                continue
+            if any(not m.bot for m in channel.members):
+                continue
+            guild_id = vc.guild.id
+            first_alone = self._alone_since.setdefault(guild_id, now)
+            if now - first_alone >= config.IDLE_TIMEOUT:
+                logger.info(
+                    "auto-leaving voice channel %s: alone for %.0fs",
+                    channel.name,
+                    now - first_alone,
+                )
+                await self._teardown_voice(vc)
+                continue  # just disconnected -> drop its timer below
+            alone.add(guild_id)
+        # Keep timers only for guilds still alone-and-connected this pass.
+        # Everything else (someone came back, /leave ran, we auto-left)
+        # resets, so the next empty stretch starts a fresh countdown.
+        self._alone_since = {
+            gid: t for gid, t in self._alone_since.items() if gid in alone
+        }
 
     # -- Playback helpers --
 

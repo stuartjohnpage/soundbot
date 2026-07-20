@@ -11,6 +11,7 @@ A Discord soundboard bot with no limits. Play sound clips in voice channels usin
 - Bind emoji to sounds — a reaction anywhere plays the sound (while the bot is in voice)
 - Playback requires being in the bot's voice channel, like Discord's native soundboard — no remote-spamming voice from a text channel
 - Optional categories for organization
+- Auto-leaves the voice channel after 10 minutes alone (configurable)
 - Global volume control
 - Play count tracking and file logging
 
@@ -147,6 +148,7 @@ All settings are environment variables, configured in `.env`:
 | `TARGET_LUFS` | `-16` | Loudness target for uploads. Sounds louder than this are turned down on upload (never boosted). |
 | `LOG_FILE` | `./soundbot.log` | Log file path (rotating, 5MB, 3 backups) |
 | `SYNC_COMMANDS` | `true` | Sync slash commands per-guild on startup and on join. Set to `false` to skip syncing entirely. |
+| `IDLE_TIMEOUT` | `600` | Seconds the bot may sit alone in a voice channel (no humans, bots don't count) before it disconnects itself. `0` disables auto-leave. |
 | `WEB_TOKEN` | *(empty)* | Auth token for the web admin panel. Empty = panel disabled. |
 | `WEB_HOST` | `0.0.0.0` | Interface the web panel binds to inside the container. |
 | `WEB_PORT` | `8000` | Port for the web admin panel. |
