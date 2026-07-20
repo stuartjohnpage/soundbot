@@ -1207,6 +1207,148 @@ class TestSameVoiceChannelGate:
         assert kwargs.get("ephemeral") is True
 
 
+class TestAutoLeaveWhenAlone:
+    """The bot disconnects after sitting alone in voice for
+    config.IDLE_TIMEOUT seconds. _disconnect_if_idle is driven by
+    _idle_check_loop in production; tests call it directly with an
+    explicit clock so no sleeping is involved."""
+
+    TIMEOUT = 600.0
+
+    @staticmethod
+    def _human():
+        m = MagicMock()
+        m.bot = False
+        return m
+
+    @staticmethod
+    def _bot_member():
+        m = MagicMock()
+        m.bot = True
+        return m
+
+    def _make_idle_cog(self, tmp_path, monkeypatch, *, members=()):
+        from soundbot import config
+
+        monkeypatch.setattr(config, "IDLE_TIMEOUT", self.TIMEOUT)
+        cog = _make_cog(tmp_path)
+        cog.mixer = MixerSource()
+        vc = _connected_vc()
+        vc.disconnect = AsyncMock()
+        vc.guild.id = GUILD_ID
+        vc.channel.name = "General"
+        # The bot's own membership is what a real voice-state cache shows
+        # for an "empty" channel.
+        vc.channel.members = [self._bot_member(), *members]
+        cog.bot.voice_clients = [vc]
+        return cog, vc
+
+    def test_alone_past_timeout_disconnects_and_cleans_mixer(
+        self, tmp_path, monkeypatch
+    ):
+        cog, vc = self._make_idle_cog(tmp_path, monkeypatch)
+
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        vc.disconnect.assert_not_awaited()
+
+        asyncio.run(cog._disconnect_if_idle(1000.0 + self.TIMEOUT))
+
+        vc.disconnect.assert_awaited_once()
+        assert cog.mixer is None
+        assert cog._alone_since == {}
+
+    def test_alone_below_timeout_stays_connected(self, tmp_path, monkeypatch):
+        cog, vc = self._make_idle_cog(tmp_path, monkeypatch)
+
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        asyncio.run(cog._disconnect_if_idle(1000.0 + self.TIMEOUT - 1))
+
+        vc.disconnect.assert_not_awaited()
+        assert cog.mixer is not None
+        assert GUILD_ID in cog._alone_since
+
+    def test_human_present_never_starts_timer(self, tmp_path, monkeypatch):
+        cog, vc = self._make_idle_cog(
+            tmp_path, monkeypatch, members=[self._human()]
+        )
+
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        asyncio.run(cog._disconnect_if_idle(1000.0 + self.TIMEOUT * 10))
+
+        vc.disconnect.assert_not_awaited()
+        assert cog._alone_since == {}
+
+    def test_human_returning_resets_the_countdown(self, tmp_path, monkeypatch):
+        cog, vc = self._make_idle_cog(tmp_path, monkeypatch)
+
+        asyncio.run(cog._disconnect_if_idle(1000.0))  # alone: timer starts
+        visitor = self._human()
+        vc.channel.members.append(visitor)
+        asyncio.run(cog._disconnect_if_idle(1300.0))  # company: timer resets
+        vc.channel.members.remove(visitor)
+        asyncio.run(cog._disconnect_if_idle(1400.0))  # alone again: restart
+
+        # 600s after the *original* alone-start, but only 200s into the
+        # fresh countdown — must still be connected.
+        asyncio.run(cog._disconnect_if_idle(1000.0 + self.TIMEOUT))
+        vc.disconnect.assert_not_awaited()
+
+        asyncio.run(cog._disconnect_if_idle(1400.0 + self.TIMEOUT))
+        vc.disconnect.assert_awaited_once()
+
+    def test_other_bots_do_not_count_as_company(self, tmp_path, monkeypatch):
+        cog, vc = self._make_idle_cog(
+            tmp_path, monkeypatch, members=[self._bot_member()]
+        )
+
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        asyncio.run(cog._disconnect_if_idle(1000.0 + self.TIMEOUT))
+
+        vc.disconnect.assert_awaited_once()
+
+    def test_zero_timeout_disables_auto_leave(self, tmp_path, monkeypatch):
+        from soundbot import config
+
+        cog, vc = self._make_idle_cog(tmp_path, monkeypatch)
+        monkeypatch.setattr(config, "IDLE_TIMEOUT", 0)
+
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        asyncio.run(cog._disconnect_if_idle(1_000_000.0))
+
+        vc.disconnect.assert_not_awaited()
+        assert cog._alone_since == {}
+
+    def test_disconnected_vc_is_skipped_and_timer_pruned(
+        self, tmp_path, monkeypatch
+    ):
+        """A vc that dropped (network blip, /leave mid-pass) must not keep
+        a stale timer that would insta-kick the next connection."""
+        cog, vc = self._make_idle_cog(tmp_path, monkeypatch)
+
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        assert GUILD_ID in cog._alone_since
+
+        vc.is_connected.return_value = False
+        asyncio.run(cog._disconnect_if_idle(1100.0))
+
+        vc.disconnect.assert_not_awaited()
+        assert cog._alone_since == {}
+
+    def test_leave_command_uses_shared_teardown(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        cog.mixer = MixerSource()
+        vc = _connected_vc()
+        vc.disconnect = AsyncMock()
+        interaction = _make_interaction(voice_client=vc)
+
+        asyncio.run(Soundboard.leave.callback(cog, interaction))
+
+        vc.disconnect.assert_awaited_once()
+        assert cog.mixer is None
+        args, _ = interaction.response.send_message.call_args
+        assert "Left" in args[0]
+
+
 class TestStatsCommand:
     def test_no_plays_yet_message(self, tmp_path):
         cog = _make_cog(tmp_path)
