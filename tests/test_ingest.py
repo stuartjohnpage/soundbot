@@ -17,7 +17,12 @@ import pytest
 from soundbot.ingest import process_upload
 from soundbot.pcm_cache import PCMCache
 from soundbot.store import SoundStore
-from tests.helpers import make_mp4, make_wav, skip_no_ffmpeg
+from tests.helpers import (
+    make_mp3_with_cover_art,
+    make_mp4,
+    make_wav,
+    skip_no_ffmpeg,
+)
 
 _skip_no_ffmpeg = skip_no_ffmpeg
 
@@ -62,6 +67,32 @@ class TestProcessUploadHappyPath:
         assert entry["category"] == "memes"
         assert entry["uploaded_by"] == "web-admin"
         assert set(entry["tags"]) == {"loud", "meme"}
+
+
+class TestProcessUploadCoverArt:
+    @_skip_no_ffmpeg
+    def test_mp3_with_cover_art_is_accepted_in_place(self, tmp_path):
+        """Album art probes as a video stream; treating it as one sent the
+        upload down the extract branch, whose .mp3 destination is the
+        upload itself -> "already exists" and the file got deleted."""
+        store, sounds_dir = _make_store(tmp_path)
+        dest = make_mp3_with_cover_art(sounds_dir / "art.mp3")
+
+        final, _gain, _trimmed = process_upload(
+            dest,
+            store=store,
+            pcm_cache=PCMCache(),
+            name="art",
+            category=None,
+            tags=[],
+            uploaded_by="tester",
+            max_duration=6.4,
+            target_lufs=-16.0,
+        )
+
+        assert final == dest
+        assert dest.exists()
+        assert store.get("art")["file"] == str(dest)
 
 
 class TestProcessUploadVideoBranch:

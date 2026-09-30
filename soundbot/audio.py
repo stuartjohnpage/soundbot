@@ -58,13 +58,18 @@ def get_duration(file_path: Path) -> float:
 
 
 def has_video_stream(file_path: Path) -> bool:
-    """Return True if the file contains a video stream."""
+    """Return True if the file contains a video stream.
+
+    Embedded cover art (an ``attached_pic`` stream, as in most MP3 and
+    M4A music files) doesn't count: capital ``V`` selects only real
+    video, whereas ``v`` would report album art as video too.
+    """
     try:
         result = subprocess.run(
             [
                 "ffprobe",
                 "-v", "error",
-                "-select_streams", "v",
+                "-select_streams", "V",
                 "-show_entries", "stream=codec_type",
                 "-of", "json",
                 str(file_path),

@@ -141,6 +141,12 @@ class TestHasVideoStream:
     def test_video_file_has_video(self, short_mp4):
         assert has_video_stream(short_mp4) is True
 
+    def test_mp3_cover_art_is_not_video(self, tmp_path):
+        from tests.helpers import make_mp3_with_cover_art
+
+        song = make_mp3_with_cover_art(tmp_path / "art.mp3")
+        assert has_video_stream(song) is False
+
     def test_invalid_file_returns_false(self, tmp_path):
         bad = tmp_path / "garbage.bin"
         bad.write_bytes(b"not a media file")

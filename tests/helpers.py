@@ -50,3 +50,27 @@ def make_mp4(path: Path, duration: float = 1.0) -> Path:
         timeout=60,
     )
     return path
+
+
+def make_mp3_with_cover_art(path: Path, duration: float = 1.0) -> Path:
+    """Render an MP3 carrying embedded album art (an attached_pic stream).
+
+    ffprobe lists the art as a video stream, which is how most music
+    downloads look — the case the video-extract branch must not trip on.
+    """
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
+            "-f", "lavfi", "-i", "color=c=red:size=16x16",
+            "-frames:v", "1",
+            "-map", "0:a", "-map", "1:v",
+            "-c:a", "libmp3lame", "-c:v", "mjpeg",
+            "-disposition:v", "attached_pic",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    return path
