@@ -15,6 +15,7 @@ venv/
 # Sounds (user data, not tracked)
 sounds/
 sounds.json
+boards.json
 
 # Logs
 *.log

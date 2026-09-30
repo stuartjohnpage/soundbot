@@ -6,7 +6,7 @@ A Discord soundboard bot with no limits. Play sound clips in voice channels usin
 
 - `/play` with fuzzy autocomplete across your entire sound library
 - Unlimited simultaneous sound overlap (no queue, no cap)
-- Interactive `/board` with paginated buttons for quick access
+- Interactive `/board` with paginated buttons for quick access — boards are deleted automatically once the bot leaves voice
 - Upload sounds directly in Discord or bulk-load from a folder
 - Bind emoji to sounds — a reaction anywhere plays the sound (while the bot is in voice)
 - Playback requires being in the bot's voice channel, like Discord's native soundboard — no remote-spamming voice from a text channel
@@ -72,7 +72,7 @@ Create a role in your Discord server called **Soundbot Admin** (or whatever you 
 | `/leave` | Bot leaves the voice channel |
 | `/play <name>` | Play a sound (fuzzy autocomplete) |
 | `/random [category]` | Play a random sound |
-| `/board` | Show clickable button board of all sounds |
+| `/board` | Show clickable button board of all sounds (auto-deleted when the bot leaves voice) |
 | `/volume <0-100>` | Set playback volume (default: 50) |
 | `/addsound <name> <file> [category] [tags]` | Upload a new sound (sounds over 6.4s are trimmed to the first 6.4s; loudness-normalized and auto-tagged with the server's tag) |
 | `/removesound <name>` | Delete a sound |
@@ -144,6 +144,7 @@ All settings are environment variables, configured in `.env`:
 | `ADMIN_ROLE` | `Soundbot Admin` | Discord role name required for all commands |
 | `SOUNDS_DIR` | `./sounds` | Directory for audio files |
 | `METADATA_FILE` | `./sounds.json` | Path to the metadata JSON file |
+| `BOARDS_FILE` | `boards.json` beside `METADATA_FILE` | Registry of posted `/board` messages, so they can be deleted after the bot leaves voice (or after a restart) |
 | `DEFAULT_VOLUME` | `50` | Playback volume on startup (0-100) |
 | `TARGET_LUFS` | `-16` | Loudness target for uploads. Sounds louder than this are turned down on upload (never boosted). |
 | `LOG_FILE` | `./soundbot.log` | Log file path (rotating, 5MB, 3 backups) |

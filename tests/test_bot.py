@@ -1380,3 +1380,140 @@ class TestStatsCommand:
         assert "silent" not in embed.description
         assert "3 sounds" in embed.footer.text
         assert "4 total plays" in embed.footer.text
+
+
+class TestBoardCleanup:
+    """Boards posted by /board are deleted once the bot leaves voice
+    (whether by /leave, idle auto-leave, or someone disconnecting it) —
+    their buttons are useless with no bot in the channel. Every leave
+    route surfaces as the bot's own voice-state update, so that listener
+    is the single trigger."""
+
+    BOT_ID = 999
+
+    def _make_board_cog(self, tmp_path):
+        from soundbot.boards import BoardTracker
+
+        cog = _make_cog(tmp_path)
+        cog.boards = BoardTracker(tmp_path / "boards.json")
+        cog.bot.user.id = self.BOT_ID
+        deleted = []
+        errors = {}
+
+        def partial_messageable(channel_id):
+            channel = MagicMock()
+
+            def partial_message(message_id):
+                message = MagicMock()
+
+                async def delete():
+                    exc = errors.get(message_id)
+                    if exc is not None:
+                        raise exc
+                    deleted.append((channel_id, message_id))
+
+                message.delete = delete
+                return message
+
+            channel.get_partial_message = partial_message
+            return channel
+
+        cog.bot.get_partial_messageable = partial_messageable
+        return cog, deleted, errors
+
+    def _voice_update(self, cog, *, member_id, before, after, guild_id=GUILD_ID):
+        member = MagicMock()
+        member.id = member_id
+        member.guild.id = guild_id
+        before_state = MagicMock()
+        before_state.channel = before
+        after_state = MagicMock()
+        after_state.channel = after
+        asyncio.run(cog.on_voice_state_update(member, before_state, after_state))
+
+    @staticmethod
+    def _http_error(cls, status):
+        response = MagicMock()
+        response.status = status
+        response.reason = "nope"
+        return cls(response, "nope")
+
+    def test_board_command_records_every_posted_message(self, tmp_path):
+        cog, _, _ = self._make_board_cog(tmp_path)
+        for i in range(30):  # 30 sounds -> two board messages
+            _add_sound(cog, f"s{i}", f"s{i}.ogg")
+        interaction = _make_interaction()
+        interaction.guild_id = GUILD_ID
+        interaction.channel_id = 42
+        interaction.followup.send = AsyncMock(
+            side_effect=[MagicMock(id=1001), MagicMock(id=1002)]
+        )
+
+        asyncio.run(Soundboard.board.callback(cog, interaction))
+
+        assert cog.boards.pop_guild(GUILD_ID) == [(42, 1001), (42, 1002)]
+
+    def test_bot_leaving_voice_deletes_that_guilds_boards(self, tmp_path):
+        cog, deleted, _ = self._make_board_cog(tmp_path)
+        cog.boards.add(GUILD_ID, channel_id=42, message_id=1001)
+        cog.boards.add(GUILD_ID, channel_id=43, message_id=1002)
+        cog.boards.add(777, channel_id=70, message_id=7001)  # other guild
+
+        self._voice_update(
+            cog, member_id=self.BOT_ID, before=MagicMock(), after=None
+        )
+
+        assert deleted == [(42, 1001), (43, 1002)]
+        assert cog.boards.pop_guild(GUILD_ID) == []
+        # The other guild's bot is still in voice; its board stays.
+        assert cog.boards.pop_guild(777) == [(70, 7001)]
+
+    def test_bot_moved_between_channels_keeps_boards(self, tmp_path):
+        cog, deleted, _ = self._make_board_cog(tmp_path)
+        cog.boards.add(GUILD_ID, channel_id=42, message_id=1001)
+
+        self._voice_update(
+            cog, member_id=self.BOT_ID, before=MagicMock(), after=MagicMock()
+        )
+
+        assert deleted == []
+
+    def test_other_members_leaving_is_ignored(self, tmp_path):
+        cog, deleted, _ = self._make_board_cog(tmp_path)
+        cog.boards.add(GUILD_ID, channel_id=42, message_id=1001)
+
+        self._voice_update(cog, member_id=1, before=MagicMock(), after=None)
+
+        assert deleted == []
+        assert cog.boards.pop_guild(GUILD_ID) == [(42, 1001)]
+
+    def test_delete_failures_do_not_stop_the_rest(self, tmp_path):
+        """A board someone already deleted (404) or one in a channel the
+        bot lost access to (403) must not strand the remaining boards."""
+        cog, deleted, errors = self._make_board_cog(tmp_path)
+        cog.boards.add(GUILD_ID, channel_id=42, message_id=1)
+        cog.boards.add(GUILD_ID, channel_id=42, message_id=2)
+        cog.boards.add(GUILD_ID, channel_id=42, message_id=3)
+        errors[1] = self._http_error(discord.NotFound, 404)
+        errors[2] = self._http_error(discord.Forbidden, 403)
+
+        self._voice_update(
+            cog, member_id=self.BOT_ID, before=MagicMock(), after=None
+        )
+
+        assert deleted == [(42, 3)]
+        assert cog.boards.pop_guild(GUILD_ID) == []
+
+    def test_startup_purges_boards_orphaned_by_restart(self, tmp_path):
+        from soundbot.boards import BoardTracker
+
+        # Written by the previous process; its buttons died with it.
+        BoardTracker(tmp_path / "boards.json").add(
+            GUILD_ID, channel_id=42, message_id=1001
+        )
+        cog, deleted, _ = self._make_board_cog(tmp_path)
+
+        asyncio.run(cog._purge_orphaned_boards())
+
+        assert deleted == [(42, 1001)]
+        assert cog.boards.pop_all() == []
