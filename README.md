@@ -166,9 +166,9 @@ All settings are environment variables, configured in `.env`:
 The bot stores two things:
 
 - **Audio files** in `sounds/` — the actual clips
-- **Metadata** in `sounds.json` — names, categories, play counts, upload info
+- **Metadata** in `data/sounds.json` — names, categories, tags, emoji bindings, play counts, upload info
 
-Both are mounted as Docker volumes so they persist across container rebuilds. Back up these two things and you've backed up everything.
+Both `sounds/` and `data/` are mounted as Docker volumes so they persist across container rebuilds (`docker-compose.yml` points `METADATA_FILE` into `data/` for you). Back up these two folders and you've backed up everything.
 
 Play counts are saved to disk every 60 seconds and on graceful shutdown.
 
@@ -177,6 +177,13 @@ Play counts are saved to disk every 60 seconds and on graceful shutdown.
 ```bash
 git pull
 docker compose up -d --build
+```
+
+**Upgrading from a version before metadata moved to `data/`:** older setups kept `sounds.json` inside the container, so a rebuild would wipe tags, play counts and emoji bindings. Copy it out *before* you rebuild:
+
+```bash
+mkdir -p data
+docker compose cp soundbot:/app/sounds.json ./data/sounds.json
 ```
 
 ## Creating a Discord Bot

@@ -3,6 +3,12 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Keep state on the mounted volumes below. These override .env on
+      # purpose: the .env defaults (./sounds.json, ./soundbot.log) land in
+      # the container's own filesystem, which every rebuild throws away.
+      METADATA_FILE: /app/data/sounds.json
+      LOG_FILE: /app/logs/soundbot.log
     ports:
       # Web admin panel (only listens when WEB_TOKEN is set in .env).
       - "${WEB_PORT:-8000}:${WEB_PORT:-8000}"

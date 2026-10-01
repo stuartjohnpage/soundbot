@@ -24,6 +24,8 @@ from soundbot.mixer import MixerSource
 from soundbot.pcm_cache import CachedPCMSource, PCMCache
 from soundbot.store import SoundStore
 
+GUILD_ID = 555
+
 
 def _make_cog(tmp_path: Path) -> Soundboard:
     sounds_dir = tmp_path / "sounds"
@@ -42,6 +44,8 @@ def _make_interaction(*, voice_client=None, response_done: bool = False):
     # Plain attribute assignment: MagicMock(name=...) would set the mock's
     # own name, not the guild.name attribute the auto-tag code reads.
     interaction.guild.name = "Test Guild"
+    interaction.guild.id = GUILD_ID
+    interaction.guild_id = GUILD_ID
     interaction.guild.voice_client = voice_client
     interaction.response = MagicMock()
     interaction.response.is_done.return_value = response_done
@@ -63,6 +67,7 @@ def _make_interaction(*, voice_client=None, response_done: bool = False):
 def _connected_vc():
     vc = MagicMock()
     vc.is_connected.return_value = True
+    vc.guild.id = GUILD_ID
     return vc
 
 
@@ -79,13 +84,13 @@ class TestPlaySoundHappyPath:
         cog = _make_cog(tmp_path)
         _add_sound(cog, "alpha")
         cog.pcm_cache = PCMCache(decoder=lambda p: b"\x00" * 7680)
-        cog.mixer = MixerSource()
+        cog.mixers[GUILD_ID] = MixerSource()
 
         interaction = _make_interaction(voice_client=_connected_vc())
         asyncio.run(cog._play_sound(interaction, "alpha"))
 
-        assert len(cog.mixer._sources) == 1
-        assert isinstance(cog.mixer._sources[0], CachedPCMSource)
+        assert len(cog.mixers[GUILD_ID]._sources) == 1
+        assert isinstance(cog.mixers[GUILD_ID]._sources[0], CachedPCMSource)
         assert cog.store.get("alpha")["play_count"] == 1
         interaction.response.send_message.assert_called_once()
 
@@ -99,7 +104,7 @@ class TestPlaySoundDecodeFailure:
             raise ValueError("unsupported codec: foo")
 
         cog.pcm_cache = PCMCache(decoder=boom)
-        cog.mixer = MixerSource()
+        cog.mixers[GUILD_ID] = MixerSource()
 
         interaction = _make_interaction(voice_client=_connected_vc())
         asyncio.run(cog._play_sound(interaction, "broken"))
@@ -110,7 +115,7 @@ class TestPlaySoundDecodeFailure:
         assert "broken" in args[0]
         assert kwargs.get("ephemeral") is True
         # Mixer untouched
-        assert cog.mixer._sources == []
+        assert cog.mixers[GUILD_ID]._sources == []
         # Play count NOT incremented — the user heard nothing
         assert cog.store.get("broken")["play_count"] == 0
 
@@ -124,17 +129,17 @@ class TestPlaySoundTeardownRace:
         _add_sound(cog, "alpha")
 
         def decoder_that_tears_down(p):
-            cog.mixer = None
+            cog.mixers.pop(GUILD_ID, None)
             return b"\x00" * 3840
 
         cog.pcm_cache = PCMCache(decoder=decoder_that_tears_down)
-        cog.mixer = MixerSource()
+        cog.mixers[GUILD_ID] = MixerSource()
 
         interaction = _make_interaction(voice_client=_connected_vc())
         asyncio.run(cog._play_sound(interaction, "alpha"))
 
         # No lazy mixer recreated
-        assert cog.mixer is None
+        assert GUILD_ID not in cog.mixers
         # Play count NOT bumped — the press produced no sound
         assert cog.store.get("alpha")["play_count"] == 0
 
@@ -149,13 +154,13 @@ class TestPlaySoundTeardownRace:
             return b"\x00" * 3840
 
         cog.pcm_cache = PCMCache(decoder=decoder_that_drops_vc)
-        cog.mixer = MixerSource()
+        cog.mixers[GUILD_ID] = MixerSource()
 
         interaction = _make_interaction(voice_client=vc)
         asyncio.run(cog._play_sound(interaction, "alpha"))
 
         # Mixer is intact but no source was added
-        assert len(cog.mixer._sources) == 0
+        assert len(cog.mixers[GUILD_ID]._sources) == 0
         assert cog.store.get("alpha")["play_count"] == 0
 
 
@@ -187,22 +192,87 @@ class TestPlaySoundUnknownSound:
         assert "not found" in args[0].lower()
 
 
+
+class TestMixerPerGuild:
+    """Each guild's voice client gets its own mixer. A single cog-wide
+    mixer routed guild A's sounds into guild B's channel once the bot
+    joined a second server, and A's /leave then silenced B."""
+
+    OTHER_GUILD = 777
+
+    def _other_guild_vc(self):
+        vc = _connected_vc()
+        vc.guild.id = self.OTHER_GUILD
+        vc.disconnect = AsyncMock()
+        return vc
+
+    def test_play_goes_to_the_invoking_guilds_mixer(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "alpha")
+        cog.pcm_cache = PCMCache(decoder=lambda p: b"\x00" * 3840)
+        cog.mixers[GUILD_ID] = MixerSource()
+        cog.mixers[self.OTHER_GUILD] = MixerSource()
+
+        interaction = _make_interaction(voice_client=_connected_vc())
+        asyncio.run(cog._play_sound(interaction, "alpha"))
+
+        assert len(cog.mixers[GUILD_ID]._sources) == 1
+        assert cog.mixers[self.OTHER_GUILD]._sources == []
+
+    def test_leaving_one_guild_keeps_the_others_mixer(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        cog.mixers[GUILD_ID] = MixerSource()
+        other = MixerSource()
+        cog.mixers[self.OTHER_GUILD] = other
+
+        asyncio.run(cog._teardown_voice(self._other_guild_vc()))
+
+        assert GUILD_ID in cog.mixers
+        assert self.OTHER_GUILD not in cog.mixers
+        assert other._sources == []  # stopped/cleaned, not reused
+
+    def test_join_creates_a_mixer_for_that_guild_only(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        existing = MixerSource()
+        cog.mixers[self.OTHER_GUILD] = existing
+        interaction = _make_interaction()
+        new_vc = MagicMock()
+        interaction.user.voice.channel.connect = AsyncMock(return_value=new_vc)
+
+        asyncio.run(Soundboard.join.callback(cog, interaction))
+
+        assert cog.mixers[self.OTHER_GUILD] is existing
+        new_vc.play.assert_called_once_with(cog.mixers[GUILD_ID])
+
+    def test_volume_applies_to_every_guilds_mixer(self, tmp_path):
+        """Volume stays global (one knob, per the spec) — it just has to
+        reach every live mixer now that there can be several."""
+        cog = _make_cog(tmp_path)
+        cog.mixers[GUILD_ID] = MixerSource(volume=1.0)
+        cog.mixers[self.OTHER_GUILD] = MixerSource(volume=1.0)
+
+        asyncio.run(Soundboard.volume.callback(cog, _make_interaction(), 30))
+
+        assert cog.mixers[GUILD_ID].volume == 0.3
+        assert cog.mixers[self.OTHER_GUILD].volume == 0.3
+
+
 class TestVolumeCommand:
     def test_volume_command_syncs_to_mixer(self, tmp_path):
         cog = _make_cog(tmp_path)
-        cog.mixer = MixerSource(volume=1.0)
+        cog.mixers[GUILD_ID] = MixerSource(volume=1.0)
         interaction = _make_interaction()
 
         asyncio.run(Soundboard.volume.callback(cog, interaction, 50))
 
         assert cog.volume == 0.5
-        assert cog.mixer.volume == 0.5
+        assert cog.mixers[GUILD_ID].volume == 0.5
         interaction.response.send_message.assert_called_once()
 
     def test_volume_command_safe_when_no_mixer(self, tmp_path):
         cog = _make_cog(tmp_path)
-        # mixer is None until /join is called
-        assert cog.mixer is None
+        # no mixer until /join is called
+        assert GUILD_ID not in cog.mixers
         interaction = _make_interaction()
 
         asyncio.run(Soundboard.volume.callback(cog, interaction, 75))
@@ -215,14 +285,14 @@ class TestVolumeCommand:
 
     def test_volume_command_rejects_out_of_range(self, tmp_path):
         cog = _make_cog(tmp_path)
-        cog.mixer = MixerSource(volume=0.5)
+        cog.mixers[GUILD_ID] = MixerSource(volume=0.5)
         interaction = _make_interaction()
 
         asyncio.run(Soundboard.volume.callback(cog, interaction, 150))
 
         # State unchanged
         assert cog.volume == 0.5
-        assert cog.mixer.volume == 0.5
+        assert cog.mixers[GUILD_ID].volume == 0.5
 
 
 class TestRemoveSoundCacheInvalidation:
@@ -860,7 +930,6 @@ class TestParseEmojiKey:
             parse_emoji_key("🎺" * 17)
 
 
-GUILD_ID = 555
 BOT_USER_ID = 999
 
 
@@ -873,7 +942,7 @@ def _make_reaction_cog(tmp_path, *, in_voice=True, reactor_in_vc=True):
     cog = _make_cog(tmp_path)
     _add_sound(cog, "airhorn")
     cog.pcm_cache = PCMCache(decoder=lambda p: b"\x00" * 7680)
-    cog.mixer = MixerSource()
+    cog.mixers[GUILD_ID] = MixerSource()
     cog.bot.user.id = BOT_USER_ID
     guild = MagicMock()
     if in_voice:
@@ -901,7 +970,7 @@ class TestReactionPlayback:
 
         asyncio.run(cog.on_raw_reaction_add(_make_payload()))
 
-        assert len(cog.mixer._sources) == 1
+        assert len(cog.mixers[GUILD_ID]._sources) == 1
         assert cog.store.get("airhorn")["play_count"] == 1
 
     def test_unbound_emoji_is_ignored(self, tmp_path):
@@ -909,7 +978,7 @@ class TestReactionPlayback:
 
         asyncio.run(cog.on_raw_reaction_add(_make_payload(emoji="💀")))
 
-        assert cog.mixer._sources == []
+        assert cog.mixers[GUILD_ID]._sources == []
         assert cog.store.get("airhorn")["play_count"] == 0
 
     def test_binding_in_other_guild_is_ignored(self, tmp_path):
@@ -918,7 +987,7 @@ class TestReactionPlayback:
 
         asyncio.run(cog.on_raw_reaction_add(_make_payload(guild_id=777)))
 
-        assert cog.mixer._sources == []
+        assert cog.mixers[GUILD_ID]._sources == []
 
     def test_dm_reaction_is_ignored(self, tmp_path):
         cog = _make_reaction_cog(tmp_path)
@@ -926,7 +995,7 @@ class TestReactionPlayback:
 
         asyncio.run(cog.on_raw_reaction_add(_make_payload(guild_id=None)))
 
-        assert cog.mixer._sources == []
+        assert cog.mixers[GUILD_ID]._sources == []
 
     def test_bots_own_reaction_is_ignored(self, tmp_path):
         cog = _make_reaction_cog(tmp_path)
@@ -934,7 +1003,7 @@ class TestReactionPlayback:
 
         asyncio.run(cog.on_raw_reaction_add(_make_payload(user_id=BOT_USER_ID)))
 
-        assert cog.mixer._sources == []
+        assert cog.mixers[GUILD_ID]._sources == []
 
     def test_bot_not_in_voice_silently_ignored(self, tmp_path):
         cog = _make_reaction_cog(tmp_path, in_voice=False)
@@ -942,13 +1011,13 @@ class TestReactionPlayback:
 
         asyncio.run(cog.on_raw_reaction_add(_make_payload()))
 
-        assert cog.mixer._sources == []
+        assert cog.mixers[GUILD_ID]._sources == []
         assert cog.store.get("airhorn")["play_count"] == 0
 
     def test_no_mixer_silently_ignored(self, tmp_path):
         cog = _make_reaction_cog(tmp_path)
         cog.store.bind_emoji(GUILD_ID, "🎺", "airhorn")
-        cog.mixer = None
+        cog.mixers.pop(GUILD_ID, None)
 
         asyncio.run(cog.on_raw_reaction_add(_make_payload()))
 
@@ -964,7 +1033,7 @@ class TestReactionPlayback:
 
         asyncio.run(cog.on_raw_reaction_add(_make_payload()))
 
-        assert cog.mixer._sources == []
+        assert cog.mixers[GUILD_ID]._sources == []
 
     def test_vs16_in_payload_still_matches_binding(self, tmp_path):
         """Binding stored without VS16 (parse_emoji_key strips it) must match
@@ -976,7 +1045,7 @@ class TestReactionPlayback:
             cog.on_raw_reaction_add(_make_payload(emoji="❤️"))
         )
 
-        assert len(cog.mixer._sources) == 1
+        assert len(cog.mixers[GUILD_ID]._sources) == 1
 
     def test_bot_user_none_fails_closed(self, tmp_path):
         cog = _make_reaction_cog(tmp_path)
@@ -985,7 +1054,7 @@ class TestReactionPlayback:
 
         asyncio.run(cog.on_raw_reaction_add(_make_payload()))
 
-        assert cog.mixer._sources == []
+        assert cog.mixers[GUILD_ID]._sources == []
 
     def test_custom_emoji_binding_matches_payload(self, tmp_path):
         cog = _make_reaction_cog(tmp_path)
@@ -996,7 +1065,7 @@ class TestReactionPlayback:
 
         asyncio.run(cog.on_raw_reaction_add(payload))
 
-        assert len(cog.mixer._sources) == 1
+        assert len(cog.mixers[GUILD_ID]._sources) == 1
 
     def test_reactor_outside_bot_vc_silently_ignored(self, tmp_path):
         """Issue #17: the reacting user must be in the bot's voice channel."""
@@ -1005,7 +1074,7 @@ class TestReactionPlayback:
 
         asyncio.run(cog.on_raw_reaction_add(_make_payload()))
 
-        assert cog.mixer._sources == []
+        assert cog.mixers[GUILD_ID]._sources == []
         assert cog.store.get("airhorn")["play_count"] == 0
 
 
@@ -1155,7 +1224,7 @@ class TestSameVoiceChannelGate:
         cog = _make_cog(tmp_path)
         _add_sound(cog, "alpha")
         cog.pcm_cache = PCMCache(decoder=lambda p: b"\x00" * 7680)
-        cog.mixer = MixerSource()
+        cog.mixers[GUILD_ID] = MixerSource()
         return cog
 
     def test_user_not_in_voice_blocked(self, tmp_path):
@@ -1168,7 +1237,7 @@ class TestSameVoiceChannelGate:
         args, kwargs = interaction.response.send_message.call_args
         assert "need to be in a voice channel" in args[0]
         assert kwargs.get("ephemeral") is True
-        assert cog.mixer._sources == []
+        assert cog.mixers[GUILD_ID]._sources == []
         assert cog.store.get("alpha")["play_count"] == 0
 
     def test_user_in_different_channel_blocked_with_both_names(self, tmp_path):
@@ -1185,7 +1254,7 @@ class TestSameVoiceChannelGate:
         assert "#General" in args[0]
         assert "#AFK" in args[0]
         assert kwargs.get("ephemeral") is True
-        assert cog.mixer._sources == []
+        assert cog.mixers[GUILD_ID]._sources == []
 
     def test_user_in_same_channel_allowed(self, tmp_path):
         cog = self._gated_cog(tmp_path)
@@ -1193,7 +1262,7 @@ class TestSameVoiceChannelGate:
 
         asyncio.run(cog._play_sound(interaction, "alpha"))
 
-        assert len(cog.mixer._sources) == 1
+        assert len(cog.mixers[GUILD_ID]._sources) == 1
         assert cog.store.get("alpha")["play_count"] == 1
 
     def test_bot_not_in_voice_message_unchanged(self, tmp_path):
@@ -1232,7 +1301,7 @@ class TestAutoLeaveWhenAlone:
 
         monkeypatch.setattr(config, "IDLE_TIMEOUT", self.TIMEOUT)
         cog = _make_cog(tmp_path)
-        cog.mixer = MixerSource()
+        cog.mixers[GUILD_ID] = MixerSource()
         vc = _connected_vc()
         vc.disconnect = AsyncMock()
         vc.guild.id = GUILD_ID
@@ -1254,7 +1323,7 @@ class TestAutoLeaveWhenAlone:
         asyncio.run(cog._disconnect_if_idle(1000.0 + self.TIMEOUT))
 
         vc.disconnect.assert_awaited_once()
-        assert cog.mixer is None
+        assert GUILD_ID not in cog.mixers
         assert cog._alone_since == {}
 
     def test_alone_below_timeout_stays_connected(self, tmp_path, monkeypatch):
@@ -1264,7 +1333,7 @@ class TestAutoLeaveWhenAlone:
         asyncio.run(cog._disconnect_if_idle(1000.0 + self.TIMEOUT - 1))
 
         vc.disconnect.assert_not_awaited()
-        assert cog.mixer is not None
+        assert GUILD_ID in cog.mixers
         assert GUILD_ID in cog._alone_since
 
     def test_human_present_never_starts_timer(self, tmp_path, monkeypatch):
@@ -1336,7 +1405,7 @@ class TestAutoLeaveWhenAlone:
 
     def test_leave_command_uses_shared_teardown(self, tmp_path):
         cog = _make_cog(tmp_path)
-        cog.mixer = MixerSource()
+        cog.mixers[GUILD_ID] = MixerSource()
         vc = _connected_vc()
         vc.disconnect = AsyncMock()
         interaction = _make_interaction(voice_client=vc)
@@ -1344,7 +1413,7 @@ class TestAutoLeaveWhenAlone:
         asyncio.run(Soundboard.leave.callback(cog, interaction))
 
         vc.disconnect.assert_awaited_once()
-        assert cog.mixer is None
+        assert GUILD_ID not in cog.mixers
         args, _ = interaction.response.send_message.call_args
         assert "Left" in args[0]
 

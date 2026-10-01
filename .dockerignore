@@ -1,0 +1,19 @@
+# Secrets: never bake the bot/web tokens into an image layer.
+.env
+
+# Runtime state lives on mounted volumes, not in the image.
+sounds/
+data/
+logs/
+sounds.json
+boards.json
+*.log
+
+# Dev-only
+.git/
+.claude/
+tests/
+__pycache__/
+*.py[cod]
+.venv/
+venv/

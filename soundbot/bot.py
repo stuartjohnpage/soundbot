@@ -194,7 +194,10 @@ class Soundboard(commands.Cog):
         self.store = store
         self.boards = boards if boards is not None else BoardTracker(None)
         self._orphans_purged = False
-        self.mixer: MixerSource | None = None
+        # guild id -> that guild's live mixer. One per voice client: the
+        # bot can sit in voice in several servers at once, and a shared
+        # mixer would play every server's sounds into the last-joined one.
+        self.mixers: dict[int, MixerSource] = {}
         self.volume: float = config.DEFAULT_VOLUME / 100.0
         self.pcm_cache = PCMCache()
         # guild id -> monotonic time the bot was first seen alone in its
@@ -231,8 +234,9 @@ class Soundboard(commands.Cog):
             await interaction.guild.voice_client.move_to(channel)
         else:
             vc = await channel.connect()
-            self.mixer = MixerSource(volume=self.volume)
-            vc.play(self.mixer)
+            mixer = MixerSource(volume=self.volume)
+            self.mixers[interaction.guild.id] = mixer
+            vc.play(mixer)
         await interaction.response.send_message(f"Joined **{channel.name}**.")
 
     @app_commands.command(name="leave", description="Bot leaves the voice channel")
@@ -252,12 +256,12 @@ class Soundboard(commands.Cog):
 
         Shared by /leave and the idle auto-leave so both paths get the
         mixer-race handling that _start_playback's re-check depends on
-        (mixer set to None *before* the disconnect await).
+        (mixer dropped *before* the disconnect await).
         """
-        if self.mixer:
-            self.mixer.stop()
-            self.mixer.cleanup()
-            self.mixer = None
+        mixer = self.mixers.pop(vc.guild.id, None)
+        if mixer is not None:
+            mixer.stop()
+            mixer.cleanup()
         await vc.disconnect()
 
     @tasks.loop(seconds=30)
@@ -409,13 +413,14 @@ class Soundboard(commands.Cog):
 
         # The to_thread await above is a yield point: a concurrent /leave can
         # tear down the mixer and disconnect the voice client before we get
-        # back here. Re-check before touching self.mixer — otherwise we'd
-        # silently drop the sound and leak an orphan mixer.
-        if self.mixer is None or not vc.is_connected():
+        # back here. Look the mixer up only now — otherwise we'd silently
+        # drop the sound and leak an orphan mixer.
+        mixer = self.mixers.get(vc.guild.id)
+        if mixer is None or not vc.is_connected():
             logger.info("voice torn down during decode, dropping sound=%s", name)
             return "Voice connection lost while loading sound."
 
-        self.mixer.add(CachedPCMSource(pcm_bytes))
+        mixer.add(CachedPCMSource(pcm_bytes))
         self.store.increment_play_count(name)
         return None
 
@@ -477,7 +482,7 @@ class Soundboard(commands.Cog):
             return
         guild = self.bot.get_guild(payload.guild_id)
         vc = guild.voice_client if guild is not None else None
-        if vc is None or not vc.is_connected() or self.mixer is None:
+        if vc is None or not vc.is_connected() or payload.guild_id not in self.mixers:
             return  # bot not in voice -> ignore silently
         # Same-VC gate (issue #17), silent like every other reaction-path
         # miss. channel.members is voice-state-cache backed, so it lists
@@ -594,10 +599,10 @@ class Soundboard(commands.Cog):
             )
             return
         self.volume = level / 100.0
-        # Mixer holds its own copy so read() can apply volume without
-        # reaching back into the cog on every frame.
-        if self.mixer is not None:
-            self.mixer.volume = self.volume
+        # Volume is one global knob. Each mixer holds its own copy so
+        # read() can apply it without reaching back into the cog per frame.
+        for mixer in self.mixers.values():
+            mixer.volume = self.volume
         await interaction.response.send_message(f"Volume set to **{level}%**.")
 
     # -- Board --
