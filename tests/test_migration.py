@@ -235,3 +235,54 @@ def test_migration_runs_even_after_setup_hook_save(tmp_path):
     assert data["version"] == 2
     assert data["sounds"]["airhorn"]["tags"] == ["my-cool-server"]
     assert data["sounds"]["rimshot"]["tags"] == ["other-place"]
+
+
+def test_migration_does_not_rerun_on_reconnect(tmp_path):
+    """Regression: on_ready fires again on every non-resumed gateway
+    reconnect, and the gate reads the frozen startup_version (still v1
+    for the life of the process). Without a "done" marker, each
+    reconnect re-ran the migration: refetching every soundboard and
+    re-adding guild tags that users had since removed on purpose."""
+    _seed_v1(tmp_path, {"airhorn": _entry()})
+    store = _make_store(tmp_path)
+    guild = _FakeGuild("My Cool Server", ["airhorn"])
+
+    asyncio.run(run_migration_if_needed(store, [guild]))
+    assert store.get("airhorn")["tags"] == ["my-cool-server"]
+
+    # A user deliberately untags the sound after migration...
+    store.remove_tag("airhorn", "my-cool-server")
+    store.save()
+
+    # ...then the gateway reconnects and on_ready fires again.
+    asyncio.run(run_migration_if_needed(store, [guild]))
+
+    assert store.get("airhorn")["tags"] == []
+    assert guild.fetch_calls == 1
+
+
+def test_skipped_migration_still_retries_on_next_ready(tmp_path):
+    """The "done" marker must only be set by a migration that actually
+    ran: an on_ready with no guilds yet has to leave the door open."""
+    _seed_v1(tmp_path, {"airhorn": _entry()})
+    store = _make_store(tmp_path)
+
+    asyncio.run(run_migration_if_needed(store, []))
+    guild = _FakeGuild("My Cool Server", ["airhorn"])
+    asyncio.run(run_migration_if_needed(store, [guild]))
+
+    assert store.get("airhorn")["tags"] == ["my-cool-server"]
+
+
+def test_failed_migration_still_retries_on_next_ready(tmp_path):
+    _seed_v1(tmp_path, {"airhorn": _entry()})
+    store = _make_store(tmp_path)
+    broken = _FakeGuild("My Cool Server", ["airhorn"])
+    broken.fetch_soundboard_sounds = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(run_migration_if_needed(store, [broken]))
+    guild = _FakeGuild("My Cool Server", ["airhorn"])
+    asyncio.run(run_migration_if_needed(store, [guild]))
+
+    assert store.get("airhorn")["tags"] == ["my-cool-server"]

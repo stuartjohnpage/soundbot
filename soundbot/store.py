@@ -98,6 +98,12 @@ class SoundStore:
         # setup_hook save() between load and on_ready can't close the gate
         # before run_migration_if_needed has had a chance to look.
         self.startup_version: int = CURRENT_SCHEMA_VERSION
+        # Set by run_migration_if_needed once it has migrated this
+        # process's data. startup_version can't double as the "done" signal
+        # (it must stay frozen), and on_ready repeats on every gateway
+        # reconnect — without this, each one re-ran the migration and
+        # re-added tags users had since removed.
+        self.tag_migration_done: bool = False
         self.load()
 
     @staticmethod
