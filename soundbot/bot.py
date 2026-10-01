@@ -9,6 +9,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from . import config
+from .boards import BoardRef, BoardTracker
 from .ingest import process_upload
 from .migration import run_migration_if_needed
 from .mixer import MixerSource
@@ -173,9 +174,16 @@ class Soundboard(commands.Cog):
         description="Manage sound tags",
     )
 
-    def __init__(self, bot: commands.Bot, store: SoundStore) -> None:
+    def __init__(
+        self,
+        bot: commands.Bot,
+        store: SoundStore,
+        boards: BoardTracker | None = None,
+    ) -> None:
         self.bot = bot
         self.store = store
+        self.boards = boards if boards is not None else BoardTracker(None)
+        self._orphans_purged = False
         self.mixer: MixerSource | None = None
         self.volume: float = config.DEFAULT_VOLUME / 100.0
         self.pcm_cache = PCMCache()
@@ -279,6 +287,69 @@ class Soundboard(commands.Cog):
         self._alone_since = {
             gid: t for gid, t in self._alone_since.items() if gid in alone
         }
+
+    # -- Board cleanup --
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Delete a guild's boards once the bot leaves voice there.
+
+        Every way out — /leave, idle auto-leave, someone disconnecting the
+        bot — arrives as the bot's own voice-state update, so this is the
+        single cleanup trigger. A move between channels (after.channel
+        set) keeps the boards: the bot is still in voice to serve them.
+        """
+        if self.bot.user is None or member.id != self.bot.user.id:
+            return
+        if before.channel is None or after.channel is not None:
+            return
+        boards = self.boards.pop_guild(member.guild.id)
+        if boards:
+            logger.info(
+                "left voice in guild_id=%s; deleting %d board(s)",
+                member.guild.id, len(boards),
+            )
+            await self._delete_boards(boards)
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        # on_ready repeats on every gateway reconnect; purge once per process.
+        if not self._orphans_purged:
+            self._orphans_purged = True
+            await self._purge_orphaned_boards()
+
+    async def _purge_orphaned_boards(self) -> None:
+        """Delete boards left behind by a previous process.
+
+        At startup the bot isn't in voice and BoardView isn't persistent,
+        so every board still on record is dead.
+        """
+        boards = self.boards.pop_all()
+        if boards:
+            logger.info("deleting %d board(s) orphaned by restart", len(boards))
+            await self._delete_boards(boards)
+
+    async def _delete_boards(self, boards: list[BoardRef]) -> None:
+        # Delete via the bot token, not the interaction webhook: followup
+        # tokens expire after 15 minutes, far sooner than boards do.
+        for channel_id, message_id in boards:
+            message = self.bot.get_partial_messageable(channel_id).get_partial_message(
+                message_id
+            )
+            try:
+                await message.delete()
+            except discord.NotFound:
+                pass  # someone already deleted it by hand
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "could not delete board message %s in channel %s: %s",
+                    message_id, channel_id, exc,
+                )
 
     # -- Playback helpers --
 
@@ -542,7 +613,13 @@ class Soundboard(commands.Cog):
             embed = discord.Embed(
                 title="Soundboard" if len(pages) == 1 else f"Soundboard ({idx}/{len(pages)})",
             )
-            await interaction.followup.send(embed=embed, view=view)
+            message = await interaction.followup.send(embed=embed, view=view)
+            if interaction.guild_id is not None:
+                self.boards.add(
+                    interaction.guild_id,
+                    channel_id=interaction.channel_id,
+                    message_id=message.id,
+                )
 
     # -- CRUD commands --
 
@@ -1098,7 +1175,8 @@ class Soundboard(commands.Cog):
 class BoardView(discord.ui.View):
     def __init__(self, cog: Soundboard, sounds) -> None:
         # timeout=None: buttons stay active until the bot restarts. Views aren't
-        # persistent, so any existing boards go dead on restart — users re-run /board.
+        # persistent, so boards go dead on restart — which is why the cog
+        # deletes every recorded board at startup (_purge_orphaned_boards).
         super().__init__(timeout=None)
         self.cog = cog
         for name, _ in sounds:
@@ -1164,7 +1242,7 @@ def create_bot() -> commands.Bot:
         config.SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
         store.scan_folder()
         store.save()
-        cog = Soundboard(bot, store)
+        cog = Soundboard(bot, store, BoardTracker(config.BOARDS_FILE))
         await bot.add_cog(cog)
         # Command sync happens in on_ready, not here: bot.guilds is empty until
         # the gateway delivers guild data after READY, and we sync per-guild.
