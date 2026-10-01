@@ -1414,7 +1414,7 @@ class TestAutoLeaveWhenAlone:
 
         vc.disconnect.assert_awaited_once()
         assert GUILD_ID not in cog.mixers
-        args, _ = interaction.response.send_message.call_args
+        args, _ = interaction.followup.send.call_args
         assert "Left" in args[0]
 
 
@@ -1652,3 +1652,109 @@ class TestUserMessage:
         from soundbot.bot import user_message
 
         assert user_message(KeyError()) == "Something went wrong."
+
+
+class TestJoinLeaveReplyDeadline:
+    """Discord voids an interaction not acknowledged within 3 seconds, and
+    the voice handshake behind connect()/disconnect() routinely takes
+    longer — the join worked but the reply 404'd as "Unknown interaction".
+    Both commands must defer before the slow await, then follow up."""
+
+    def test_join_defers_before_connecting(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        interaction = _make_interaction()
+        interaction.user.voice.channel.name = "General"
+        order = []
+        interaction.response.defer = AsyncMock(
+            side_effect=lambda *a, **k: order.append("defer")
+        )
+
+        async def connect():
+            order.append("connect")
+            return MagicMock()
+
+        interaction.user.voice.channel.connect = connect
+
+        asyncio.run(Soundboard.join.callback(cog, interaction))
+
+        assert order == ["defer", "connect"]
+        interaction.response.send_message.assert_not_called()
+        args, _ = interaction.followup.send.call_args
+        assert "Joined **General**" in args[0]
+
+    def test_join_move_also_defers(self, tmp_path):
+        existing = _connected_vc()
+        existing.move_to = AsyncMock()
+        cog = _make_cog(tmp_path)
+        interaction = _make_interaction(voice_client=existing)
+
+        asyncio.run(Soundboard.join.callback(cog, interaction))
+
+        interaction.response.defer.assert_awaited_once()
+        existing.move_to.assert_awaited_once()
+        interaction.followup.send.assert_awaited_once()
+
+    def test_join_without_voice_replies_immediately(self, tmp_path):
+        """Nothing slow happens on this path, so it keeps the direct
+        ephemeral reply rather than a deferred (public) "thinking..."."""
+        cog = _make_cog(tmp_path)
+        interaction = _make_interaction()
+        interaction.user.voice = None
+
+        asyncio.run(Soundboard.join.callback(cog, interaction))
+
+        interaction.response.defer.assert_not_called()
+        _, kwargs = interaction.response.send_message.call_args
+        assert kwargs.get("ephemeral") is True
+
+    def test_leave_defers_before_disconnecting(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        vc = _connected_vc()
+        order = []
+        interaction = _make_interaction(voice_client=vc)
+        interaction.response.defer = AsyncMock(
+            side_effect=lambda *a, **k: order.append("defer")
+        )
+        vc.disconnect = AsyncMock(side_effect=lambda *a, **k: order.append("disconnect"))
+
+        asyncio.run(Soundboard.leave.callback(cog, interaction))
+
+        assert order == ["defer", "disconnect"]
+        args, _ = interaction.followup.send.call_args
+        assert "Left" in args[0]
+
+
+class TestShutdownSignalHandler:
+    """`docker stop` sends SIGTERM. Python's default action kills the
+    process outright, skipping Bot.close() — so cog_unload's final save
+    never ran and up to a minute of play counts was lost."""
+
+    def test_sigterm_closes_the_bot(self):
+        import signal
+
+        from soundbot.bot import install_shutdown_handler
+
+        bot = MagicMock()
+        bot.close = AsyncMock()
+        loop = MagicMock()
+
+        async def scenario():
+            assert install_shutdown_handler(bot, loop) is True
+            sig, callback = loop.add_signal_handler.call_args.args
+            assert sig == signal.SIGTERM
+            callback()
+            # The handler schedules close(); let it run.
+            await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+        bot.close.assert_awaited_once()
+
+    def test_unsupported_platform_is_tolerated(self):
+        """Windows event loops raise NotImplementedError for signal
+        handlers; that must not break startup (Ctrl+C still works there)."""
+        from soundbot.bot import install_shutdown_handler
+
+        loop = MagicMock()
+        loop.add_signal_handler.side_effect = NotImplementedError
+
+        assert install_shutdown_handler(MagicMock(), loop) is False

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import signal
 import time
 from pathlib import Path
 
@@ -230,6 +231,10 @@ class Soundboard(commands.Cog):
             )
             return
         channel = interaction.user.voice.channel
+        # Defer first: the voice handshake routinely outlasts Discord's
+        # 3-second acknowledgement window, and a late reply 404s as
+        # "Unknown interaction" even though the join succeeded.
+        await interaction.response.defer()
         if interaction.guild.voice_client:
             await interaction.guild.voice_client.move_to(channel)
         else:
@@ -237,7 +242,7 @@ class Soundboard(commands.Cog):
             mixer = MixerSource(volume=self.volume)
             self.mixers[interaction.guild.id] = mixer
             vc.play(mixer)
-        await interaction.response.send_message(f"Joined **{channel.name}**.")
+        await interaction.followup.send(f"Joined **{channel.name}**.")
 
     @app_commands.command(name="leave", description="Bot leaves the voice channel")
     @_admin_check()
@@ -248,8 +253,11 @@ class Soundboard(commands.Cog):
                 "Not in a voice channel.", ephemeral=True
             )
             return
+        # Defer for the same reason as /join: disconnect() waits on the
+        # gateway to confirm, which can outlast the 3-second window.
+        await interaction.response.defer()
         await self._teardown_voice(vc)
-        await interaction.response.send_message("Left the voice channel.")
+        await interaction.followup.send("Left the voice channel.")
 
     async def _teardown_voice(self, vc: discord.VoiceProtocol) -> None:
         """Stop the mixer and disconnect — the one true voice teardown.
@@ -1238,6 +1246,30 @@ async def deploy_commands(
     await http.bulk_upsert_global_commands(application_id, [])
 
 
+def install_shutdown_handler(
+    bot: commands.Bot, loop: asyncio.AbstractEventLoop
+) -> bool:
+    """Make SIGTERM close the bot gracefully. Returns False if unsupported.
+
+    `docker stop` sends SIGTERM, whose default action kills the process
+    on the spot — skipping Bot.close(), which is what unloads the cog
+    and runs its final store.save(). (Ctrl+C already works: bot.run()
+    turns KeyboardInterrupt into a clean close.) Windows event loops
+    don't support signal handlers; there, Ctrl+C remains the clean path.
+    """
+
+    def on_sigterm() -> None:
+        logger.info("SIGTERM received; shutting down")
+        # Keep a reference so the close task can't be garbage-collected.
+        bot.shutdown_task = asyncio.ensure_future(bot.close())
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, on_sigterm)
+    except (NotImplementedError, RuntimeError):
+        return False
+    return True
+
+
 def create_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
@@ -1249,6 +1281,8 @@ def create_bot() -> commands.Bot:
     )
 
     async def setup_hook():
+        if not install_shutdown_handler(bot, asyncio.get_running_loop()):
+            logger.info("SIGTERM handler unsupported here; use Ctrl+C to stop cleanly")
         config.SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
         store.scan_folder()
         store.save()
@@ -1333,9 +1367,5 @@ def create_bot() -> commands.Bot:
                 await sync_guild_commands(bot.tree, guild)
             except Exception:
                 logger.exception("failed to sync commands to new guild id=%s", guild.id)
-
-    @bot.event
-    async def on_close():
-        store.save()
 
     return bot
