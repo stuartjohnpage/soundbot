@@ -10,7 +10,9 @@ A Discord soundboard bot with no limits. Play sound clips in voice channels usin
 - Upload sounds directly in Discord or bulk-load from a folder
 - Bind emoji to sounds — a reaction anywhere plays the sound (while the bot is in voice)
 - Playback requires being in the bot's voice channel, like Discord's native soundboard — no remote-spamming voice from a text channel
-- Optional categories for organization
+- Optional categories and tags for organization — tags filter `/play`, `/random` and `/board`
+- Uploads (including video files) are auto-trimmed to 6.4s and loudness-normalized
+- Optional web admin panel for managing the library from a browser
 - Auto-leaves the voice channel after 10 minutes alone (configurable)
 - Global volume control
 - Play count tracking and file logging
@@ -83,12 +85,17 @@ Create a role in your Discord server called **Soundbot Admin** (or whatever you 
 | `/bindemoji <sound> <emoji>` | Bind an emoji: anyone reacting with it plays the sound (bindings are per-server) |
 | `/unbindemoji <emoji>` | Remove an emoji binding |
 | `/listbindings` | List this server's emoji-to-sound bindings |
+| `/tag add <sound> <tag>` | Add a tag to a sound |
+| `/tag remove <sound> <tag>` | Remove a tag from a sound |
+| `/tag list [sound]` | List a sound's tags, or every tag in use with counts |
+
+`/play`, `/random` and `/board` also take an optional `tag` option: on `/random` and `/board` it filters the sounds; on `/play` it narrows the name autocomplete.
 
 ## Adding Sounds
 
 ### Via Discord
 
-Use `/addsound` and attach an audio file. Any format FFmpeg supports works (mp3, wav, ogg, m4a, flac, opus, etc.). Clips must be 6.4 seconds or shorter.
+Use `/addsound` and attach an audio file. Any format FFmpeg supports works (mp3, wav, ogg, m4a, flac, opus, etc.), and video files (mp4, webm, …) have their audio track extracted. Clips longer than 6.4 seconds are trimmed to the first 6.4 seconds, and clips louder than `TARGET_LUFS` are turned down to it. New sounds are auto-tagged with the server's name so they show up on that server's tag-filtered boards.
 
 ```
 /addsound name:airhorn category:memes file:[attach audio]
@@ -128,7 +135,7 @@ WEB_TOKEN=some-long-random-string
 
 Generate one with e.g. `openssl rand -hex 32`. If `WEB_TOKEN` is empty or unset, the web server never starts.
 
-Then restart (`docker compose up -d --build`) and open `http://<host>:8000` on your LAN. Enter the token on the login screen; it's stored in your browser and sent with every request. Uploads go through the same pipeline as `/addsound` (duration limit, loudness normalization), so sounds added from the browser behave exactly like sounds added from Discord.
+Then restart (`docker compose up -d --build`) and open `http://<host>:8000` on your LAN. Enter the token on the login screen; it's stored in your browser and sent with every request. Uploads go through the same pipeline as `/addsound` (video extraction, auto-trim, loudness normalization), so sounds added from the browser behave exactly like sounds added from Discord.
 
 The panel runs inside the bot process and shares its sound library state. Change the port with `WEB_PORT` in `.env`.
 
@@ -202,4 +209,6 @@ docker compose logs -f
 
 **"You don't have permission":** Make sure you have the admin role (default: `Soundbot Admin`). The role name is case-sensitive and must match `ADMIN_ROLE` in `.env` exactly.
 
-**Sound rejected as too long:** Clips must be 6.4 seconds or shorter. Trim your audio before uploading.
+**Sound cut off early:** Clips longer than 6.4 seconds are trimmed to their first 6.4 seconds on upload. Trim to the part you want before uploading.
+
+**"Already exists" but the sound isn't on the board:** Names are unique across the whole library, but boards are usually tag-filtered. The error lists the existing sound's tags; run `/board` with no filter to find it, or `/tag add` it for this server.

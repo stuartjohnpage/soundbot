@@ -1,5 +1,24 @@
 # Discord Soundbot — v1 Specification
 
+> **Historical document.** This is the original v1 design and is kept for
+> context. It no longer describes the bot exactly; **[README.md](README.md)
+> is the source of truth** for current behavior, commands and configuration.
+>
+> Notable changes since v1:
+>
+> - **Boards** post one message per 25 sounds (no Previous/Next paging), take
+>   an optional tag filter instead of grouping by category.
+> - **Play feedback** is an ephemeral "Playing …" reply to `/play`; board
+>   presses reply silently. Playback requires being in the bot's voice channel.
+> - **Uploads are processed once, at add time:** audio is extracted from video
+>   files, clips over 6.4s are trimmed (not rejected), and loud clips are
+>   loudness-normalized.
+> - **Voice:** the bot auto-leaves after sitting alone (`IDLE_TIMEOUT`).
+> - **New since v1:** tags (`/tag`), emoji-reaction bindings, `/stats`,
+>   `/importsounds`, and an optional web admin panel.
+> - **Metadata** is schema version 2 (adds `tags` per sound and per-guild
+>   `emoji_bindings`).
+
 ## Overview
 
 A Discord bot that replaces Discord's built-in soundboard, removing the limitations on sound count and clip duration. Built in Python using discord.py, deployed via Docker.
@@ -181,7 +200,7 @@ services:
 
 Tracked as GitHub issues:
 
-1. **Web admin panel** — Browse, rename, delete, re-categorize, upload, preview sounds via a web UI.
-2. **SQLite migration** — Migrate from JSON to SQLite if the metadata file becomes unwieldy.
-3. **`/stats` command** — Show most played sounds, play counts by user, etc.
-4. **Favorites system** — Users can favorite sounds; `/board` shows personal favorites by default.
+1. ~~**Web admin panel**~~ — shipped (#23).
+2. **SQLite migration** — Migrate from JSON to SQLite if the metadata file becomes unwieldy. Open: #2.
+3. ~~**`/stats` command**~~ — shipped as top-played sounds and totals (#27); per-user counts not implemented.
+4. **Favorites system** — Users can favorite sounds; `/board` shows personal favorites by default. Open: #4.
