@@ -67,11 +67,16 @@ async def run_migration_if_needed(store: SoundStore, guilds) -> None:
     Atomic on fetch failures: if any guild's fetch raises, no save
     happens and the file stays at v1 so the next startup retries.
 
+    Runs at most once per process: a successful run sets
+    ``store.tag_migration_done``, because on_ready fires again on every
+    gateway reconnect while ``startup_version`` stays at v1. Skipped
+    (no guilds) and failed runs leave it unset so a later on_ready retries.
+
     The ``guilds`` parameter is duck-typed: it must yield objects with
     ``.name`` and an awaitable ``fetch_soundboard_sounds()`` method.
     Tested against fake guild objects in tests/test_migration.py.
     """
-    if store.startup_version >= CURRENT_SCHEMA_VERSION:
+    if store.startup_version >= CURRENT_SCHEMA_VERSION or store.tag_migration_done:
         return
 
     if not guilds:
@@ -111,6 +116,7 @@ async def run_migration_if_needed(store: SoundStore, guilds) -> None:
     # Swap in the migrated dict via the public hook and persist atomically.
     store.replace_sounds(v2_data["sounds"])
     store.save()
+    store.tag_migration_done = True
 
     sounds_view = store.raw_sounds()
     # Direct subscript: migrate_v1_to_v2 guarantees every entry has a tags key.
