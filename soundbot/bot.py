@@ -64,6 +64,16 @@ def classify_import_sound(
     return "needs_download"
 
 
+def user_message(exc: Exception) -> str:
+    """The user-facing text of a store exception.
+
+    Use this, never str(exc), when a KeyError can reach the user:
+    KeyError.__str__ wraps the message in an extra layer of quotes, so
+    "Sound 'x' not found" would render with literal quotes around it.
+    """
+    return str(exc.args[0]) if exc.args else "Something went wrong."
+
+
 def duplicate_sound_message(name: str, entry: dict) -> str:
     """Explain a name collision in terms of where the existing sound is visible.
 
@@ -783,7 +793,7 @@ class Soundboard(commands.Cog):
             self.store.rename(old, new)
             self.store.save()
         except (KeyError, ValueError) as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            await interaction.response.send_message(user_message(exc), ephemeral=True)
             return
         await interaction.response.send_message(
             f"Renamed **{old}** to **{new}**."
@@ -987,11 +997,8 @@ class Soundboard(commands.Cog):
             self.store.save()
         except (KeyError, ValueError) as exc:
             # remove_tag raises KeyError when the sound doesn't exist and
-            # ValueError when the tag isn't on the sound. Both render to
-            # the user via str(exc); KeyError's repr quoting is avoided
-            # because exc.args[0] is the user-facing message either way.
-            msg = exc.args[0] if exc.args else "Not found."
-            await interaction.response.send_message(msg, ephemeral=True)
+            # ValueError when the tag isn't on the sound.
+            await interaction.response.send_message(user_message(exc), ephemeral=True)
             return
         await interaction.response.send_message(
             f"Removed `{tag}` from **{sound}**.", ephemeral=True
@@ -1142,9 +1149,7 @@ class Soundboard(commands.Cog):
             sound = self.store.unbind_emoji(interaction.guild.id, emoji_key)
             self.store.save()
         except KeyError as exc:
-            # exc.args[0], not str(exc): KeyError.__str__ wraps the message
-            # in an extra layer of quotes.
-            await interaction.response.send_message(exc.args[0], ephemeral=True)
+            await interaction.response.send_message(user_message(exc), ephemeral=True)
             return
         await interaction.response.send_message(
             f"Unbound {emoji_key} (was **{sound}**)."

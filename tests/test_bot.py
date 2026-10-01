@@ -1517,3 +1517,69 @@ class TestBoardCleanup:
 
         assert deleted == [(42, 1001)]
         assert cog.boards.pop_all() == []
+
+
+class TestRenameSoundCommand:
+    def _rename(self, cog, old, new):
+        interaction = _make_interaction()
+        asyncio.run(Soundboard.renamesound.callback(cog, interaction, old, new))
+        args, kwargs = interaction.response.send_message.call_args
+        return args[0], kwargs.get("ephemeral")
+
+    def test_renames_and_persists(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "alpha")
+
+        msg, ephemeral = self._rename(cog, "alpha", "bravo")
+
+        assert "Renamed **alpha** to **bravo**" in msg
+        assert not ephemeral
+        assert cog.store.get("bravo") is not None
+        assert cog.store.get("alpha") is None
+
+    def test_unknown_sound_message_is_not_repr_quoted(self, tmp_path):
+        """str(KeyError) wraps the message in quotes, so the user saw
+        "Sound 'ghost' not found" *including* the outer quotes."""
+        cog = _make_cog(tmp_path)
+
+        msg, ephemeral = self._rename(cog, "ghost", "bravo")
+
+        assert msg == "Sound 'ghost' not found"
+        assert ephemeral is True
+
+    def test_existing_target_name_is_rejected(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "alpha")
+        _add_sound(cog, "bravo", "bravo.ogg")
+
+        msg, ephemeral = self._rename(cog, "alpha", "bravo")
+
+        assert msg == "Sound 'bravo' already exists"
+        assert ephemeral is True
+        assert cog.store.get("alpha") is not None
+
+    def test_invalid_new_name_is_rejected(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        _add_sound(cog, "alpha")
+
+        msg, ephemeral = self._rename(cog, "alpha", "bad name!")
+
+        assert ephemeral is True
+        assert cog.store.get("alpha") is not None
+
+
+class TestUserMessage:
+    def test_key_error_is_unquoted(self):
+        from soundbot.bot import user_message
+
+        assert user_message(KeyError("Sound 'x' not found")) == "Sound 'x' not found"
+
+    def test_value_error_passes_through(self):
+        from soundbot.bot import user_message
+
+        assert user_message(ValueError("bad")) == "bad"
+
+    def test_argless_exception_does_not_crash(self):
+        from soundbot.bot import user_message
+
+        assert user_message(KeyError()) == "Something went wrong."
