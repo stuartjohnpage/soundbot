@@ -3,7 +3,6 @@ import logging
 import random
 import signal
 import time
-from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -624,15 +623,6 @@ class Soundboard(commands.Cog):
 
     # -- CRUD commands --
 
-    def _find_existing_by_path(self, path: Path) -> str | None:
-        """Return the name of any store entry whose file is `path`, or None.
-
-        Thin delegate to SoundStore.find_by_path — the logic was hoisted
-        into the store so the web panel's upload route can use the same
-        no-clobber guard without reaching into the cog.
-        """
-        return self.store.find_by_path(path)
-
     @app_commands.command(name="addsound", description="Add a new sound")
     @app_commands.describe(
         name="Sound name",
@@ -842,7 +832,7 @@ class Soundboard(commands.Cog):
             # store entry, the dest path could still be owned by an entry
             # under a different name (dangling pointer, manual JSON edit,
             # etc.). Don't silently overwrite — same guard addsound uses.
-            other_owner = self._find_existing_by_path(dest)
+            other_owner = self.store.find_by_path(dest)
             if other_owner is not None:
                 path_conflict.append(f"{key} (owned by '{other_owner}')")
                 continue
@@ -854,7 +844,16 @@ class Soundboard(commands.Cog):
                 file_conflict.append(key)
                 continue
             try:
-                await sound.save(dest)
+                try:
+                    await sound.save(dest)
+                except BaseException:
+                    # We reserved dest, so it's ours to drop on any
+                    # failure, including ones the per-sound handler below
+                    # doesn't catch (cancellation, unexpected errors) that
+                    # would otherwise leave the placeholder blocking the
+                    # filename.
+                    dest.unlink(missing_ok=True)
+                    raise
                 # Same ingest pipeline as /addsound — imported soundboard
                 # sounds arrive at whatever level they were uploaded to
                 # Discord at, so they get the same validation and

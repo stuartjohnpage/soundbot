@@ -262,7 +262,10 @@ def normalize_loudness(file_path: Path, target_lufs: float) -> float | None:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         # OSError subsumes FileNotFoundError (ffmpeg not installed).
         tmp.unlink(missing_ok=True)
+        # Same as trim_audio: ffmpeg's stderr echoes the full server path,
+        # so it goes to the log rather than into the message.
         stderr = getattr(exc, "stderr", None)
-        detail = f": {stderr[-300:]}" if stderr else ""
-        raise ValueError(f"Failed to normalize '{file_path.name}'{detail}") from exc
+        if stderr:
+            logger.warning("ffmpeg normalize failed for %s: %s", file_path, stderr[-300:])
+        raise ValueError(f"Failed to normalize '{file_path.name}'") from exc
     return gain

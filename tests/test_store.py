@@ -938,6 +938,25 @@ class TestFindByPath:
         monkeypatch.chdir(sounds_dir)
         assert store.find_by_path(Path("alpha.mp3")) == "alpha"
 
+    def test_finds_match_among_multiple_entries(self, tmp_path):
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        store = SoundStore(metadata_path=tmp_path / "sounds.json", sounds_dir=sounds_dir)
+        for name in ("one", "two", "three"):
+            path = sounds_dir / f"{name}.mp3"
+            path.write_bytes(b"x")
+            store.add(name, path)
+
+        assert store.find_by_path(sounds_dir / "two.mp3") == "two"
+
+    def test_does_not_raise_on_unusual_paths(self, tmp_path):
+        sounds_dir = tmp_path / "sounds"
+        sounds_dir.mkdir()
+        store = SoundStore(metadata_path=tmp_path / "sounds.json", sounds_dir=sounds_dir)
+
+        assert store.find_by_path(Path("")) is None
+        assert store.find_by_path(Path("does/not/exist.mp3")) is None
+
     def test_missing_file_still_matches_entry(self, tmp_path):
         """A dangling store entry (file manually deleted) still owns its
         path — an upload landing there would corrupt the entry."""

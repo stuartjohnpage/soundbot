@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from .ingest import (
+    RejectionKind,
     UploadRejected,
     precheck_upload,
     process_upload,
@@ -70,7 +71,11 @@ class TagsBody(BaseModel):
 
 
 # HTTP status for each ingest.UploadRejected kind.
-_REJECTION_STATUS = {"invalid": 400, "duplicate": 409, "conflict": 409}
+_REJECTION_STATUS: dict[RejectionKind, int] = {
+    "invalid": 400,
+    "duplicate": 409,
+    "conflict": 409,
+}
 
 
 def _auth_dependency(token: str):
@@ -202,9 +207,18 @@ def create_web_app(
                             ),
                         )
                     out.write(chunk)
+        except BaseException:
+            # A failed write (413 above, disk full mid-write) must not
+            # orphan a partial file in sounds_dir, where it would block
+            # the filename and register as a broken sound on the next
+            # scan_folder(). Safe to unlink: reserve_upload_path created
+            # this file, so nothing else owns it.
+            dest.unlink(missing_ok=True)
+            raise
+        try:
             # Shared ingest pipeline — the exact code path /addsound runs
             # (video-extract, validate, normalize, cache-invalidate,
-            # register).
+            # register). It cleans up its own file on any failure.
             final_dest, gain, trimmed_from = process_upload(
                 dest,
                 store=store,
@@ -216,20 +230,12 @@ def create_web_app(
                 max_duration=max_duration,
                 target_lufs=target_lufs,
             )
+        except UploadRejected as exc:
+            raise HTTPException(
+                status_code=_REJECTION_STATUS[exc.kind], detail=str(exc)
+            )
         except ValueError as exc:
-            # The pipeline already unlinked dest on its own failures.
             raise HTTPException(status_code=400, detail=str(exc))
-        except BaseException:
-            # Anything else — 413 above, disk full mid-write, a transient
-            # AV lock on Windows (a failure mode normalize_loudness
-            # explicitly documents) — must not orphan a partial file in
-            # sounds_dir, where the next scan_folder() would register it
-            # as a broken sound. Safe to unlink: reserve_upload_path above
-            # created this file, so nothing else owns it. Only after
-            # process_upload returns is the file owned by a store entry,
-            # and from there it must survive.
-            dest.unlink(missing_ok=True)
-            raise
         store.save()
         return {
             "name": name.lower(),

@@ -19,6 +19,7 @@ the bot's event loop must wrap calls in `asyncio.to_thread`.
 """
 import logging
 from pathlib import Path
+from typing import Literal
 
 from .audio import (
     extract_audio,
@@ -33,17 +34,23 @@ from .store import SoundStore, parse_tags
 logger = logging.getLogger("soundbot")
 
 
-class UploadRejected(ValueError):
-    """An upload refused before any bytes were written.
+RejectionKind = Literal["invalid", "duplicate", "conflict"]
 
-    `kind` lets each front end pick its own response: "invalid" (bad
-    input, HTTP 400), "duplicate" (sound name taken, 409) or "conflict"
-    (destination file already in use, 409).
+
+class UploadRejected(ValueError):
+    """An upload refused because its input or destination is unusable.
+
+    Mostly raised before any bytes are written (precheck_upload,
+    reserve_upload_path), but also from inside process_upload when a
+    video's extracted-audio destination is taken. `kind` lets each front
+    end pick its own response: "invalid" (bad input, HTTP 400),
+    "duplicate" (sound name taken, 409) or "conflict" (destination file
+    already in use, 409).
     """
 
-    def __init__(self, message: str, kind: str) -> None:
+    def __init__(self, message: str, kind: RejectionKind) -> None:
         super().__init__(message)
-        self.kind = kind
+        self.kind: RejectionKind = kind
 
 
 def duplicate_sound_message(name: str, entry: dict, *, markdown: bool = True) -> str:
@@ -130,7 +137,8 @@ def precheck_upload(
         )
     # Nor to a file nobody owns: overwriting a stray file in sounds/
     # (say one scan_folder skipped) destroys it, and a failed upload then
-    # deletes it outright.
+    # deletes it outright. reserve_upload_path would refuse it too; this
+    # earlier check exists for the clearer "not in the library" message.
     if dest.exists():
         raise UploadRejected(
             f"A file named '{dest.name}' is already in the sounds folder "
@@ -198,11 +206,13 @@ def process_upload(
     when no attenuation was applied; trimmed_from_seconds is the original
     duration when the upload exceeded max_duration and was auto-trimmed
     to the cap (issue #20), else None.
-    Raises ValueError with a user-facing message on failure;
-    the file at `dest` is deleted so a rejected upload leaves nothing
-    behind. Callers must ensure no *other* store entry owns `dest`
-    before saving bytes there (store.find_by_path) — otherwise the
-    error-path unlink here would delete that entry's file.
+    Raises ValueError with a user-facing message on failure (an
+    UploadRejected if the extracted-audio destination is taken). On any
+    failure, the upload's file (the video, or its extracted audio once
+    swapped in) is deleted so nothing is left behind, unless a store
+    entry already owns it. Callers must own `dest`, i.e. have claimed it
+    with reserve_upload_path, before saving bytes there; otherwise the
+    cleanup here could delete someone else's file.
     Does NOT call store.save(); the caller decides when to persist.
     """
     try:
@@ -214,10 +224,11 @@ def process_upload(
             # for the reservation below to collide with).
             audio_owner = store.find_by_path(audio_dest)
             if audio_owner is not None:
-                raise ValueError(
+                raise UploadRejected(
                     f"Can't extract the audio: '{audio_dest.name}' is "
                     f"already used by sound '{audio_owner}'. Remove that "
-                    f"sound first."
+                    f"sound first.",
+                    "conflict",
                 )
             # Claim it like the upload itself, so neither a stray file nor
             # a concurrent upload's extraction gets overwritten.
@@ -249,7 +260,14 @@ def process_upload(
         store.add(name, dest, category=category, uploaded_by=uploaded_by)
         for tag in tags:
             store.add_tag(name, tag)
-    except ValueError:
-        dest.unlink(missing_ok=True)
+    except BaseException:
+        # Any failure, not just ValueError: an orphan left by an
+        # unexpected error would block its filename (precheck_upload
+        # refuses files already on disk) and register as a broken sound on
+        # the next scan_folder. `dest` is whichever file this upload owns
+        # right now. The ownership check keeps a file that store.add
+        # already registered from being pulled out from under its entry.
+        if store.find_by_path(dest) is None:
+            dest.unlink(missing_ok=True)
         raise
     return dest, gain, trimmed_from
