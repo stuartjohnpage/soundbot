@@ -1,10 +1,18 @@
 """Shared upload-ingest pipeline.
 
-The post-save half of what /addsound does: validate, loudness-normalize,
-invalidate stale cached PCM, and register the sound in the store. Lives
-in its own module so the Discord commands (/addsound, /importsounds) and
-the web panel's upload route run the exact same code path instead of
-diverging copies.
+Both halves of an upload, shared by the Discord commands (/addsound,
+/importsounds) and the web panel's upload route so they run the exact
+same code instead of diverging copies:
+
+- pre-save: precheck_upload (validate input, refuse collisions) and
+  reserve_upload_path (atomically claim the destination file);
+- post-save: process_upload (validate audio, trim, loudness-normalize,
+  invalidate stale cached PCM, register in the store).
+
+Messages raised from here are plain text naming files by basename: they
+reach both Discord replies and web API error details, so no Discord
+markdown and no server paths. (duplicate_sound_message is the one
+exception, with an explicit markdown switch.)
 
 Everything here is blocking (ffmpeg/ffprobe subprocesses) — callers on
 the bot's event loop must wrap calls in `asyncio.to_thread`.
@@ -20,9 +28,138 @@ from .audio import (
     trim_audio,
 )
 from .pcm_cache import PCMCache
-from .store import SoundStore
+from .store import SoundStore, parse_tags
 
 logger = logging.getLogger("soundbot")
+
+
+class UploadRejected(ValueError):
+    """An upload refused before any bytes were written.
+
+    `kind` lets each front end pick its own response: "invalid" (bad
+    input, HTTP 400), "duplicate" (sound name taken, 409) or "conflict"
+    (destination file already in use, 409).
+    """
+
+    def __init__(self, message: str, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def duplicate_sound_message(name: str, entry: dict, *, markdown: bool = True) -> str:
+    """Explain a name collision in terms of where the existing sound is visible.
+
+    Names are unique across the whole library, but boards are usually
+    tag-filtered, so "already exists" alone reads as a lie when the
+    existing sound carries no tag for (or a different tag than) the guild
+    the uploader is looking at. Spell out the tags so the user can find it.
+    `markdown=False` gives the plain-text form for the web panel.
+    """
+    # Direct subscript: SoundStore.load() guarantees the tags key exists.
+    tags = entry["tags"]
+    if markdown:
+        if tags:
+            tag_list = ", ".join(f"`{t}`" for t in sorted(tags))
+            return (
+                f"A sound named **{name.lower()}** already exists, tagged {tag_list}. "
+                f"It only shows on boards filtered by those tags — run `/board` with "
+                f"no filter to see it, or pick another name."
+            )
+        return (
+            f"A sound named **{name.lower()}** already exists but has **no tags**, "
+            f"so it never appears on tag-filtered boards. Run `/board` with no "
+            f"filter to see it, `/tag add` to tag it for this server, or pick "
+            f"another name."
+        )
+    if tags:
+        return (
+            f"Sound '{name.lower()}' already exists, tagged: "
+            f"{', '.join(sorted(tags))}. Clear the tag filter to see it, "
+            f"or pick another name."
+        )
+    return (
+        f"Sound '{name.lower()}' already exists but has no tags, so it "
+        f"never appears on tag-filtered views. Clear the tag filter to "
+        f"see it, or pick another name."
+    )
+
+
+def precheck_upload(
+    store: SoundStore,
+    sounds_dir: Path,
+    *,
+    name: str,
+    tags: str | None,
+    filename: str | None,
+    markdown: bool,
+) -> tuple[Path, list[str]]:
+    """Validate an upload before any bytes hit disk.
+
+    Returns (dest, tag_list) or raises UploadRejected. Ordered cheapest-
+    first so bad input fails before any file I/O. Passing these checks
+    doesn't claim `dest` — call reserve_upload_path for that, since
+    another upload can race in between. `markdown` only affects the
+    duplicate-name message (the one with Discord-specific advice).
+    """
+    try:
+        SoundStore.validate_name(name)
+        tag_list = parse_tags(tags)
+    except ValueError as exc:
+        raise UploadRejected(str(exc), "invalid") from exc
+    existing = store.get(name)
+    if existing is not None:
+        raise UploadRejected(
+            duplicate_sound_message(name, existing, markdown=markdown),
+            "duplicate",
+        )
+    # Path(...).name strips directory parts, defusing path traversal.
+    safe_name = Path(filename or "").name
+    if not safe_name:
+        raise UploadRejected("Missing filename.", "invalid")
+    dest = sounds_dir / safe_name
+    if not dest.resolve().is_relative_to(sounds_dir.resolve()):
+        raise UploadRejected("Invalid filename.", "invalid")
+    # Never write to a path another entry owns: the pipeline's error-path
+    # unlink would delete that entry's file.
+    owner = store.find_by_path(dest)
+    if owner is not None:
+        raise UploadRejected(
+            f"The file name '{dest.name}' is already used by sound "
+            f"'{owner}'. Remove that sound first or rename your file.",
+            "conflict",
+        )
+    # Nor to a file nobody owns: overwriting a stray file in sounds/
+    # (say one scan_folder skipped) destroys it, and a failed upload then
+    # deletes it outright.
+    if dest.exists():
+        raise UploadRejected(
+            f"A file named '{dest.name}' is already in the sounds folder "
+            f"(but not in the library). Rename your file and try again.",
+            "conflict",
+        )
+    return dest, tag_list
+
+
+def reserve_upload_path(dest: Path) -> None:
+    """Atomically claim `dest` by creating it empty, or raise UploadRejected.
+
+    precheck_upload's checks and the later write are separate steps, so
+    two uploads with the same filename could both pass and then write the
+    same file. Exclusive create ("xb") lets exactly one claim it. The
+    winner then owns `dest`: it overwrites the placeholder with its bytes
+    and must unlink it on any failure.
+    """
+    try:
+        with dest.open("xb"):
+            pass
+    except FileExistsError:
+        # Can't tell a concurrent upload from a stray file here, so the
+        # message has to fit both.
+        raise UploadRejected(
+            f"A file named '{dest.name}' already exists in the sounds "
+            f"folder. Rename your file and try again.",
+            "conflict",
+        ) from None
 
 
 def normalize_upload(dest: Path, target_lufs: float) -> float | None:
@@ -71,21 +208,25 @@ def process_upload(
     try:
         if has_video_stream(dest):
             audio_dest = dest.with_suffix(".mp3")
-            if audio_dest.exists():
-                raise ValueError(
-                    f"A file named `{audio_dest.name}` already exists."
-                )
-            # Same no-clobber guard as the caller's pre-save check, but
-            # for the extracted audio destination. Covers the case where
-            # a store entry references a file path that was manually
-            # deleted off disk — the .exists() check above misses it.
+            # Same no-clobber guard as precheck_upload, but for the
+            # extracted audio destination. The owner check covers a store
+            # entry whose file was deleted off disk (so it isn't on disk
+            # for the reservation below to collide with).
             audio_owner = store.find_by_path(audio_dest)
             if audio_owner is not None:
                 raise ValueError(
-                    f"Cannot upload: `{audio_dest.name}` is already in use "
-                    f"by sound **{audio_owner}**. Remove that sound first."
+                    f"Can't extract the audio: '{audio_dest.name}' is "
+                    f"already used by sound '{audio_owner}'. Remove that "
+                    f"sound first."
                 )
-            extract_audio(dest, audio_dest)
+            # Claim it like the upload itself, so neither a stray file nor
+            # a concurrent upload's extraction gets overwritten.
+            reserve_upload_path(audio_dest)
+            try:
+                extract_audio(dest, audio_dest)
+            except BaseException:
+                audio_dest.unlink(missing_ok=True)
+                raise
             dest.unlink(missing_ok=True)
             dest = audio_dest
         # get_duration doubles as the is-this-readable-audio check that

@@ -234,3 +234,152 @@ class TestProcessUploadRejection:
 
         assert not dest.exists()
         assert store.get("bad") is None
+
+
+class TestPrecheckUpload:
+    """The pre-save checks shared by /addsound and the web upload route.
+    They used to be two hand-maintained copies; one function means a rule
+    change can't land on only one front end."""
+
+    def _check(self, store, sounds_dir, *, name="horn", tags=None,
+               filename="horn.wav", markdown=False):
+        from soundbot.ingest import precheck_upload
+
+        return precheck_upload(
+            store, sounds_dir, name=name, tags=tags, filename=filename,
+            markdown=markdown,
+        )
+
+    def test_returns_destination_and_parsed_tags(self, tmp_path):
+        store, sounds_dir = _make_store(tmp_path)
+
+        dest, tags = self._check(store, sounds_dir, tags="Meme, loud")
+
+        assert dest == sounds_dir / "horn.wav"
+        assert tags == ["meme", "loud"]
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"name": "bad name!"},
+            {"tags": "ok,bad tag!"},
+            {"filename": ""},
+        ],
+    )
+    def test_bad_input_is_invalid(self, tmp_path, kwargs):
+        from soundbot.ingest import UploadRejected
+
+        store, sounds_dir = _make_store(tmp_path)
+
+        with pytest.raises(UploadRejected) as exc_info:
+            self._check(store, sounds_dir, **kwargs)
+        assert exc_info.value.kind == "invalid"
+
+    def test_path_components_are_stripped_from_filename(self, tmp_path):
+        store, sounds_dir = _make_store(tmp_path)
+
+        dest, _ = self._check(store, sounds_dir, filename="../../etc/horn.wav")
+
+        assert dest == sounds_dir / "horn.wav"
+
+    def test_duplicate_name_explains_tags(self, tmp_path):
+        from soundbot.ingest import UploadRejected
+
+        store, sounds_dir = _make_store(tmp_path)
+        existing = sounds_dir / "old.wav"
+        existing.write_bytes(b"x")
+        store.add("horn", existing)
+        store.add_tag("horn", "elsewhere")
+
+        with pytest.raises(UploadRejected) as exc_info:
+            self._check(store, sounds_dir)
+        assert exc_info.value.kind == "duplicate"
+        assert "elsewhere" in str(exc_info.value)
+
+    def test_plain_text_messages_carry_no_discord_markdown(self, tmp_path):
+        from soundbot.ingest import UploadRejected
+
+        store, sounds_dir = _make_store(tmp_path)
+        (sounds_dir / "old.wav").write_bytes(b"x")
+        store.add("horn", sounds_dir / "old.wav")
+
+        with pytest.raises(UploadRejected) as plain:
+            self._check(store, sounds_dir, markdown=False)
+        with pytest.raises(UploadRejected) as discord_md:
+            self._check(store, sounds_dir, markdown=True)
+
+        assert "**" not in str(plain.value) and "`" not in str(plain.value)
+        assert "**horn**" in str(discord_md.value)
+
+    def test_filename_owned_by_another_entry_conflicts(self, tmp_path):
+        from soundbot.ingest import UploadRejected
+
+        store, sounds_dir = _make_store(tmp_path)
+        (sounds_dir / "horn.wav").write_bytes(b"theirs")
+        store.add("other", sounds_dir / "horn.wav")
+
+        with pytest.raises(UploadRejected) as exc_info:
+            self._check(store, sounds_dir, name="mine")
+        assert exc_info.value.kind == "conflict"
+        assert "other" in str(exc_info.value)
+
+    def test_unregistered_file_on_disk_conflicts_and_survives(self, tmp_path):
+        """A file in sounds/ that isn't in the library (e.g. scan_folder
+        skipped it for an invalid name) used to be overwritten by the
+        upload — and deleted outright if processing then failed."""
+        from soundbot.ingest import UploadRejected
+
+        store, sounds_dir = _make_store(tmp_path)
+        stray = sounds_dir / "horn.wav"
+        stray.write_bytes(b"someone's file")
+
+        with pytest.raises(UploadRejected) as exc_info:
+            self._check(store, sounds_dir)
+        assert exc_info.value.kind == "conflict"
+        assert stray.read_bytes() == b"someone's file"
+
+
+class TestReserveUploadPath:
+    def test_creates_the_file(self, tmp_path):
+        from soundbot.ingest import reserve_upload_path
+
+        dest = tmp_path / "horn.wav"
+        reserve_upload_path(dest)
+
+        assert dest.exists()
+
+    def test_second_reservation_of_same_path_conflicts(self, tmp_path):
+        """Two concurrent uploads with one filename both passed the
+        pre-checks and wrote the same file. Exclusive create makes the
+        reservation atomic: exactly one of them wins."""
+        from soundbot.ingest import UploadRejected, reserve_upload_path
+
+        dest = tmp_path / "horn.wav"
+        reserve_upload_path(dest)
+        dest.write_bytes(b"winner")
+
+        with pytest.raises(UploadRejected) as exc_info:
+            reserve_upload_path(dest)
+        assert exc_info.value.kind == "conflict"
+        assert dest.read_bytes() == b"winner"
+
+
+class TestPipelineMessagesArePlainText:
+    def test_extract_destination_conflict_has_no_markdown(self, tmp_path, monkeypatch):
+        store, sounds_dir = _make_store(tmp_path)
+        (sounds_dir / "clip.mp3").write_bytes(b"x")
+        store.add("other", sounds_dir / "clip.mp3")
+        (sounds_dir / "clip.mp3").unlink()  # dangling entry: owner check fires
+        dest = sounds_dir / "clip.mp4"
+        dest.write_bytes(b"video")
+        monkeypatch.setattr("soundbot.ingest.has_video_stream", lambda p: True)
+
+        with pytest.raises(ValueError) as exc_info:
+            process_upload(
+                dest, store=store, pcm_cache=PCMCache(), name="clip",
+                category=None, tags=[], uploaded_by="t", max_duration=6.4,
+                target_lufs=-16.0,
+            )
+        message = str(exc_info.value)
+        assert "**" not in message and "`" not in message
+        assert "other" in message

@@ -444,6 +444,19 @@ class TestUpload:
         assert path.read_bytes() == b"bytes-of-first"
         assert store.get("second") is None
 
+    def test_unregistered_file_on_disk_is_409_and_untouched(self, tmp_path):
+        """A stray file in sounds/ that no entry owns must not be
+        overwritten (or deleted on a failed upload)."""
+        client, store, sounds_dir = _make_client(tmp_path)
+        stray = sounds_dir / "stray.wav"
+        stray.write_bytes(b"not ours")
+
+        resp = _upload(client, name="stray", filename="stray.wav", content=b"x")
+
+        assert resp.status_code == 409
+        assert stray.read_bytes() == b"not ours"
+        assert store.get("stray") is None
+
     @_skip_no_ffmpeg
     def test_path_traversal_filename_is_neutralized(self, tmp_path):
         """A '../'-laden filename must not escape sounds_dir. Same

@@ -28,7 +28,12 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from .ingest import process_upload
+from .ingest import (
+    UploadRejected,
+    precheck_upload,
+    process_upload,
+    reserve_upload_path,
+)
 from .pcm_cache import PCMCache
 from .store import SoundStore, parse_tags
 
@@ -64,22 +69,8 @@ class TagsBody(BaseModel):
     tags: list[str]
 
 
-def _duplicate_detail(name: str, entry: dict) -> str:
-    """Plain-text version of bot.duplicate_sound_message: explain where
-    the existing sound is visible, since tag-hidden name collisions are
-    the usual reason someone re-uploads a sound (see PR #22)."""
-    tags = entry["tags"]
-    if tags:
-        return (
-            f"Sound '{name.lower()}' already exists, tagged: "
-            f"{', '.join(sorted(tags))}. Clear the tag filter to see it, "
-            f"or pick another name."
-        )
-    return (
-        f"Sound '{name.lower()}' already exists but has no tags, so it "
-        f"never appears on tag-filtered views. Clear the tag filter to "
-        f"see it, or pick another name."
-    )
+# HTTP status for each ingest.UploadRejected kind.
+_REJECTION_STATUS = {"invalid": 400, "duplicate": 409, "conflict": 409}
 
 
 def _auth_dependency(token: str):
@@ -180,36 +171,22 @@ def create_web_app(
         category: str | None = Form(None),
         tags: str | None = Form(None),
     ) -> dict:
-        # Same pre-checks as /addsound, in the same order: fail cleanly
-        # on bad input before any file I/O.
+        # The pre-save checks /addsound runs (shared, so they can't
+        # drift), then an atomic claim on the destination file so a
+        # concurrent upload with the same filename can't write it too.
         try:
-            SoundStore.validate_name(name)
-            tag_list = parse_tags(tags)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        existing = store.get(name)
-        if existing is not None:
-            raise HTTPException(
-                status_code=409, detail=_duplicate_detail(name, existing)
+            dest, tag_list = precheck_upload(
+                store,
+                sounds_dir,
+                name=name,
+                tags=tags,
+                filename=file.filename,
+                markdown=False,
             )
-        # Sanitize filename to prevent path traversal.
-        safe_name = Path(file.filename or "").name
-        if not safe_name:
-            raise HTTPException(status_code=400, detail="Missing filename")
-        dest = sounds_dir / safe_name
-        if not dest.resolve().is_relative_to(sounds_dir.resolve()):
-            raise HTTPException(status_code=400, detail="Invalid filename")
-        # Never write to a path another entry already owns — the ingest
-        # pipeline's error-path unlink would delete that entry's file.
-        owner = store.find_by_path(dest)
-        if owner is not None:
+            reserve_upload_path(dest)
+        except UploadRejected as exc:
             raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"File '{dest.name}' is already in use by sound "
-                    f"'{owner}'. Remove that sound first or rename your "
-                    f"upload."
-                ),
+                status_code=_REJECTION_STATUS[exc.kind], detail=str(exc)
             )
         try:
             written = 0
@@ -247,8 +224,8 @@ def create_web_app(
             # AV lock on Windows (a failure mode normalize_loudness
             # explicitly documents) — must not orphan a partial file in
             # sounds_dir, where the next scan_folder() would register it
-            # as a broken sound. Safe to unlink: the find_by_path guard
-            # above proved no other entry owns this path. Only after
+            # as a broken sound. Safe to unlink: reserve_upload_path above
+            # created this file, so nothing else owns it. Only after
             # process_upload returns is the file owned by a store entry,
             # and from there it must survive.
             dest.unlink(missing_ok=True)

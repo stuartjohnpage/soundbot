@@ -11,12 +11,17 @@ from discord.ext import commands, tasks
 
 from . import config
 from .boards import BoardRef, BoardTracker
-from .ingest import process_upload
+from .ingest import (
+    UploadRejected,
+    precheck_upload,
+    process_upload,
+    reserve_upload_path,
+)
 from .migration import run_migration_if_needed
 from .mixer import MixerSource
 from .pagination import paginate
 from .pcm_cache import CachedPCMSource, PCMCache
-from .store import SoundStore, parse_tags
+from .store import SoundStore
 from .web import build_web_server, maybe_create_web_app, serve_web_app
 
 logger = logging.getLogger("soundbot")
@@ -73,33 +78,6 @@ def user_message(exc: Exception) -> str:
     "Sound 'x' not found" would render with literal quotes around it.
     """
     return str(exc.args[0]) if exc.args else "Something went wrong."
-
-
-def duplicate_sound_message(name: str, entry: dict) -> str:
-    """Explain a name collision in terms of where the existing sound is visible.
-
-    Names are unique across the whole library, but boards are usually
-    tag-filtered — so "already exists" alone reads as a lie when the
-    existing sound carries no tag for (or a different tag than) the guild
-    the uploader is looking at. Spell out the tags so the user can find it.
-    Pure function so the wording is unit-testable without an Interaction.
-    """
-    # Direct subscript: SoundStore.load() guarantees the tags key exists
-    # on every entry (same invariant classify_import_sound relies on).
-    tags = entry["tags"]
-    if tags:
-        tag_list = ", ".join(f"`{t}`" for t in sorted(tags))
-        return (
-            f"A sound named **{name.lower()}** already exists, tagged {tag_list}. "
-            f"It only shows on boards filtered by those tags — run `/board` with "
-            f"no filter to see it, or pick another name."
-        )
-    return (
-        f"A sound named **{name.lower()}** already exists but has **no tags**, "
-        f"so it never appears on tag-filtered boards. Run `/board` with no "
-        f"filter to see it, `/tag add` to tag it for this server, or pick "
-        f"another name."
-    )
 
 
 # Keycap emoji (1️⃣, #️⃣, …) start with a plain ASCII char before the
@@ -672,24 +650,20 @@ class Soundboard(commands.Cog):
         tags: str | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
-        # Validate name and tags before any file I/O so we fail cleanly
-        # on bad input (otherwise an invalid name isn't caught until
-        # store.add, after the download and the whole ffmpeg pipeline).
+        # Shared pre-save checks (same as the web upload route): validate
+        # name/tags, explain name collisions, and refuse any destination
+        # file that's already taken — all before any bytes are downloaded.
         try:
-            SoundStore.validate_name(name)
-            tag_list = parse_tags(tags)
-        except ValueError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
-            return
-        # Name-collision check before any file I/O. store.add would catch
-        # this too, but by then the upload is already on disk — and its
-        # bare "already exists" doesn't explain why the sound is invisible
-        # on tag-filtered boards (the usual reason the user re-uploads it).
-        existing = self.store.get(name)
-        if existing is not None:
-            await interaction.followup.send(
-                duplicate_sound_message(name, existing), ephemeral=True
+            dest, tag_list = precheck_upload(
+                self.store,
+                config.SOUNDS_DIR,
+                name=name,
+                tags=tags,
+                filename=file.filename,
+                markdown=True,
             )
+        except UploadRejected as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
             return
         # Auto-tag with the guild so the new sound shows up on this
         # server's tag-filtered board immediately. Same convention as
@@ -705,40 +679,27 @@ class Soundboard(commands.Cog):
                     "sound will be added without the guild auto-tag",
                     interaction.guild.name,
                 )
-        # Sanitize filename to prevent path traversal
-        safe_name = Path(file.filename).name
-        dest = config.SOUNDS_DIR / safe_name
-        if not dest.resolve().is_relative_to(config.SOUNDS_DIR.resolve()):
-            await interaction.followup.send("Invalid filename.", ephemeral=True)
+        # Atomically claim the file: the web panel uploads on other
+        # threads, so another upload with the same filename can pass the
+        # same checks before either one writes.
+        try:
+            reserve_upload_path(dest)
+        except UploadRejected as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
             return
-        # Must come before file.save: we never want to write to a path that
-        # another entry already owns. Catches both same-name re-uploads
-        # (refuse, tell user to remove first) and different-name same-filename
-        # collisions (would otherwise corrupt the existing entry).
-        owner = self._find_existing_by_path(dest)
-        if owner is not None:
-            if owner == name.lower():
-                msg = (
-                    f"Sound **{owner}** already uses `{dest.name}`. "
-                    "Remove it first if you want to replace it."
-                )
-            else:
-                msg = (
-                    f"Cannot upload: `{dest.name}` is already in use by sound "
-                    f"**{owner}**. Remove that sound first or rename your upload."
-                )
-            await interaction.followup.send(msg, ephemeral=True)
-            return
-        await file.save(dest)
+        try:
+            await file.save(dest)
+        except BaseException:
+            # We own dest (reserved above); don't orphan a partial file
+            # that the next scan_folder would register as a broken sound.
+            dest.unlink(missing_ok=True)
+            raise
         try:
             # Shared ingest pipeline (video-extract, validate, normalize,
             # cache-invalidate, register) — same code path as the web
             # panel's upload route. to_thread keeps the ffmpeg subprocess
             # work off the event loop. On ValueError the pipeline has
-            # already unlinked dest; safe because _find_existing_by_path
-            # above guarantees no other entry references this path.
-            # (Concurrent /addsound calls could race around the file.save
-            # yield point — that's a pre-existing TOCTOU limitation.)
+            # already unlinked dest, which is safe: we reserved it.
             dest, gain, trimmed_from = await asyncio.to_thread(
                 process_upload,
                 dest,
@@ -884,6 +845,13 @@ class Soundboard(commands.Cog):
             other_owner = self._find_existing_by_path(dest)
             if other_owner is not None:
                 path_conflict.append(f"{key} (owned by '{other_owner}')")
+                continue
+            # Claim the file atomically: a web upload with the same
+            # filename can land between classification and the download.
+            try:
+                reserve_upload_path(dest)
+            except UploadRejected:
+                file_conflict.append(key)
                 continue
             try:
                 await sound.save(dest)

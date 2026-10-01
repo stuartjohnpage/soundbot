@@ -17,9 +17,9 @@ import pytest
 from soundbot.bot import (
     Soundboard,
     deploy_commands,
-    duplicate_sound_message,
     sync_guild_commands,
 )
+from soundbot.ingest import duplicate_sound_message
 from soundbot.mixer import MixerSource
 from soundbot.pcm_cache import CachedPCMSource, PCMCache
 from soundbot.store import SoundStore
@@ -450,6 +450,43 @@ class TestImportSoundsPathConflict:
         assert "owner" in summary_calls[0].args[0]
 
 
+class TestImportSoundsReservation:
+    def test_file_appearing_after_classification_is_not_overwritten(
+        self, tmp_path, monkeypatch
+    ):
+        """Classification checks the disk, then the download awaits — a
+        web upload with the same filename can land in between. The import
+        must claim the file atomically and back off if it lost the race."""
+        from soundbot import config
+
+        cog = _make_cog(tmp_path)
+        sounds_dir = Path(cog.store._sounds_dir)
+        monkeypatch.setattr(config, "SOUNDS_DIR", sounds_dir)
+        # Simulate losing the race: classification saw no file, but by the
+        # time the import claims the path, someone else has written it.
+        monkeypatch.setattr(
+            "soundbot.bot.classify_import_sound", lambda *a: "needs_download"
+        )
+        winner = sounds_dir / "victim.ogg"
+        winner.write_bytes(b"web upload")
+        sound = MagicMock()
+        sound.name = "victim"
+        sound.id = 1234
+        sound.save = AsyncMock()
+        guild = MagicMock()
+        guild.name = "test-guild"
+        guild.fetch_soundboard_sounds = AsyncMock(return_value=[sound])
+        interaction = _make_interaction()
+        interaction.guild = guild
+
+        asyncio.run(Soundboard.importsounds.callback(cog, interaction))
+
+        sound.save.assert_not_awaited()
+        assert winner.read_bytes() == b"web upload"
+        summary = interaction.followup.send.call_args.args[0]
+        assert "File conflict 1" in summary
+
+
 class TestAddSoundClobberPrevention:
     """The error-path unlink in addsound used to clobber another entry's
     file. Pre-existing bug, surfaced in the second review of PR #18.
@@ -595,6 +632,24 @@ class TestAddSoundCacheInvalidation:
         )
 
         assert cache_key not in cog.pcm_cache
+
+
+class TestAddSoundUnregisteredFile:
+    def test_stray_file_on_disk_is_refused_and_untouched(self, tmp_path, monkeypatch):
+        cog, sounds_dir = _setup_addsound(tmp_path, monkeypatch)
+        stray = sounds_dir / "stray.mp3"
+        stray.write_bytes(b"not ours")
+        attachment = _make_attachment("stray.mp3")
+        interaction = _make_interaction()
+
+        asyncio.run(Soundboard.addsound.callback(cog, interaction, "stray", attachment))
+
+        attachment.save.assert_not_called()
+        assert stray.read_bytes() == b"not ours"
+        assert cog.store.get("stray") is None
+        args, kwargs = interaction.followup.send.call_args
+        assert "stray.mp3" in args[0]
+        assert kwargs.get("ephemeral") is True
 
 
 def _setup_addsound(tmp_path, monkeypatch, *, normalize=lambda p, t: None):
