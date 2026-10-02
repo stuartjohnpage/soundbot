@@ -17,9 +17,9 @@ import pytest
 from soundbot.bot import (
     Soundboard,
     deploy_commands,
-    duplicate_sound_message,
     sync_guild_commands,
 )
+from soundbot.ingest import duplicate_sound_message
 from soundbot.mixer import MixerSource
 from soundbot.pcm_cache import CachedPCMSource, PCMCache
 from soundbot.store import SoundStore
@@ -326,69 +326,6 @@ class TestRemoveSoundCacheInvalidation:
         assert cog.pcm_cache._cache == before
 
 
-class TestFindExistingByPath:
-    """Direct unit tests for the _find_existing_by_path helper. The
-    integration tests in TestAddSoundClobberPrevention exercise it
-    through addsound; these cover its contract independently so a future
-    refactor can move the iteration without losing coverage."""
-
-    def test_returns_name_when_path_matches(self, tmp_path):
-        cog = _make_cog(tmp_path)
-        sounds_dir = Path(cog.store._sounds_dir)
-        path = sounds_dir / "alpha.mp3"
-        path.write_bytes(b"")
-        cog.store.add("alpha", path)
-
-        assert cog._find_existing_by_path(path) == "alpha"
-
-    def test_returns_none_for_unowned_path(self, tmp_path):
-        cog = _make_cog(tmp_path)
-        sounds_dir = Path(cog.store._sounds_dir)
-        owned = sounds_dir / "alpha.mp3"
-        owned.write_bytes(b"")
-        cog.store.add("alpha", owned)
-
-        unowned = sounds_dir / "beta.mp3"
-        assert cog._find_existing_by_path(unowned) is None
-
-    def test_returns_none_on_empty_store(self, tmp_path):
-        cog = _make_cog(tmp_path)
-        sounds_dir = Path(cog.store._sounds_dir)
-        assert cog._find_existing_by_path(sounds_dir / "anything.mp3") is None
-
-    def test_finds_match_among_multiple_entries(self, tmp_path):
-        cog = _make_cog(tmp_path)
-        sounds_dir = Path(cog.store._sounds_dir)
-        for name in ("one", "two", "three"):
-            p = sounds_dir / f"{name}.mp3"
-            p.write_bytes(b"")
-            cog.store.add(name, p)
-
-        target = sounds_dir / "two.mp3"
-        assert cog._find_existing_by_path(target) == "two"
-
-    def test_resolves_relative_against_absolute(self, tmp_path, monkeypatch):
-        """The helper resolves both sides — same logical file via different
-        path representations (relative vs absolute) should still match."""
-        cog = _make_cog(tmp_path)
-        sounds_dir = Path(cog.store._sounds_dir)
-
-        # Store an entry with the absolute path
-        abs_path = (sounds_dir / "alpha.mp3").resolve()
-        abs_path.write_bytes(b"")
-        cog.store.add("alpha", abs_path)
-
-        # Look it up by a relative path that resolves to the same place
-        monkeypatch.chdir(sounds_dir)
-        assert cog._find_existing_by_path(Path("alpha.mp3")) == "alpha"
-
-    def test_does_not_raise_on_unusual_paths(self, tmp_path):
-        cog = _make_cog(tmp_path)
-        # Empty store: any input path should return None, never raise
-        assert cog._find_existing_by_path(Path("")) is None
-        assert cog._find_existing_by_path(Path("does/not/exist.mp3")) is None
-
-
 class TestImportSoundsPathConflict:
     """The same store-entry-path-collision guard that addsound got needs
     to fire in importsounds too: a fresh download of a Discord soundboard
@@ -448,6 +385,68 @@ class TestImportSoundsPathConflict:
         ]
         assert len(summary_calls) == 1
         assert "owner" in summary_calls[0].args[0]
+
+
+class TestImportSoundsReservation:
+    def test_file_appearing_after_classification_is_not_overwritten(
+        self, tmp_path, monkeypatch
+    ):
+        """Classification checks the disk, then the download awaits — a
+        web upload with the same filename can land in between. The import
+        must claim the file atomically and back off if it lost the race."""
+        from soundbot import config
+
+        cog = _make_cog(tmp_path)
+        sounds_dir = Path(cog.store._sounds_dir)
+        monkeypatch.setattr(config, "SOUNDS_DIR", sounds_dir)
+        # Simulate losing the race: classification saw no file, but by the
+        # time the import claims the path, someone else has written it.
+        monkeypatch.setattr(
+            "soundbot.bot.classify_import_sound", lambda *a: "needs_download"
+        )
+        winner = sounds_dir / "victim.ogg"
+        winner.write_bytes(b"web upload")
+        sound = MagicMock()
+        sound.name = "victim"
+        sound.id = 1234
+        sound.save = AsyncMock()
+        guild = MagicMock()
+        guild.name = "test-guild"
+        guild.fetch_soundboard_sounds = AsyncMock(return_value=[sound])
+        interaction = _make_interaction()
+        interaction.guild = guild
+
+        asyncio.run(Soundboard.importsounds.callback(cog, interaction))
+
+        sound.save.assert_not_awaited()
+        assert winner.read_bytes() == b"web upload"
+        summary = interaction.followup.send.call_args.args[0]
+        assert "File conflict 1" in summary
+
+    def test_cancelled_download_removes_the_placeholder(self, tmp_path, monkeypatch):
+        """The import reserves an empty placeholder before downloading.
+        Anything escaping the per-sound error handling (cancellation, an
+        unexpected exception) must not leave it behind, where it would
+        block the filename and register as a broken sound on restart."""
+        from soundbot import config
+
+        cog = _make_cog(tmp_path)
+        sounds_dir = Path(cog.store._sounds_dir)
+        monkeypatch.setattr(config, "SOUNDS_DIR", sounds_dir)
+        sound = MagicMock()
+        sound.name = "victim"
+        sound.id = 1234
+        sound.save = AsyncMock(side_effect=asyncio.CancelledError)
+        guild = MagicMock()
+        guild.name = "test-guild"
+        guild.fetch_soundboard_sounds = AsyncMock(return_value=[sound])
+        interaction = _make_interaction()
+        interaction.guild = guild
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(Soundboard.importsounds.callback(cog, interaction))
+
+        assert not (sounds_dir / "victim.ogg").exists()
 
 
 class TestAddSoundClobberPrevention:
@@ -595,6 +594,24 @@ class TestAddSoundCacheInvalidation:
         )
 
         assert cache_key not in cog.pcm_cache
+
+
+class TestAddSoundUnregisteredFile:
+    def test_stray_file_on_disk_is_refused_and_untouched(self, tmp_path, monkeypatch):
+        cog, sounds_dir = _setup_addsound(tmp_path, monkeypatch)
+        stray = sounds_dir / "stray.mp3"
+        stray.write_bytes(b"not ours")
+        attachment = _make_attachment("stray.mp3")
+        interaction = _make_interaction()
+
+        asyncio.run(Soundboard.addsound.callback(cog, interaction, "stray", attachment))
+
+        attachment.save.assert_not_called()
+        assert stray.read_bytes() == b"not ours"
+        assert cog.store.get("stray") is None
+        args, kwargs = interaction.followup.send.call_args
+        assert "stray.mp3" in args[0]
+        assert kwargs.get("ephemeral") is True
 
 
 def _setup_addsound(tmp_path, monkeypatch, *, normalize=lambda p, t: None):

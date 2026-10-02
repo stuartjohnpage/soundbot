@@ -187,6 +187,22 @@ class TestFfprobeTimeout:
                 get_duration(fake_file)
 
 
+class TestErrorMessagesHideServerPaths:
+    """These messages reach users verbatim (Discord replies and web API
+    error details), so they name the file, never its server path."""
+
+    def test_unreadable_file_names_only_the_basename(self, tmp_path):
+        bad = tmp_path / "secret-dir" / "junk.mp3"
+        bad.parent.mkdir()
+        bad.write_bytes(b"not audio")
+        failed = subprocess.CalledProcessError(1, "ffprobe")
+        with patch("soundbot.audio.subprocess.run", side_effect=failed):
+            with pytest.raises(ValueError) as exc_info:
+                get_duration(bad)
+        assert "junk.mp3" in str(exc_info.value)
+        assert "secret-dir" not in str(exc_info.value)
+
+
 @pytest.fixture()
 def loud_wav(tmp_path):
     """Generate a 2-second sine well above the -16 LUFS target (~-7 LUFS).

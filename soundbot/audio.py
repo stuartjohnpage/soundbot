@@ -1,8 +1,11 @@
 import json
+import logging
 import os
 import re
 import subprocess
 from pathlib import Path
+
+logger = logging.getLogger("soundbot")
 
 # ebur128 prints a summary block on stderr; these pull the integrated
 # loudness and true peak out of it. Same patterns as scripts/measure_loudness.py.
@@ -48,13 +51,13 @@ def get_duration(file_path: Path) -> float:
     except subprocess.TimeoutExpired as exc:
         raise ValueError("Audio file could not be processed (timed out)") from exc
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        raise ValueError(f"Cannot read audio file: {file_path}") from exc
+        raise ValueError(f"Cannot read audio file: '{file_path.name}'") from exc
 
     data = json.loads(result.stdout)
     try:
         return float(data["format"]["duration"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"Cannot determine duration of: {file_path}") from exc
+        raise ValueError(f"Cannot determine duration of: '{file_path.name}'") from exc
 
 
 def has_video_stream(file_path: Path) -> bool:
@@ -111,9 +114,9 @@ def extract_audio(video_path: Path, output_path: Path) -> None:
         )
         data = json.loads(result.stdout)
         if not data.get("streams"):
-            raise ValueError(f"Video has no audio track: {video_path}")
+            raise ValueError(f"Video has no audio track: '{video_path.name}'")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        raise ValueError(f"Cannot read file: {video_path}") from exc
+        raise ValueError(f"Cannot read file: '{video_path.name}'") from exc
     except (json.JSONDecodeError, ValueError):
         raise
 
@@ -132,7 +135,7 @@ def extract_audio(video_path: Path, output_path: Path) -> None:
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         output_path.unlink(missing_ok=True)
-        raise ValueError(f"Failed to extract audio from: {video_path}") from exc
+        raise ValueError(f"Failed to extract audio from: '{video_path.name}'") from exc
 
 
 def validate_sound(file_path: Path, max_duration: float) -> None:
@@ -175,9 +178,12 @@ def trim_audio(file_path: Path, max_duration: float) -> None:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         # OSError subsumes FileNotFoundError (ffmpeg not installed).
         tmp.unlink(missing_ok=True)
+        # ffmpeg's stderr goes to the log, not the message: it echoes the
+        # full server path, and this message is shown to users.
         stderr = getattr(exc, "stderr", None)
-        detail = f": {stderr[-300:]}" if stderr else ""
-        raise ValueError(f"Failed to trim {file_path}{detail}") from exc
+        if stderr:
+            logger.warning("ffmpeg trim failed for %s: %s", file_path, stderr[-300:])
+        raise ValueError(f"Failed to trim '{file_path.name}'") from exc
 
 
 def measure_loudness(file_path: Path) -> tuple[float, float]:
@@ -203,12 +209,12 @@ def measure_loudness(file_path: Path) -> tuple[float, float]:
     except subprocess.TimeoutExpired as exc:
         raise ValueError("Loudness measurement timed out") from exc
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        raise ValueError(f"Cannot read audio file: {file_path}") from exc
+        raise ValueError(f"Cannot read audio file: '{file_path.name}'") from exc
 
     integrated = _INTEGRATED_RE.search(result.stderr)
     true_peak = _TRUE_PEAK_RE.search(result.stderr)
     if not integrated or not true_peak:
-        raise ValueError(f"Cannot measure loudness of: {file_path}")
+        raise ValueError(f"Cannot measure loudness of: '{file_path.name}'")
     return float(integrated.group(1)), float(true_peak.group(1))
 
 
@@ -256,7 +262,10 @@ def normalize_loudness(file_path: Path, target_lufs: float) -> float | None:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         # OSError subsumes FileNotFoundError (ffmpeg not installed).
         tmp.unlink(missing_ok=True)
+        # Same as trim_audio: ffmpeg's stderr echoes the full server path,
+        # so it goes to the log rather than into the message.
         stderr = getattr(exc, "stderr", None)
-        detail = f": {stderr[-300:]}" if stderr else ""
-        raise ValueError(f"Failed to normalize {file_path}{detail}") from exc
+        if stderr:
+            logger.warning("ffmpeg normalize failed for %s: %s", file_path, stderr[-300:])
+        raise ValueError(f"Failed to normalize '{file_path.name}'") from exc
     return gain

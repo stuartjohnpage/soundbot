@@ -444,6 +444,33 @@ class TestUpload:
         assert path.read_bytes() == b"bytes-of-first"
         assert store.get("second") is None
 
+    def test_extraction_target_conflict_is_409(self, tmp_path, monkeypatch):
+        """A video whose extracted .mp3 name is already taken is a file
+        conflict like any other, so 409 — not the 400 of bad audio."""
+        client, store, sounds_dir = _make_client(tmp_path)
+        monkeypatch.setattr("soundbot.ingest.has_video_stream", lambda p: True)
+        stray = sounds_dir / "clip.mp3"
+        stray.write_bytes(b"not ours")
+
+        resp = _upload(client, name="clip", filename="clip.mp4", content=b"v")
+
+        assert resp.status_code == 409
+        assert stray.read_bytes() == b"not ours"
+        assert not (sounds_dir / "clip.mp4").exists()
+
+    def test_unregistered_file_on_disk_is_409_and_untouched(self, tmp_path):
+        """A stray file in sounds/ that no entry owns must not be
+        overwritten (or deleted on a failed upload)."""
+        client, store, sounds_dir = _make_client(tmp_path)
+        stray = sounds_dir / "stray.wav"
+        stray.write_bytes(b"not ours")
+
+        resp = _upload(client, name="stray", filename="stray.wav", content=b"x")
+
+        assert resp.status_code == 409
+        assert stray.read_bytes() == b"not ours"
+        assert store.get("stray") is None
+
     @_skip_no_ffmpeg
     def test_path_traversal_filename_is_neutralized(self, tmp_path):
         """A '../'-laden filename must not escape sounds_dir. Same
@@ -527,14 +554,16 @@ class TestUpload:
         assert dest_key not in cache
 
     def test_unexpected_error_does_not_orphan_partial_file(self, tmp_path, monkeypatch):
-        """A non-ValueError failure (disk full, transient AV lock on
-        Windows) must not leave a partial file in sounds_dir, where the
-        next scan_folder() would register it as a broken sound."""
+        """A non-ValueError failure inside the pipeline (disk full, a
+        transient AV lock on Windows) must not leave a partial file in
+        sounds_dir, where it would block the filename and register as a
+        broken sound on the next scan_folder()."""
 
         def explode(*args, **kwargs):
             raise OSError("disk full")
 
-        monkeypatch.setattr("soundbot.web.process_upload", explode)
+        monkeypatch.setattr("soundbot.ingest.has_video_stream", lambda p: False)
+        monkeypatch.setattr("soundbot.ingest.get_duration", explode)
         client, store, sounds_dir = _make_client(tmp_path)
 
         with pytest.raises(OSError):
