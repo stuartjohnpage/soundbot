@@ -13,6 +13,7 @@ A Discord soundboard bot with no limits. Play sound clips in voice channels usin
 - Optional categories and tags for organization — tags filter `/play`, `/random` and `/board`
 - Uploads (including video files) are auto-trimmed to 6.4s and loudness-normalized
 - Optional web admin panel for managing the library from a browser
+- Optional auto-join: on one nominated server, the bot walks into named voice channels by itself as soon as someone is in them
 - Auto-leaves the voice channel after 10 minutes alone (configurable)
 - Global volume control
 - Play count tracking and file logging
@@ -157,9 +158,50 @@ All settings are environment variables, configured in `.env`:
 | `LOG_FILE` | `./soundbot.log` | Log file path (rotating, 5MB, 3 backups) |
 | `SYNC_COMMANDS` | `true` | Sync slash commands per-guild on startup and on join. Set to `false` to skip syncing entirely. |
 | `IDLE_TIMEOUT` | `600` | Seconds the bot may sit alone in a voice channel (no humans, bots don't count) before it disconnects itself. `0` disables auto-leave. |
+| `AUTO_JOIN_GUILD` | *(empty)* | The one server auto-join applies to, by name or id. Empty = auto-join disabled. |
+| `AUTO_JOIN_CHANNELS` | *(empty)* | Comma-separated voice channels to watch on that server, by name or id. Empty = auto-join disabled. |
+| `AUTO_JOIN_COOLDOWN` | `300` | Seconds a deliberate exit keeps auto-join muted in that server. `0` = no mute. |
 | `WEB_TOKEN` | *(empty)* | Auth token for the web admin panel. Empty = panel disabled. |
 | `WEB_HOST` | `0.0.0.0` | Interface the web panel binds to inside the container. |
 | `WEB_PORT` | `8000` | Port for the web admin panel. |
+
+## Auto-Join
+
+The bot can join voice on its own, so nobody has to run `/join` first. Name
+one server and the voice channels to watch on it:
+
+```
+AUTO_JOIN_GUILD=Anti-Union
+AUTO_JOIN_CHANNELS=Chillin,Deadlock,CS2
+```
+
+The moment a person appears in one of those channels, the bot connects to it.
+Both settings take either a name or a Discord id — ids survive a rename, so
+use them for channels you expect to rename (turn on **Developer Mode** in
+Discord settings, then right-click a server or channel and **Copy ID**). Name
+matching ignores case; a value that is all digits is only ever read as an id.
+
+**Disabled by default.** Leaving either setting empty turns auto-join off
+entirely, and it only ever applies to the single server in
+`AUTO_JOIN_GUILD` — the bot's other servers keep behaving exactly as before.
+
+Three rules keep it from becoming a nuisance:
+
+- **It stays put.** If the bot is already in voice on that server, a join in
+  another watched channel is ignored rather than making it hop — that would
+  cut off whoever is still listening in the first channel.
+- **A deliberate exit mutes it.** `/leave`, or disconnecting the bot by hand
+  in Discord, suppresses auto-join on that server for `AUTO_JOIN_COOLDOWN`
+  seconds (default 5 minutes). Without that, the next person to walk in would
+  drag the bot straight back and `/leave` would look broken. `/join` clears
+  the mute again, and `AUTO_JOIN_COOLDOWN=0` drops it entirely.
+- **Auto-leave doesn't mute it.** Disconnecting after `IDLE_TIMEOUT` alone
+  means "nobody is here", not "go away", so the next arrival is picked up
+  normally.
+
+Auto-join reacts to people arriving, so a bot restart leaves it out of voice
+until the next person joins or re-joins a watched channel. Other bots joining
+never count.
 
 ## Data and Persistence
 
