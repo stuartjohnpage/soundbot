@@ -8,6 +8,7 @@ plumbing is mocked rather than stood up; the goal here is to exercise
 the cog's own logic, not Discord's dispatcher.
 """
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,6 +17,7 @@ import pytest
 
 from soundbot.bot import (
     Soundboard,
+    _matches_ref,
     deploy_commands,
     sync_guild_commands,
 )
@@ -1778,6 +1780,47 @@ class TestShutdownSignalHandler:
         assert install_shutdown_handler(MagicMock(), loop) is False
 
 
+class TestMatchesRef:
+    """Auto-join config names a guild or channel by snowflake id or by name.
+    _matches_ref is pure, so it is tested directly rather than through a
+    voice-state update."""
+
+    def test_digits_match_the_id(self):
+        assert _matches_ref("42", 42, "Chillin") is True
+
+    def test_digits_never_match_a_name(self):
+        """The documented trade-off: a channel literally named "42" can only
+        be configured by its id, because an all-digit ref is read as one."""
+        assert _matches_ref("42", 99, "42") is False
+
+    def test_name_matches_exactly(self):
+        assert _matches_ref("Chillin", 1, "Chillin") is True
+
+    def test_name_match_ignores_case(self):
+        assert _matches_ref("CHILLIN", 1, "chillin") is True
+
+    def test_name_match_folds_rather_than_lowercases(self):
+        """casefold, not lower: Discord channel names are free-form Unicode,
+        and lower() would miss equivalences like this one."""
+        assert _matches_ref("STRASSE", 1, "straße") is True
+
+    def test_different_name_does_not_match(self):
+        assert _matches_ref("Chillin", 1, "General") is False
+
+    def test_surrounding_whitespace_is_ignored(self):
+        assert _matches_ref("  Chillin  ", 1, "Chillin") is True
+
+    @pytest.mark.parametrize("ref", ["", "   "])
+    def test_blank_ref_matches_nothing(self, ref):
+        """config.py already drops blanks; this keeps the helper safe for any
+        later caller that does not."""
+        assert _matches_ref(ref, 1, "Chillin") is False
+
+    def test_nameless_object_only_matches_by_id(self):
+        assert _matches_ref("Chillin", 1, None) is False
+        assert _matches_ref("1", 1, None) is True
+
+
 class TestAutoJoinWatchedChannels:
     """The bot joins a watched voice channel by itself the moment a human
     lands in it, scoped to the one guild named by AUTO_JOIN_GUILD so other
@@ -2042,18 +2085,29 @@ class TestAutoJoinWatchedChannels:
 
         assert channel.connect.await_count == 1
 
-    def test_connect_failure_is_logged_not_raised(self, cog):
+    def test_connect_failure_is_logged_and_the_next_arrival_retries(
+        self, cog, caplog
+    ):
         """discord.py turns a listener exception into a bare traceback; a
-        channel the bot cannot enter must not produce one every arrival."""
-        channel = self._channel("Chillin")
-        channel.connect = AsyncMock(
-            side_effect=discord.ClientException("already connected")
+        channel the bot cannot enter must log the cause instead, and must not
+        poison the guild against later attempts."""
+        caplog.set_level(logging.WARNING, logger="soundbot")
+        failing = self._channel("Chillin")
+        failing.connect = AsyncMock(
+            side_effect=discord.ClientException("no Connect permission")
         )
 
-        self._arrive(cog, channel)
+        self._arrive(cog, failing)
 
         assert cog.mixers == {}
         assert GUILD_ID not in cog._autojoin_pending
+        assert "no Connect permission" in caplog.text
+        # A failure is not a mute: the comment promises the next arrival
+        # retries, so pin that rather than trusting it.
+        assert cog._autojoin_muted_until == {}
+        retry = self._channel("Chillin")
+        self._arrive(cog, retry)
+        retry.connect.assert_awaited_once()
 
     # -- Mute window after a deliberate exit --
 
@@ -2165,6 +2219,57 @@ class TestAutoJoinWatchedChannels:
         until = cog._autojoin_muted_until[GUILD_ID]
         channel = self._channel("Chillin")
         self._arrive(cog, channel, now=until - 1)
+        channel.connect.assert_not_awaited()
+
+    def test_external_disconnect_still_deletes_the_boards(self, cog, tmp_path):
+        """The stray-mixer branch runs ahead of board cleanup in the same
+        method, so the two have to be exercised together: an early return
+        added there later would strand boards with a green suite."""
+        from soundbot.boards import BoardTracker
+
+        cog.boards = BoardTracker(tmp_path / "boards.json")
+        cog.boards.add(GUILD_ID, channel_id=42, message_id=1001)
+        cog.mixers[GUILD_ID] = MixerSource()
+        deleted = []
+
+        def partial_messageable(channel_id):
+            messageable = MagicMock()
+
+            def partial_message(message_id):
+                message = MagicMock()
+
+                async def delete():
+                    deleted.append((channel_id, message_id))
+
+                message.delete = delete
+                return message
+
+            messageable.get_partial_message = partial_message
+            return messageable
+
+        cog.bot.get_partial_messageable = partial_messageable
+
+        self._bot_left_voice(cog)
+
+        assert deleted == [(42, 1001)]
+        assert GUILD_ID not in cog.mixers
+        assert GUILD_ID in cog._autojoin_muted_until
+
+    def test_the_bots_own_arrival_does_not_recurse_into_autojoin(self, cog):
+        """The bot joining a watched channel fires its own voice-state
+        update; routing that back into auto-join would loop."""
+        channel = self._channel("Chillin")
+        member = MagicMock()
+        member.id = self.BOT_ID
+        member.bot = True
+        member.guild = channel.guild
+        before_state = MagicMock()
+        before_state.channel = None
+        after_state = MagicMock()
+        after_state.channel = channel
+
+        asyncio.run(cog.on_voice_state_update(member, before_state, after_state))
+
         channel.connect.assert_not_awaited()
 
     def test_teardown_exit_leaves_no_stray_mixer_to_mute_on(self, cog):
