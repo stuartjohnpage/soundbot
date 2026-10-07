@@ -1,1 +1,2 @@
 - [Project stack](project_stack.md) — discord.py + ffmpeg PCM at 48kHz; cog handlers tested via .callback() + mock Interaction in tests/test_bot.py
+- [discord.py voice internals](discordpy_voice_internals.md) — verified connect/disconnect await ordering; use before judging any voice race claim in bot.py

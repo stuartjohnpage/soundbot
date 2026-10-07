@@ -139,6 +139,22 @@ def parse_emoji_key(raw: str) -> str:
     return candidate
 
 
+def _matches_ref(ref: str, obj_id: int, name: str | None) -> bool:
+    """True if `ref` names this guild or channel, by snowflake id or name.
+
+    Config accepts either form so an admin can write `Lounge` without
+    turning on developer mode, while ids stay available for channels whose
+    names drift. An all-digit ref is only ever read as an id, so a channel
+    literally named "1234" has to be configured by its id.
+    """
+    ref = ref.strip()
+    if not ref:
+        return False
+    if ref.isdigit():
+        return int(ref) == obj_id
+    return name is not None and ref.casefold() == name.casefold()
+
+
 def _admin_check() -> app_commands.check:
     """Check that the invoking user has the configured admin role."""
 
@@ -182,6 +198,15 @@ class Soundboard(commands.Cog):
         # voice channel. Entries live only while the bot stays alone;
         # _disconnect_if_idle prunes them the moment company arrives.
         self._alone_since: dict[int, float] = {}
+        # guild id -> monotonic deadline until which auto-join stays muted
+        # after a deliberate exit. Pruned on the first arrival past it.
+        self._autojoin_muted_until: dict[int, float] = {}
+        # Guilds with an auto-join handshake in flight. discord.py happens
+        # to register guild.voice_client synchronously inside connect(), so
+        # the voice_client check in _maybe_autojoin already turns a second
+        # arrival away; this keeps that from depending on an internal
+        # ordering discord.py never promised.
+        self._autojoin_pending: set[int] = set()
 
     async def cog_load(self) -> None:
         self._save_loop.start()
@@ -215,10 +240,11 @@ class Soundboard(commands.Cog):
         if interaction.guild.voice_client:
             await interaction.guild.voice_client.move_to(channel)
         else:
-            vc = await channel.connect()
-            mixer = MixerSource(volume=self.volume)
-            self.mixers[interaction.guild.id] = mixer
-            vc.play(mixer)
+            await self._connect_voice(channel)
+        # /join is the exact opposite intent to the /leave that armed any
+        # mute, so clear it: otherwise a later auto-leave would be followed
+        # by auto-join mysteriously refusing to fire.
+        self._unmute_autojoin(interaction.guild.id)
         await interaction.followup.send(f"Joined **{channel.name}**.")
 
     @app_commands.command(name="leave", description="Bot leaves the voice channel")
@@ -233,8 +259,30 @@ class Soundboard(commands.Cog):
         # Defer for the same reason as /join: disconnect() waits on the
         # gateway to confirm, which can outlast the 3-second window.
         await interaction.response.defer()
+        # Mute before tearing down, not after: without it the next arrival in
+        # a watched channel would drag the bot straight back in and /leave
+        # would look broken. Arming first also holds if disconnect() raises,
+        # and does not lean on discord.py clearing guild.voice_client only
+        # after its own await.
+        self._mute_autojoin(interaction.guild, time.monotonic())
         await self._teardown_voice(vc)
         await interaction.followup.send("Left the voice channel.")
+
+    async def _connect_voice(
+        self, channel: "discord.VoiceChannel | discord.StageChannel"
+    ) -> discord.VoiceClient:
+        """Connect to `channel` and put that guild's mixer on the air.
+
+        The counterpart to _teardown_voice, shared by /join and auto-join,
+        and keyed off channel.guild exactly as that one keys off vc.guild:
+        _play_sound looks the mixer up by guild id, so it has to be
+        registered before the voice client starts playing.
+        """
+        vc = await channel.connect()
+        mixer = MixerSource(volume=self.volume)
+        vc.play(mixer)
+        self.mixers[channel.guild.id] = mixer
+        return vc
 
     async def _teardown_voice(self, vc: discord.VoiceProtocol) -> None:
         """Stop the mixer and disconnect — the one true voice teardown.
@@ -287,7 +335,7 @@ class Soundboard(commands.Cog):
             gid: t for gid, t in self._alone_since.items() if gid in alone
         }
 
-    # -- Board cleanup --
+    # -- Voice-state reactions --
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -296,24 +344,162 @@ class Soundboard(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        """Delete a guild's boards once the bot leaves voice there.
+        """Route every voice-state change to the half that cares about it.
+
+        discord.py funnels all of them through this one listener: the
+        bot's own updates drive cleanup after it leaves, everyone else's
+        drive auto-join.
+        """
+        if self.bot.user is not None and member.id == self.bot.user.id:
+            await self._handle_own_voice_change(member, before, after)
+            return
+        await self._maybe_autojoin(member, before, after, time.monotonic())
+
+    async def _handle_own_voice_change(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Delete the guild's boards, and mute auto-join if this exit was
+        not the bot's own doing.
 
         Every way out — /leave, idle auto-leave, someone disconnecting the
         bot — arrives as the bot's own voice-state update, so this is the
         single cleanup trigger. A move between channels (after.channel
-        set) keeps the boards: the bot is still in voice to serve them.
+        set) changes nothing: the bot is still in voice to serve its
+        boards.
         """
-        if self.bot.user is None or member.id != self.bot.user.id:
-            return
         if before.channel is None or after.channel is not None:
             return
-        boards = self.boards.pop_guild(member.guild.id)
+        guild_id = member.guild.id
+        # _teardown_voice drops the mixer *before* awaiting the disconnect,
+        # so a mixer still parked here means this exit did not come from our
+        # own teardown: someone hit Disconnect on the bot, the channel was
+        # deleted, the bot was removed from the guild, or the voice
+        # connection failed terminally. Discord does not say which, so treat
+        # them all as deliberate — mute rather than bounce straight back
+        # into a channel something just ejected us from — and clean up the
+        # mixer no teardown got to.
+        stray = self.mixers.pop(guild_id, None)
+        if stray is not None:
+            stray.stop()
+            stray.cleanup()
+            self._mute_autojoin(member.guild, time.monotonic())
+            logger.info(
+                "voice ended outside teardown in guild_id=%s; "
+                "muting auto-join", guild_id,
+            )
+        boards = self.boards.pop_guild(guild_id)
         if boards:
             logger.info(
                 "left voice in guild_id=%s; deleting %d board(s)",
-                member.guild.id, len(boards),
+                guild_id, len(boards),
             )
             await self._delete_boards(boards)
+
+    # -- Auto-join --
+
+    def _mute_autojoin(self, guild: discord.Guild, now: float) -> None:
+        """Hold auto-join off in `guild` for AUTO_JOIN_COOLDOWN seconds.
+
+        A no-op when the cooldown is 0, and when `guild` is not the one
+        auto-join covers: /leave runs on every server, and a deadline for a
+        guild that can never auto-join would sit there unread forever, since
+        _autojoin_muted only ever prunes the guild it is asked about.
+        """
+        if config.AUTO_JOIN_COOLDOWN <= 0 or not self._is_autojoin_guild(guild):
+            return
+        self._autojoin_muted_until[guild.id] = now + config.AUTO_JOIN_COOLDOWN
+
+    def _unmute_autojoin(self, guild_id: int) -> None:
+        """Re-arm auto-join in `guild_id` now, whatever time was left."""
+        self._autojoin_muted_until.pop(guild_id, None)
+
+    def _autojoin_muted(self, guild_id: int, now: float) -> bool:
+        """Whether auto-join is still muted in `guild_id`, pruning if not."""
+        until = self._autojoin_muted_until.get(guild_id)
+        if until is None:
+            return False
+        if now >= until:
+            del self._autojoin_muted_until[guild_id]
+            return False
+        return True
+
+    def _is_autojoin_guild(self, guild: discord.Guild) -> bool:
+        """Whether auto-join is turned on and covers `guild`.
+
+        Either setting left empty disables the feature: a channel list with
+        no guild scope is ambiguous, not a licence to join every server.
+        """
+        if not config.AUTO_JOIN_GUILD or not config.AUTO_JOIN_CHANNELS:
+            return False
+        return _matches_ref(config.AUTO_JOIN_GUILD, guild.id, guild.name)
+
+    def _is_watched(self, channel: discord.abc.GuildChannel) -> bool:
+        """Whether `channel` is one of the auto-join channels."""
+        if not self._is_autojoin_guild(channel.guild):
+            return False
+        return any(
+            _matches_ref(ref, channel.id, channel.name)
+            for ref in config.AUTO_JOIN_CHANNELS
+        )
+
+    async def _maybe_autojoin(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+        now: float,
+    ) -> None:
+        """Join a watched voice channel the moment a human lands in it.
+
+        `now` is monotonic time, passed in (rather than read here) so tests
+        can drive the mute window explicitly, as _disconnect_if_idle does.
+
+        The bot stays put if it is already in voice in that guild: chasing
+        the newest arrival would yank it away from whoever is mid-session
+        in another channel.
+        """
+        if member.bot:
+            return
+        channel = after.channel
+        # Mutes, deafens and go-live all fire with the channel unchanged;
+        # none of them is an arrival.
+        if channel is None or channel == before.channel:
+            return
+        if not self._is_watched(channel):
+            return
+        guild = member.guild
+        # Deliberately `is not None`, not the is_connected() this file uses
+        # elsewhere: discord.py registers the voice client before the
+        # handshake finishes, and that window is exactly when a second
+        # arrival has to be turned away. is_connected() would reopen the
+        # double-connect race.
+        if guild.voice_client is not None:
+            return
+        if self._autojoin_muted(guild.id, now):
+            return
+        if guild.id in self._autojoin_pending:
+            return
+        self._autojoin_pending.add(guild.id)
+        try:
+            logger.info(
+                "auto-joining %s for %s in guild_id=%s",
+                channel.name, member, guild.id,
+            )
+            await self._connect_voice(channel)
+        except (discord.DiscordException, asyncio.TimeoutError, OSError) as exc:
+            # connect() fails for reasons outside the bot's control: no
+            # Connect permission, a full channel, a handshake that times
+            # out. Raising here would only print a traceback per arrival,
+            # so log the cause and let the next arrival retry.
+            logger.warning(
+                "auto-join of %s in guild_id=%s failed: %s",
+                channel.name, guild.id, exc,
+            )
+        finally:
+            self._autojoin_pending.discard(guild.id)
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:

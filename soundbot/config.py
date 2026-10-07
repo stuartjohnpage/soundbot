@@ -23,6 +23,23 @@ SYNC_COMMANDS: bool = os.getenv("SYNC_COMMANDS", "true").lower() == "true"
 # Seconds the bot may sit alone (no human members) in a voice channel
 # before disconnecting itself. 0 disables auto-leave.
 IDLE_TIMEOUT: float = float(os.getenv("IDLE_TIMEOUT", "600"))
+# Auto-join: the bot walks into a watched voice channel on its own the
+# moment a human appears there. Scoped to the single guild named by
+# AUTO_JOIN_GUILD so the bot's other servers never get surprise joins;
+# leaving either setting empty disables the feature outright.
+# Both accept a snowflake id or a (case-insensitive) name -- ids survive a
+# rename, names save hunting through Discord's developer mode.
+AUTO_JOIN_GUILD: str = os.getenv("AUTO_JOIN_GUILD", "").strip()
+AUTO_JOIN_CHANNELS: tuple[str, ...] = tuple(
+    ref.strip()
+    for ref in os.getenv("AUTO_JOIN_CHANNELS", "").split(",")
+    if ref.strip()
+)
+# Seconds a deliberate exit (/leave, or someone disconnecting the bot in
+# Discord) suppresses auto-join in that guild, so the bot does not bounce
+# straight back in on the next arrival. 0 = no suppression.
+AUTO_JOIN_COOLDOWN: float = float(os.getenv("AUTO_JOIN_COOLDOWN", "300"))
+
 # Web admin panel (issue #1). Empty token = panel disabled entirely.
 WEB_TOKEN: str = os.getenv("WEB_TOKEN", "")
 WEB_HOST: str = os.getenv("WEB_HOST", "0.0.0.0")

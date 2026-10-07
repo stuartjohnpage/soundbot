@@ -8,6 +8,7 @@ plumbing is mocked rather than stood up; the goal here is to exercise
 the cog's own logic, not Discord's dispatcher.
 """
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,6 +17,7 @@ import pytest
 
 from soundbot.bot import (
     Soundboard,
+    _matches_ref,
     deploy_commands,
     sync_guild_commands,
 )
@@ -57,6 +59,7 @@ def _make_interaction(*, voice_client=None, response_done: bool = False):
     interaction.user.__str__ = MagicMock(return_value="test-user")
     interaction.user.voice = MagicMock()
     interaction.user.voice.channel = MagicMock()
+    interaction.user.voice.channel.guild = interaction.guild
     # Default to the happy path for the same-VC gate (issue #17): the
     # user sits in the bot's channel. Gate tests override one side.
     if voice_client is not None:
@@ -1775,3 +1778,509 @@ class TestShutdownSignalHandler:
         loop.add_signal_handler.side_effect = NotImplementedError
 
         assert install_shutdown_handler(MagicMock(), loop) is False
+
+
+class TestMatchesRef:
+    """Auto-join config names a guild or channel by snowflake id or by name.
+    _matches_ref is pure, so it is tested directly rather than through a
+    voice-state update."""
+
+    def test_digits_match_the_id(self):
+        assert _matches_ref("42", 42, "Lounge") is True
+
+    def test_digits_never_match_a_name(self):
+        """The documented trade-off: a channel literally named "42" can only
+        be configured by its id, because an all-digit ref is read as one."""
+        assert _matches_ref("42", 99, "42") is False
+
+    def test_name_matches_exactly(self):
+        assert _matches_ref("Lounge", 1, "Lounge") is True
+
+    def test_name_match_ignores_case(self):
+        assert _matches_ref("LOUNGE", 1, "lounge") is True
+
+    def test_name_match_folds_rather_than_lowercases(self):
+        """casefold, not lower: Discord channel names are free-form Unicode,
+        and lower() would miss equivalences like this one."""
+        assert _matches_ref("STRASSE", 1, "straße") is True
+
+    def test_different_name_does_not_match(self):
+        assert _matches_ref("Lounge", 1, "General") is False
+
+    def test_surrounding_whitespace_is_ignored(self):
+        assert _matches_ref("  Lounge  ", 1, "Lounge") is True
+
+    @pytest.mark.parametrize("ref", ["", "   "])
+    def test_blank_ref_matches_nothing(self, ref):
+        """config.py already drops blanks; this keeps the helper safe for any
+        later caller that does not."""
+        assert _matches_ref(ref, 1, "Lounge") is False
+
+    def test_nameless_object_only_matches_by_id(self):
+        assert _matches_ref("Lounge", 1, None) is False
+        assert _matches_ref("1", 1, None) is True
+
+
+class TestAutoJoinWatchedChannels:
+    """The bot joins a watched voice channel by itself the moment a human
+    lands in it, scoped to the one guild named by AUTO_JOIN_GUILD so other
+    servers never get surprise joins.
+
+    The mute window after a deliberate exit is clock-driven, so tests read
+    the deadline the code set and probe either side of it rather than
+    patching time.monotonic — asyncio runs on that same clock.
+    """
+
+    GUILD_NAME = "Watched Server"
+    WATCHED = ("Lounge", "Gaming", "Movie Night")
+    COOLDOWN = 300.0
+    BOT_ID = 999
+    NOW = 1000.0
+
+    @pytest.fixture
+    def cog(self, tmp_path, monkeypatch):
+        from soundbot import config
+
+        monkeypatch.setattr(config, "AUTO_JOIN_GUILD", self.GUILD_NAME)
+        monkeypatch.setattr(config, "AUTO_JOIN_CHANNELS", self.WATCHED)
+        monkeypatch.setattr(config, "AUTO_JOIN_COOLDOWN", self.COOLDOWN)
+        cog = _make_cog(tmp_path)
+        cog.bot.user.id = self.BOT_ID
+        cog.bot.voice_clients = []
+        return cog
+
+    def _channel(self, name, *, channel_id=1, guild_id=GUILD_ID, guild_name=None):
+        channel = MagicMock()
+        # Plain assignment: MagicMock(name=...) names the mock, not the attr.
+        channel.name = name
+        channel.id = channel_id
+        channel.guild.id = guild_id
+        channel.guild.name = self.GUILD_NAME if guild_name is None else guild_name
+        channel.guild.voice_client = None
+        channel.connect = AsyncMock(return_value=MagicMock())
+        return channel
+
+    def _member(self, channel, *, is_bot=False):
+        member = MagicMock()
+        member.id = 1234
+        member.bot = is_bot
+        member.guild = channel.guild
+        return member
+
+    def _arrive(self, cog, channel, *, member=None, before=None, now=None):
+        """Dispatch "someone moved into `channel`" at `now`."""
+        member = self._member(channel) if member is None else member
+        before_state = MagicMock()
+        before_state.channel = before
+        after_state = MagicMock()
+        after_state.channel = channel
+        asyncio.run(
+            cog._maybe_autojoin(
+                member,
+                before_state,
+                after_state,
+                self.NOW if now is None else now,
+            )
+        )
+
+    def _leave_interaction(self, *, voice_client, guild_id=GUILD_ID, guild_name=None):
+        """An interaction from the auto-join guild, so a mute can arm."""
+        interaction = _make_interaction(voice_client=voice_client)
+        interaction.guild.id = guild_id
+        interaction.guild.name = self.GUILD_NAME if guild_name is None else guild_name
+        return interaction
+
+    def _bot_left_voice(self, cog, *, guild_id=GUILD_ID):
+        """Dispatch the bot's own "disconnected from voice" update."""
+        member = MagicMock()
+        member.id = self.BOT_ID
+        member.guild.id = guild_id
+        member.guild.name = self.GUILD_NAME
+        before_state = MagicMock()
+        before_state.channel = MagicMock()
+        after_state = MagicMock()
+        after_state.channel = None
+        asyncio.run(cog.on_voice_state_update(member, before_state, after_state))
+
+    # -- Matching --
+
+    def test_human_joining_watched_channel_connects_and_starts_mixer(self, cog):
+        channel = self._channel("Lounge")
+
+        self._arrive(cog, channel)
+
+        channel.connect.assert_awaited_once()
+        vc = channel.connect.return_value
+        vc.play.assert_called_once_with(cog.mixers[GUILD_ID])
+
+    @pytest.mark.parametrize("name", ["Lounge", "Gaming", "Movie Night"])
+    def test_every_configured_channel_is_watched(self, cog, name):
+        channel = self._channel(name)
+
+        self._arrive(cog, channel)
+
+        channel.connect.assert_awaited_once()
+
+    def test_unwatched_channel_in_the_same_guild_is_ignored(self, cog):
+        channel = self._channel("General")
+
+        self._arrive(cog, channel)
+
+        channel.connect.assert_not_awaited()
+        assert cog.mixers == {}
+
+    def test_watched_name_in_another_guild_is_ignored(self, cog):
+        """The whole point of the guild scope: a Gaming channel on some
+        other server must not pull the bot in."""
+        channel = self._channel(
+            "Gaming", guild_id=777, guild_name="Some Other Server"
+        )
+
+        self._arrive(cog, channel)
+
+        channel.connect.assert_not_awaited()
+
+    def test_channel_name_match_is_case_insensitive(self, cog):
+        channel = self._channel("lounge")
+
+        self._arrive(cog, channel)
+
+        channel.connect.assert_awaited_once()
+
+    def test_guild_and_channels_may_be_given_as_ids(self, cog, monkeypatch):
+        """Ids survive a channel rename, so config takes either form."""
+        from soundbot import config
+
+        monkeypatch.setattr(config, "AUTO_JOIN_GUILD", str(GUILD_ID))
+        monkeypatch.setattr(config, "AUTO_JOIN_CHANNELS", ("42",))
+        channel = self._channel("Renamed Since", channel_id=42, guild_name="Renamed")
+
+        self._arrive(cog, channel)
+
+        channel.connect.assert_awaited_once()
+
+    def test_id_config_does_not_match_a_different_channel(self, cog, monkeypatch):
+        from soundbot import config
+
+        monkeypatch.setattr(config, "AUTO_JOIN_CHANNELS", ("42",))
+        channel = self._channel("Lounge", channel_id=43)
+
+        self._arrive(cog, channel)
+
+        channel.connect.assert_not_awaited()
+
+    def test_unset_channels_disables_autojoin(self, cog, monkeypatch):
+        from soundbot import config
+
+        monkeypatch.setattr(config, "AUTO_JOIN_CHANNELS", ())
+        channel = self._channel("Lounge")
+
+        self._arrive(cog, channel)
+
+        channel.connect.assert_not_awaited()
+
+    def test_unset_guild_disables_autojoin(self, cog, monkeypatch):
+        """A channel list with no guild scope is ambiguous, not global —
+        it must stay off rather than fire on every server."""
+        from soundbot import config
+
+        monkeypatch.setattr(config, "AUTO_JOIN_GUILD", "")
+        channel = self._channel("Lounge")
+
+        self._arrive(cog, channel)
+
+        channel.connect.assert_not_awaited()
+
+    # -- Which events count --
+
+    def test_other_bots_do_not_trigger_a_join(self, cog):
+        channel = self._channel("Lounge")
+        member = self._member(channel, is_bot=True)
+
+        self._arrive(cog, channel, member=member)
+
+        channel.connect.assert_not_awaited()
+
+    def test_same_channel_update_is_ignored(self, cog):
+        """Mute, deafen and go-live all fire voice_state_update with the
+        channel unchanged — none of them is an arrival."""
+        channel = self._channel("Lounge")
+
+        self._arrive(cog, channel, before=channel)
+
+        channel.connect.assert_not_awaited()
+
+    def test_leaving_a_watched_channel_is_ignored(self, cog):
+        channel = self._channel("Lounge")
+        member = self._member(channel)
+        before_state = MagicMock()
+        before_state.channel = channel
+        after_state = MagicMock()
+        after_state.channel = None
+
+        asyncio.run(cog._maybe_autojoin(member, before_state, after_state, self.NOW))
+
+        channel.connect.assert_not_awaited()
+
+    def test_listener_routes_human_updates_to_autojoin(self, cog):
+        """Wiring check: the board-cleanup listener must not swallow
+        everyone else's voice-state updates."""
+        channel = self._channel("Lounge")
+        member = self._member(channel)
+        before_state = MagicMock()
+        before_state.channel = None
+        after_state = MagicMock()
+        after_state.channel = channel
+
+        asyncio.run(cog.on_voice_state_update(member, before_state, after_state))
+
+        channel.connect.assert_awaited_once()
+
+    # -- Staying put --
+
+    def test_already_in_voice_in_that_guild_stays_put(self, cog):
+        """Bot is in Lounge, someone joins Gaming: following them would
+        yank it away from whoever is still in Lounge."""
+        channel = self._channel("Gaming", channel_id=2)
+        channel.guild.voice_client = _connected_vc()
+
+        self._arrive(cog, channel)
+
+        channel.connect.assert_not_awaited()
+
+    def test_concurrent_arrivals_connect_only_once(self, cog):
+        """Two people joining together dispatch two updates, and the second
+        must not fire its own connect() while the first is mid-handshake.
+
+        discord.py does register guild.voice_client before connect() awaits,
+        so the check above would catch this anyway; mocking connect() out
+        removes that safety net, which is the point -- this pins the
+        in-flight guard on its own."""
+        channel = self._channel("Lounge")
+        member = self._member(channel)
+        before_state = MagicMock()
+        before_state.channel = None
+        after_state = MagicMock()
+        after_state.channel = channel
+
+        async def scenario():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def slow_connect():
+                started.set()
+                await release.wait()
+                return MagicMock()
+
+            channel.connect = AsyncMock(side_effect=slow_connect)
+            first = asyncio.create_task(
+                cog._maybe_autojoin(member, before_state, after_state, self.NOW)
+            )
+            await started.wait()
+            await cog._maybe_autojoin(member, before_state, after_state, self.NOW)
+            release.set()
+            await first
+
+        asyncio.run(scenario())
+
+        assert channel.connect.await_count == 1
+
+    def test_connect_failure_is_logged_and_the_next_arrival_retries(
+        self, cog, caplog
+    ):
+        """discord.py turns a listener exception into a bare traceback; a
+        channel the bot cannot enter must log the cause instead, and must not
+        poison the guild against later attempts."""
+        caplog.set_level(logging.WARNING, logger="soundbot")
+        failing = self._channel("Lounge")
+        failing.connect = AsyncMock(
+            side_effect=discord.ClientException("no Connect permission")
+        )
+
+        self._arrive(cog, failing)
+
+        assert cog.mixers == {}
+        assert GUILD_ID not in cog._autojoin_pending
+        assert "no Connect permission" in caplog.text
+        # A failure is not a mute: the comment promises the next arrival
+        # retries, so pin that rather than trusting it.
+        assert cog._autojoin_muted_until == {}
+        retry = self._channel("Lounge")
+        self._arrive(cog, retry)
+        retry.connect.assert_awaited_once()
+
+    # -- Mute window after a deliberate exit --
+
+    def test_manual_leave_mutes_then_rearms_autojoin(self, cog):
+        vc = _connected_vc()
+        vc.disconnect = AsyncMock()
+        cog.mixers[GUILD_ID] = MixerSource()
+
+        asyncio.run(
+            Soundboard.leave.callback(cog, self._leave_interaction(voice_client=vc))
+        )
+
+        until = cog._autojoin_muted_until[GUILD_ID]
+        muted = self._channel("Lounge")
+        self._arrive(cog, muted, now=until - 1)
+        muted.connect.assert_not_awaited()
+
+        rearmed = self._channel("Lounge")
+        self._arrive(cog, rearmed, now=until)
+        rearmed.connect.assert_awaited_once()
+        assert GUILD_ID not in cog._autojoin_muted_until
+
+    def test_manual_join_clears_the_mute(self, cog):
+        """/join says "be here", so it must undo an earlier /leave's mute —
+        otherwise auto-join stays silently dead for the rest of the window."""
+        leaving = _connected_vc()
+        leaving.disconnect = AsyncMock()
+        asyncio.run(
+            Soundboard.leave.callback(
+                cog, self._leave_interaction(voice_client=leaving)
+            )
+        )
+        assert GUILD_ID in cog._autojoin_muted_until
+
+        rejoin = self._leave_interaction(voice_client=None)
+        rejoin.user.voice.channel.connect = AsyncMock(return_value=MagicMock())
+        asyncio.run(Soundboard.join.callback(cog, rejoin))
+
+        assert cog._autojoin_muted_until == {}
+
+    def test_leave_in_an_unwatched_guild_records_no_mute(self, cog):
+        """A /leave anywhere else must not leave a deadline behind: only the
+        auto-join guild is ever checked, so nothing would prune it."""
+        vc = _connected_vc()
+        vc.disconnect = AsyncMock()
+        interaction = self._leave_interaction(
+            voice_client=vc, guild_id=777, guild_name="Some Other Server"
+        )
+
+        asyncio.run(Soundboard.leave.callback(cog, interaction))
+
+        assert cog._autojoin_muted_until == {}
+        channel = self._channel("Lounge")
+        self._arrive(cog, channel)
+
+        channel.connect.assert_awaited_once()
+
+    def test_zero_cooldown_disables_muting(self, cog, monkeypatch):
+        from soundbot import config
+
+        monkeypatch.setattr(config, "AUTO_JOIN_COOLDOWN", 0)
+        vc = _connected_vc()
+        vc.disconnect = AsyncMock()
+
+        asyncio.run(
+            Soundboard.leave.callback(cog, self._leave_interaction(voice_client=vc))
+        )
+
+        assert cog._autojoin_muted_until == {}
+        channel = self._channel("Lounge")
+        self._arrive(cog, channel)
+        channel.connect.assert_awaited_once()
+
+    def test_idle_auto_leave_does_not_mute_autojoin(self, cog, monkeypatch):
+        """Auto-leave means nobody is here, not go away — the next person
+        to arrive should still get the bot."""
+        from soundbot import config
+
+        monkeypatch.setattr(config, "IDLE_TIMEOUT", 600.0)
+        vc = _connected_vc()
+        vc.disconnect = AsyncMock()
+        vc.channel.name = "Lounge"
+        bot_member = MagicMock()
+        bot_member.bot = True
+        vc.channel.members = [bot_member]
+        cog.mixers[GUILD_ID] = MixerSource()
+        cog.bot.voice_clients = [vc]
+
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        asyncio.run(cog._disconnect_if_idle(1600.0))
+        vc.disconnect.assert_awaited_once()
+
+        assert cog._autojoin_muted_until == {}
+        channel = self._channel("Lounge")
+        self._arrive(cog, channel)
+        channel.connect.assert_awaited_once()
+
+    def test_external_disconnect_mutes_autojoin_and_clears_stray_mixer(self, cog):
+        """Someone hitting Disconnect on the bot in Discord is as
+        deliberate as /leave, and leaves the guild mixer orphaned because
+        no teardown ran."""
+        mixer = MixerSource()
+        cog.mixers[GUILD_ID] = mixer
+
+        self._bot_left_voice(cog)
+
+        assert GUILD_ID not in cog.mixers
+        assert mixer._sources == []
+        until = cog._autojoin_muted_until[GUILD_ID]
+        channel = self._channel("Lounge")
+        self._arrive(cog, channel, now=until - 1)
+        channel.connect.assert_not_awaited()
+
+    def test_external_disconnect_still_deletes_the_boards(self, cog, tmp_path):
+        """The stray-mixer branch runs ahead of board cleanup in the same
+        method, so the two have to be exercised together: an early return
+        added there later would strand boards with a green suite."""
+        from soundbot.boards import BoardTracker
+
+        cog.boards = BoardTracker(tmp_path / "boards.json")
+        cog.boards.add(GUILD_ID, channel_id=42, message_id=1001)
+        cog.mixers[GUILD_ID] = MixerSource()
+        deleted = []
+
+        def partial_messageable(channel_id):
+            messageable = MagicMock()
+
+            def partial_message(message_id):
+                message = MagicMock()
+
+                async def delete():
+                    deleted.append((channel_id, message_id))
+
+                message.delete = delete
+                return message
+
+            messageable.get_partial_message = partial_message
+            return messageable
+
+        cog.bot.get_partial_messageable = partial_messageable
+
+        self._bot_left_voice(cog)
+
+        assert deleted == [(42, 1001)]
+        assert GUILD_ID not in cog.mixers
+        assert GUILD_ID in cog._autojoin_muted_until
+
+    def test_the_bots_own_arrival_does_not_recurse_into_autojoin(self, cog):
+        """The bot joining a watched channel fires its own voice-state
+        update; routing that back into auto-join would loop."""
+        channel = self._channel("Lounge")
+        member = MagicMock()
+        member.id = self.BOT_ID
+        member.bot = True
+        member.guild = channel.guild
+        before_state = MagicMock()
+        before_state.channel = None
+        after_state = MagicMock()
+        after_state.channel = channel
+
+        asyncio.run(cog.on_voice_state_update(member, before_state, after_state))
+
+        channel.connect.assert_not_awaited()
+
+    def test_teardown_exit_leaves_no_stray_mixer_to_mute_on(self, cog):
+        """_teardown_voice drops the mixer before awaiting disconnect, so
+        by the time the bot's own update lands there is nothing parked —
+        that absence is how an external kick is told apart from our own."""
+        vc = _connected_vc()
+        vc.disconnect = AsyncMock()
+        cog.mixers[GUILD_ID] = MixerSource()
+
+        asyncio.run(cog._teardown_voice(vc))
+        self._bot_left_voice(cog)
+
+        assert cog._autojoin_muted_until == {}
