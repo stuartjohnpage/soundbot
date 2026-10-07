@@ -57,6 +57,7 @@ def _make_interaction(*, voice_client=None, response_done: bool = False):
     interaction.user.__str__ = MagicMock(return_value="test-user")
     interaction.user.voice = MagicMock()
     interaction.user.voice.channel = MagicMock()
+    interaction.user.voice.channel.guild = interaction.guild
     # Default to the happy path for the same-VC gate (issue #17): the
     # user sits in the bot's channel. Gate tests override one side.
     if voice_client is not None:
@@ -1839,11 +1840,19 @@ class TestAutoJoinWatchedChannels:
             )
         )
 
+    def _leave_interaction(self, *, voice_client, guild_id=GUILD_ID, guild_name=None):
+        """An interaction from the auto-join guild, so a mute can arm."""
+        interaction = _make_interaction(voice_client=voice_client)
+        interaction.guild.id = guild_id
+        interaction.guild.name = self.GUILD_NAME if guild_name is None else guild_name
+        return interaction
+
     def _bot_left_voice(self, cog, *, guild_id=GUILD_ID):
         """Dispatch the bot's own "disconnected from voice" update."""
         member = MagicMock()
         member.id = self.BOT_ID
         member.guild.id = guild_id
+        member.guild.name = self.GUILD_NAME
         before_state = MagicMock()
         before_state.channel = MagicMock()
         after_state = MagicMock()
@@ -1997,9 +2006,13 @@ class TestAutoJoinWatchedChannels:
         channel.connect.assert_not_awaited()
 
     def test_concurrent_arrivals_connect_only_once(self, cog):
-        """Two people joining together dispatch two updates; the second
-        must not fire a second connect() while the first is mid-handshake,
-        since guild.voice_client stays None until it completes."""
+        """Two people joining together dispatch two updates, and the second
+        must not fire its own connect() while the first is mid-handshake.
+
+        discord.py does register guild.voice_client before connect() awaits,
+        so the check above would catch this anyway; mocking connect() out
+        removes that safety net, which is the point -- this pins the
+        in-flight guard on its own."""
         channel = self._channel("Chillin")
         member = self._member(channel)
         before_state = MagicMock()
@@ -2048,10 +2061,10 @@ class TestAutoJoinWatchedChannels:
         vc = _connected_vc()
         vc.disconnect = AsyncMock()
         cog.mixers[GUILD_ID] = MixerSource()
-        interaction = _make_interaction(voice_client=vc)
-        interaction.guild.id = GUILD_ID
 
-        asyncio.run(Soundboard.leave.callback(cog, interaction))
+        asyncio.run(
+            Soundboard.leave.callback(cog, self._leave_interaction(voice_client=vc))
+        )
 
         until = cog._autojoin_muted_until[GUILD_ID]
         muted = self._channel("Chillin")
@@ -2068,26 +2081,31 @@ class TestAutoJoinWatchedChannels:
         otherwise auto-join stays silently dead for the rest of the window."""
         leaving = _connected_vc()
         leaving.disconnect = AsyncMock()
-        interaction = _make_interaction(voice_client=leaving)
-        interaction.guild.id = GUILD_ID
-        asyncio.run(Soundboard.leave.callback(cog, interaction))
+        asyncio.run(
+            Soundboard.leave.callback(
+                cog, self._leave_interaction(voice_client=leaving)
+            )
+        )
         assert GUILD_ID in cog._autojoin_muted_until
 
-        rejoin = _make_interaction()
-        rejoin.guild.id = GUILD_ID
+        rejoin = self._leave_interaction(voice_client=None)
         rejoin.user.voice.channel.connect = AsyncMock(return_value=MagicMock())
         asyncio.run(Soundboard.join.callback(cog, rejoin))
 
         assert cog._autojoin_muted_until == {}
 
-    def test_leave_in_one_guild_does_not_mute_another(self, cog):
+    def test_leave_in_an_unwatched_guild_records_no_mute(self, cog):
+        """A /leave anywhere else must not leave a deadline behind: only the
+        auto-join guild is ever checked, so nothing would prune it."""
         vc = _connected_vc()
         vc.disconnect = AsyncMock()
-        interaction = _make_interaction(voice_client=vc)
-        interaction.guild.id = 777
+        interaction = self._leave_interaction(
+            voice_client=vc, guild_id=777, guild_name="Some Other Server"
+        )
 
         asyncio.run(Soundboard.leave.callback(cog, interaction))
 
+        assert cog._autojoin_muted_until == {}
         channel = self._channel("Chillin")
         self._arrive(cog, channel)
 
@@ -2099,10 +2117,10 @@ class TestAutoJoinWatchedChannels:
         monkeypatch.setattr(config, "AUTO_JOIN_COOLDOWN", 0)
         vc = _connected_vc()
         vc.disconnect = AsyncMock()
-        interaction = _make_interaction(voice_client=vc)
-        interaction.guild.id = GUILD_ID
 
-        asyncio.run(Soundboard.leave.callback(cog, interaction))
+        asyncio.run(
+            Soundboard.leave.callback(cog, self._leave_interaction(voice_client=vc))
+        )
 
         assert cog._autojoin_muted_until == {}
         channel = self._channel("Chillin")
