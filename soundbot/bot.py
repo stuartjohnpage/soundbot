@@ -142,7 +142,7 @@ def parse_emoji_key(raw: str) -> str:
 def _matches_ref(ref: str, obj_id: int, name: str | None) -> bool:
     """True if `ref` names this guild or channel, by snowflake id or name.
 
-    Config accepts either form so an admin can write `Chillin` without
+    Config accepts either form so an admin can write `Lounge` without
     turning on developer mode, while ids stay available for channels whose
     names drift. An all-digit ref is only ever read as an id, so a channel
     literally named "1234" has to be configured by its id.

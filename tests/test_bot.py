@@ -1786,7 +1786,7 @@ class TestMatchesRef:
     voice-state update."""
 
     def test_digits_match_the_id(self):
-        assert _matches_ref("42", 42, "Chillin") is True
+        assert _matches_ref("42", 42, "Lounge") is True
 
     def test_digits_never_match_a_name(self):
         """The documented trade-off: a channel literally named "42" can only
@@ -1794,10 +1794,10 @@ class TestMatchesRef:
         assert _matches_ref("42", 99, "42") is False
 
     def test_name_matches_exactly(self):
-        assert _matches_ref("Chillin", 1, "Chillin") is True
+        assert _matches_ref("Lounge", 1, "Lounge") is True
 
     def test_name_match_ignores_case(self):
-        assert _matches_ref("CHILLIN", 1, "chillin") is True
+        assert _matches_ref("LOUNGE", 1, "lounge") is True
 
     def test_name_match_folds_rather_than_lowercases(self):
         """casefold, not lower: Discord channel names are free-form Unicode,
@@ -1805,19 +1805,19 @@ class TestMatchesRef:
         assert _matches_ref("STRASSE", 1, "straße") is True
 
     def test_different_name_does_not_match(self):
-        assert _matches_ref("Chillin", 1, "General") is False
+        assert _matches_ref("Lounge", 1, "General") is False
 
     def test_surrounding_whitespace_is_ignored(self):
-        assert _matches_ref("  Chillin  ", 1, "Chillin") is True
+        assert _matches_ref("  Lounge  ", 1, "Lounge") is True
 
     @pytest.mark.parametrize("ref", ["", "   "])
     def test_blank_ref_matches_nothing(self, ref):
         """config.py already drops blanks; this keeps the helper safe for any
         later caller that does not."""
-        assert _matches_ref(ref, 1, "Chillin") is False
+        assert _matches_ref(ref, 1, "Lounge") is False
 
     def test_nameless_object_only_matches_by_id(self):
-        assert _matches_ref("Chillin", 1, None) is False
+        assert _matches_ref("Lounge", 1, None) is False
         assert _matches_ref("1", 1, None) is True
 
 
@@ -1831,8 +1831,8 @@ class TestAutoJoinWatchedChannels:
     patching time.monotonic — asyncio runs on that same clock.
     """
 
-    GUILD_NAME = "Anti-Union"
-    WATCHED = ("Chillin", "Deadlock", "CS2")
+    GUILD_NAME = "Watched Server"
+    WATCHED = ("Lounge", "Gaming", "Movie Night")
     COOLDOWN = 300.0
     BOT_ID = 999
     NOW = 1000.0
@@ -1905,7 +1905,7 @@ class TestAutoJoinWatchedChannels:
     # -- Matching --
 
     def test_human_joining_watched_channel_connects_and_starts_mixer(self, cog):
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
 
         self._arrive(cog, channel)
 
@@ -1913,7 +1913,7 @@ class TestAutoJoinWatchedChannels:
         vc = channel.connect.return_value
         vc.play.assert_called_once_with(cog.mixers[GUILD_ID])
 
-    @pytest.mark.parametrize("name", ["Chillin", "Deadlock", "CS2"])
+    @pytest.mark.parametrize("name", ["Lounge", "Gaming", "Movie Night"])
     def test_every_configured_channel_is_watched(self, cog, name):
         channel = self._channel(name)
 
@@ -1930,10 +1930,10 @@ class TestAutoJoinWatchedChannels:
         assert cog.mixers == {}
 
     def test_watched_name_in_another_guild_is_ignored(self, cog):
-        """The whole point of the guild scope: a Deadlock channel on some
+        """The whole point of the guild scope: a Gaming channel on some
         other server must not pull the bot in."""
         channel = self._channel(
-            "Deadlock", guild_id=777, guild_name="Some Other Server"
+            "Gaming", guild_id=777, guild_name="Some Other Server"
         )
 
         self._arrive(cog, channel)
@@ -1941,7 +1941,7 @@ class TestAutoJoinWatchedChannels:
         channel.connect.assert_not_awaited()
 
     def test_channel_name_match_is_case_insensitive(self, cog):
-        channel = self._channel("chillin")
+        channel = self._channel("lounge")
 
         self._arrive(cog, channel)
 
@@ -1963,7 +1963,7 @@ class TestAutoJoinWatchedChannels:
         from soundbot import config
 
         monkeypatch.setattr(config, "AUTO_JOIN_CHANNELS", ("42",))
-        channel = self._channel("Chillin", channel_id=43)
+        channel = self._channel("Lounge", channel_id=43)
 
         self._arrive(cog, channel)
 
@@ -1973,7 +1973,7 @@ class TestAutoJoinWatchedChannels:
         from soundbot import config
 
         monkeypatch.setattr(config, "AUTO_JOIN_CHANNELS", ())
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
 
         self._arrive(cog, channel)
 
@@ -1985,7 +1985,7 @@ class TestAutoJoinWatchedChannels:
         from soundbot import config
 
         monkeypatch.setattr(config, "AUTO_JOIN_GUILD", "")
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
 
         self._arrive(cog, channel)
 
@@ -1994,7 +1994,7 @@ class TestAutoJoinWatchedChannels:
     # -- Which events count --
 
     def test_other_bots_do_not_trigger_a_join(self, cog):
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
         member = self._member(channel, is_bot=True)
 
         self._arrive(cog, channel, member=member)
@@ -2004,14 +2004,14 @@ class TestAutoJoinWatchedChannels:
     def test_same_channel_update_is_ignored(self, cog):
         """Mute, deafen and go-live all fire voice_state_update with the
         channel unchanged — none of them is an arrival."""
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
 
         self._arrive(cog, channel, before=channel)
 
         channel.connect.assert_not_awaited()
 
     def test_leaving_a_watched_channel_is_ignored(self, cog):
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
         member = self._member(channel)
         before_state = MagicMock()
         before_state.channel = channel
@@ -2025,7 +2025,7 @@ class TestAutoJoinWatchedChannels:
     def test_listener_routes_human_updates_to_autojoin(self, cog):
         """Wiring check: the board-cleanup listener must not swallow
         everyone else's voice-state updates."""
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
         member = self._member(channel)
         before_state = MagicMock()
         before_state.channel = None
@@ -2039,9 +2039,9 @@ class TestAutoJoinWatchedChannels:
     # -- Staying put --
 
     def test_already_in_voice_in_that_guild_stays_put(self, cog):
-        """Bot is in Chillin, someone joins Deadlock: following them would
-        yank it away from whoever is still in Chillin."""
-        channel = self._channel("Deadlock", channel_id=2)
+        """Bot is in Lounge, someone joins Gaming: following them would
+        yank it away from whoever is still in Lounge."""
+        channel = self._channel("Gaming", channel_id=2)
         channel.guild.voice_client = _connected_vc()
 
         self._arrive(cog, channel)
@@ -2056,7 +2056,7 @@ class TestAutoJoinWatchedChannels:
         so the check above would catch this anyway; mocking connect() out
         removes that safety net, which is the point -- this pins the
         in-flight guard on its own."""
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
         member = self._member(channel)
         before_state = MagicMock()
         before_state.channel = None
@@ -2092,7 +2092,7 @@ class TestAutoJoinWatchedChannels:
         channel the bot cannot enter must log the cause instead, and must not
         poison the guild against later attempts."""
         caplog.set_level(logging.WARNING, logger="soundbot")
-        failing = self._channel("Chillin")
+        failing = self._channel("Lounge")
         failing.connect = AsyncMock(
             side_effect=discord.ClientException("no Connect permission")
         )
@@ -2105,7 +2105,7 @@ class TestAutoJoinWatchedChannels:
         # A failure is not a mute: the comment promises the next arrival
         # retries, so pin that rather than trusting it.
         assert cog._autojoin_muted_until == {}
-        retry = self._channel("Chillin")
+        retry = self._channel("Lounge")
         self._arrive(cog, retry)
         retry.connect.assert_awaited_once()
 
@@ -2121,11 +2121,11 @@ class TestAutoJoinWatchedChannels:
         )
 
         until = cog._autojoin_muted_until[GUILD_ID]
-        muted = self._channel("Chillin")
+        muted = self._channel("Lounge")
         self._arrive(cog, muted, now=until - 1)
         muted.connect.assert_not_awaited()
 
-        rearmed = self._channel("Chillin")
+        rearmed = self._channel("Lounge")
         self._arrive(cog, rearmed, now=until)
         rearmed.connect.assert_awaited_once()
         assert GUILD_ID not in cog._autojoin_muted_until
@@ -2160,7 +2160,7 @@ class TestAutoJoinWatchedChannels:
         asyncio.run(Soundboard.leave.callback(cog, interaction))
 
         assert cog._autojoin_muted_until == {}
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
         self._arrive(cog, channel)
 
         channel.connect.assert_awaited_once()
@@ -2177,7 +2177,7 @@ class TestAutoJoinWatchedChannels:
         )
 
         assert cog._autojoin_muted_until == {}
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
         self._arrive(cog, channel)
         channel.connect.assert_awaited_once()
 
@@ -2189,7 +2189,7 @@ class TestAutoJoinWatchedChannels:
         monkeypatch.setattr(config, "IDLE_TIMEOUT", 600.0)
         vc = _connected_vc()
         vc.disconnect = AsyncMock()
-        vc.channel.name = "Chillin"
+        vc.channel.name = "Lounge"
         bot_member = MagicMock()
         bot_member.bot = True
         vc.channel.members = [bot_member]
@@ -2201,7 +2201,7 @@ class TestAutoJoinWatchedChannels:
         vc.disconnect.assert_awaited_once()
 
         assert cog._autojoin_muted_until == {}
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
         self._arrive(cog, channel)
         channel.connect.assert_awaited_once()
 
@@ -2217,7 +2217,7 @@ class TestAutoJoinWatchedChannels:
         assert GUILD_ID not in cog.mixers
         assert mixer._sources == []
         until = cog._autojoin_muted_until[GUILD_ID]
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
         self._arrive(cog, channel, now=until - 1)
         channel.connect.assert_not_awaited()
 
@@ -2258,7 +2258,7 @@ class TestAutoJoinWatchedChannels:
     def test_the_bots_own_arrival_does_not_recurse_into_autojoin(self, cog):
         """The bot joining a watched channel fires its own voice-state
         update; routing that back into auto-join would loop."""
-        channel = self._channel("Chillin")
+        channel = self._channel("Lounge")
         member = MagicMock()
         member.id = self.BOT_ID
         member.bot = True

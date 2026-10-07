@@ -171,8 +171,8 @@ The bot can join voice on its own, so nobody has to run `/join` first. Name
 one server and the voice channels to watch on it:
 
 ```
-AUTO_JOIN_GUILD=Anti-Union
-AUTO_JOIN_CHANNELS=Chillin,Deadlock,CS2
+AUTO_JOIN_GUILD=My Server
+AUTO_JOIN_CHANNELS=Lounge,Gaming,Movie Night
 ```
 
 The moment a person appears in one of those channels, the bot connects to it.
