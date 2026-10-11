@@ -530,6 +530,13 @@ class Soundboard(commands.Cog):
         try:
             for embed, view in self._board_pages(sounds):
                 message = await channel.send(embed=embed, view=view)
+                # The send is a yield point: if the bot left voice meanwhile,
+                # the leave cleanup has already run and would never see
+                # this board, so delete it now rather than record a page of
+                # dead buttons nothing will clean up.
+                if guild.id not in self.mixers:
+                    await self._delete_boards([(channel.id, message.id)])
+                    return
                 self.boards.add(guild.id, channel_id=channel.id, message_id=message.id)
         except discord.HTTPException as exc:
             # Typically Forbidden: no Send Messages or Embed Links there.

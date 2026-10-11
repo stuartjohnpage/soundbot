@@ -2452,3 +2452,25 @@ class TestAutoJoinBoard:
 
         interaction.followup.send.assert_awaited_once()
         assert cog.boards.pop_guild(GUILD_ID) == [(77, 5)]
+
+    def test_leaving_voice_mid_post_deletes_board_instead_of_recording_it(self, cog):
+        """The send is a yield point; a leave during it has already run its
+        cleanup, so a board recorded afterwards would never be deleted."""
+        board_channel = self._text_channel()
+
+        def send_then_leave(**kw):
+            cog.mixers.pop(GUILD_ID, None)  # bot leaves voice mid-send
+            return MagicMock(id=9)
+
+        board_channel.send = AsyncMock(side_effect=send_then_leave)
+        partial = MagicMock()
+        partial.delete = AsyncMock()
+        cog.bot.get_partial_messageable.return_value.get_partial_message.return_value = (
+            partial
+        )
+
+        self._arrive(cog, self._guild(board_channel))
+
+        partial.delete.assert_awaited_once()
+        cog.bot.get_partial_messageable.assert_called_with(self.BOARD_CHANNEL_ID)
+        assert cog.boards.pop_guild(GUILD_ID) == []
