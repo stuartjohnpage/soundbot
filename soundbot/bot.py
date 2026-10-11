@@ -498,8 +498,52 @@ class Soundboard(commands.Cog):
                 "auto-join of %s in guild_id=%s failed: %s",
                 channel.name, guild.id, exc,
             )
+        else:
+            await self._post_autojoin_board(guild)
         finally:
             self._autojoin_pending.discard(guild.id)
+
+    async def _post_autojoin_board(self, guild: discord.Guild) -> None:
+        """Post the full board to AUTO_JOIN_BOARD_CHANNEL, as if someone
+        had run /board there.
+
+        Recorded in self.boards like any /board, so leaving voice deletes it
+        and each auto-join starts from one fresh board rather than a pile.
+        Failures are logged, not raised: the bot is already in voice and
+        working, and a missing board is not worth a listener traceback.
+        """
+        ref = config.AUTO_JOIN_BOARD_CHANNEL
+        if not ref:
+            return
+        channel = next(
+            (c for c in guild.text_channels if _matches_ref(ref, c.id, c.name)),
+            None,
+        )
+        if channel is None:
+            logger.warning(
+                "auto-join board channel %r not found in guild_id=%s", ref, guild.id
+            )
+            return
+        sounds = self.store.list_sounds()
+        if not sounds:
+            return
+        try:
+            for embed, view in self._board_pages(sounds):
+                message = await channel.send(embed=embed, view=view)
+                # The send is a yield point: if the bot left voice meanwhile,
+                # the leave cleanup has already run and would never see
+                # this board, so delete it now rather than record a page of
+                # dead buttons nothing will clean up.
+                if guild.id not in self.mixers:
+                    await self._delete_boards([(channel.id, message.id)])
+                    return
+                self.boards.add(guild.id, channel_id=channel.id, message_id=message.id)
+        except discord.HTTPException as exc:
+            # Typically Forbidden: no Send Messages or Embed Links there.
+            logger.warning(
+                "could not post auto-join board in %s (guild_id=%s): %s",
+                channel.name, guild.id, exc,
+            )
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
@@ -791,14 +835,9 @@ class Soundboard(commands.Cog):
                 "No sounds in the library.", ephemeral=True
             )
             return
-        pages = paginate(sounds, per_page=SOUNDS_PER_BOARD)
         # Defer so we can send multiple followup messages, one per board chunk.
         await interaction.response.defer()
-        for idx, page_sounds in enumerate(pages, start=1):
-            view = BoardView(self, page_sounds)
-            embed = discord.Embed(
-                title="Soundboard" if len(pages) == 1 else f"Soundboard ({idx}/{len(pages)})",
-            )
+        for embed, view in self._board_pages(sounds):
             message = await interaction.followup.send(embed=embed, view=view)
             if interaction.guild_id is not None:
                 self.boards.add(
@@ -806,6 +845,19 @@ class Soundboard(commands.Cog):
                     channel_id=interaction.channel_id,
                     message_id=message.id,
                 )
+
+    def _board_pages(self, sounds) -> list[tuple[discord.Embed, "BoardView"]]:
+        """One (embed, view) per board message, SOUNDS_PER_BOARD buttons each."""
+        pages = paginate(sounds, per_page=SOUNDS_PER_BOARD)
+        return [
+            (
+                discord.Embed(
+                    title="Soundboard" if len(pages) == 1 else f"Soundboard ({idx}/{len(pages)})",
+                ),
+                BoardView(self, page_sounds),
+            )
+            for idx, page_sounds in enumerate(pages, start=1)
+        ]
 
     # -- CRUD commands --
 

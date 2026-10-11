@@ -39,6 +39,12 @@ AUTO_JOIN_CHANNELS: tuple[str, ...] = tuple(
 # Discord) suppresses auto-join in that guild, so the bot does not bounce
 # straight back in on the next arrival. 0 = no suppression.
 AUTO_JOIN_COOLDOWN: float = float(os.getenv("AUTO_JOIN_COOLDOWN", "300"))
+# Text channel in the auto-join guild where the bot posts a /board each time
+# it auto-joins, by id or (case-insensitive) name; a leading "#" is ignored.
+# Empty = no board.
+AUTO_JOIN_BOARD_CHANNEL: str = (
+    os.getenv("AUTO_JOIN_BOARD_CHANNEL", "").strip().lstrip("#").strip()
+)
 
 # Web admin panel (issue #1). Empty token = panel disabled entirely.
 WEB_TOKEN: str = os.getenv("WEB_TOKEN", "")

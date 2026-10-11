@@ -161,6 +161,7 @@ All settings are environment variables, configured in `.env`:
 | `AUTO_JOIN_GUILD` | *(empty)* | The one server auto-join applies to, by name or id. Empty = auto-join disabled. |
 | `AUTO_JOIN_CHANNELS` | *(empty)* | Comma-separated voice channels to watch on that server, by name or id. Empty = auto-join disabled. |
 | `AUTO_JOIN_COOLDOWN` | `300` | Seconds a deliberate exit keeps auto-join muted in that server. `0` = no mute. |
+| `AUTO_JOIN_BOARD_CHANNEL` | *(empty)* | Text channel on that server where the bot posts a `/board` each time it auto-joins, by name or id. Empty = no board. |
 | `WEB_TOKEN` | *(empty)* | Auth token for the web admin panel. Empty = panel disabled. |
 | `WEB_HOST` | `0.0.0.0` | Interface the web panel binds to inside the container. |
 | `WEB_PORT` | `8000` | Port for the web admin panel. |
@@ -182,6 +183,20 @@ Discord settings, then right-click a server or channel and **Copy ID**). Name
 matching ignores case; a value that is all digits is only ever read as an id.
 `AUTO_JOIN_CHANNELS` splits on commas, so a channel whose name contains a
 comma has to be given by id.
+
+To have the button board waiting as well, name a text channel on the same
+server:
+
+```
+AUTO_JOIN_BOARD_CHANNEL=sounds
+```
+
+Each auto-join then posts the full board there, just as `/board` would. Like
+any board, it is deleted when the bot leaves voice, so the channel holds one
+live board rather than a growing pile. It only follows an auto-join — after a
+manual `/join`, run `/board` yourself. If the channel is missing or the bot
+lacks **Send Messages** / **Embed Links** there, it logs a warning and stays
+in voice regardless.
 
 **Disabled by default.** Leaving either setting empty turns auto-join off
 entirely, and it only ever applies to the single server in

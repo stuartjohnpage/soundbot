@@ -2284,3 +2284,193 @@ class TestAutoJoinWatchedChannels:
         self._bot_left_voice(cog)
 
         assert cog._autojoin_muted_until == {}
+
+
+class TestAutoJoinBoard:
+    """On an auto-join, the bot posts the full board to the text channel
+    named by AUTO_JOIN_BOARD_CHANNEL, exactly as if someone had run /board
+    there, so nobody has to type it after the bot walks in."""
+
+    GUILD_NAME = "Watched Server"
+    BOARD_CHANNEL_ID = 4242
+    NOW = 1000.0
+
+    @pytest.fixture
+    def cog(self, tmp_path, monkeypatch):
+        from soundbot import config
+        from soundbot.boards import BoardTracker
+
+        monkeypatch.setattr(config, "AUTO_JOIN_GUILD", self.GUILD_NAME)
+        monkeypatch.setattr(config, "AUTO_JOIN_CHANNELS", ("Lounge",))
+        monkeypatch.setattr(config, "AUTO_JOIN_BOARD_CHANNEL", "Sounds")
+        cog = _make_cog(tmp_path)
+        cog.boards = BoardTracker(tmp_path / "boards.json")
+        _add_sound(cog, "airhorn")
+        return cog
+
+    def _guild(self, *text_channels):
+        guild = MagicMock()
+        guild.id = GUILD_ID
+        guild.name = self.GUILD_NAME
+        guild.voice_client = None
+        guild.text_channels = list(text_channels)
+        return guild
+
+    def _text_channel(self, name="Sounds", channel_id=BOARD_CHANNEL_ID):
+        channel = MagicMock()
+        channel.name = name
+        channel.id = channel_id
+        sent = iter(range(1, 100))
+        channel.send = AsyncMock(
+            side_effect=lambda **kw: MagicMock(id=next(sent))
+        )
+        return channel
+
+    def _arrive(self, cog, guild, *, connect=None):
+        voice = MagicMock()
+        voice.name = "Lounge"
+        voice.id = 1
+        voice.guild = guild
+        voice.connect = connect or AsyncMock(return_value=MagicMock())
+        member = MagicMock()
+        member.bot = False
+        member.guild = guild
+        before_state = MagicMock()
+        before_state.channel = None
+        after_state = MagicMock()
+        after_state.channel = voice
+        asyncio.run(cog._maybe_autojoin(member, before_state, after_state, self.NOW))
+        return voice
+
+    def test_auto_join_posts_board_in_configured_channel(self, cog):
+        board_channel = self._text_channel()
+        other = self._text_channel("general", channel_id=1)
+        guild = self._guild(other, board_channel)
+
+        self._arrive(cog, guild)
+
+        board_channel.send.assert_awaited_once()
+        other.send.assert_not_awaited()
+        kwargs = board_channel.send.await_args.kwargs
+        assert kwargs["embed"].title == "Soundboard"
+        assert [b.label for b in kwargs["view"].children] == ["airhorn"]
+
+    def test_posted_board_is_recorded_for_cleanup_on_leave(self, cog):
+        guild = self._guild(self._text_channel())
+
+        self._arrive(cog, guild)
+
+        assert cog.boards.pop_guild(GUILD_ID) == [(self.BOARD_CHANNEL_ID, 1)]
+
+    def test_large_library_posts_one_message_per_page(self, cog):
+        for i in range(30):
+            _add_sound(cog, f"s{i:02}", file_name=f"s{i:02}.ogg")
+        board_channel = self._text_channel()
+
+        self._arrive(cog, self._guild(board_channel))
+
+        assert board_channel.send.await_count == 2
+        assert cog.boards.pop_guild(GUILD_ID) == [
+            (self.BOARD_CHANNEL_ID, 1),
+            (self.BOARD_CHANNEL_ID, 2),
+        ]
+
+    def test_channel_may_be_given_by_id(self, cog, monkeypatch):
+        from soundbot import config
+
+        monkeypatch.setattr(
+            config, "AUTO_JOIN_BOARD_CHANNEL", str(self.BOARD_CHANNEL_ID)
+        )
+        board_channel = self._text_channel("renamed-since")
+
+        self._arrive(cog, self._guild(board_channel))
+
+        board_channel.send.assert_awaited_once()
+
+    def test_unset_channel_posts_nothing(self, cog, monkeypatch):
+        from soundbot import config
+
+        monkeypatch.setattr(config, "AUTO_JOIN_BOARD_CHANNEL", "")
+        board_channel = self._text_channel()
+
+        voice = self._arrive(cog, self._guild(board_channel))
+
+        voice.connect.assert_awaited_once()
+        board_channel.send.assert_not_awaited()
+
+    def test_failed_connect_posts_nothing(self, cog):
+        """A board with no bot in voice is a page of dead buttons."""
+        board_channel = self._text_channel()
+
+        self._arrive(
+            cog,
+            self._guild(board_channel),
+            connect=AsyncMock(side_effect=discord.ClientException("nope")),
+        )
+
+        board_channel.send.assert_not_awaited()
+
+    def test_missing_channel_is_logged_not_raised(self, cog, caplog):
+        caplog.set_level(logging.WARNING, logger="soundbot")
+
+        voice = self._arrive(cog, self._guild(self._text_channel("general")))
+
+        voice.connect.assert_awaited_once()
+        assert "'Sounds' not found" in caplog.text
+
+    def test_empty_library_posts_nothing(self, cog):
+        cog.store.remove("airhorn")
+        board_channel = self._text_channel()
+
+        self._arrive(cog, self._guild(board_channel))
+
+        board_channel.send.assert_not_awaited()
+
+    def test_send_failure_is_logged_and_bot_stays_in_voice(self, cog, caplog):
+        caplog.set_level(logging.WARNING, logger="soundbot")
+        board_channel = self._text_channel()
+        response = MagicMock()
+        response.status = 403
+        response.reason = "Forbidden"
+        board_channel.send = AsyncMock(
+            side_effect=discord.Forbidden(response, "Missing Permissions")
+        )
+
+        self._arrive(cog, self._guild(board_channel))
+
+        assert GUILD_ID in cog.mixers
+        assert GUILD_ID not in cog._autojoin_pending
+        assert "could not post auto-join board" in caplog.text
+
+    def test_manual_board_command_is_unchanged(self, cog):
+        """/board shares the page builder; it still replies via followups."""
+        interaction = _make_interaction()
+        interaction.channel_id = 77
+        interaction.followup.send = AsyncMock(return_value=MagicMock(id=5))
+
+        asyncio.run(cog.board.callback(cog, interaction))
+
+        interaction.followup.send.assert_awaited_once()
+        assert cog.boards.pop_guild(GUILD_ID) == [(77, 5)]
+
+    def test_leaving_voice_mid_post_deletes_board_instead_of_recording_it(self, cog):
+        """The send is a yield point; a leave during it has already run its
+        cleanup, so a board recorded afterwards would never be deleted."""
+        board_channel = self._text_channel()
+
+        def send_then_leave(**kw):
+            cog.mixers.pop(GUILD_ID, None)  # bot leaves voice mid-send
+            return MagicMock(id=9)
+
+        board_channel.send = AsyncMock(side_effect=send_then_leave)
+        partial = MagicMock()
+        partial.delete = AsyncMock()
+        cog.bot.get_partial_messageable.return_value.get_partial_message.return_value = (
+            partial
+        )
+
+        self._arrive(cog, self._guild(board_channel))
+
+        partial.delete.assert_awaited_once()
+        cog.bot.get_partial_messageable.assert_called_with(self.BOARD_CHANNEL_ID)
+        assert cog.boards.pop_guild(GUILD_ID) == []
