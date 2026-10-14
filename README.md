@@ -249,12 +249,16 @@ When `some.user` walks into the bot's voice channel, the bot plays a random
 sound tagged `alice`. It only does this when another person is already in the
 channel — joining an empty room (bots don't count) stays silent. Use the
 Discord **username**, not the display name; a user id also works, and name
-matching ignores case. Someone with no tagged sounds is skipped, with a line
-in the log.
+matching ignores case. A username made only of digits is read as an id, so
+map that person by their id instead. Someone with no tagged sounds is
+skipped, with a line in the log.
+
+It fires on every arrival, including hopping out of the channel and straight
+back in.
 
 This works on any server the bot is in voice on, and combines with auto-join:
 if your arrival brings the bot into a channel where people were already
-waiting, your sound plays as it lands.
+waiting, your sound plays as it lands, ahead of the auto-join board.
 
 ## Data and Persistence
 

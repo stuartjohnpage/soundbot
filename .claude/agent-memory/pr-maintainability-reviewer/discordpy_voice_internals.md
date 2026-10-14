@@ -31,6 +31,12 @@ auto-join review. These orderings decide whether voice race-condition claims in
   `except (DiscordException, asyncio.TimeoutError, OSError)` has a redundant
   middle term.
 
+- `ConnectionState.parse_voice_state_update` calls `guild._update_voice_state`
+  **before** dispatching `voice_state_update`, so inside the listener
+  `after.channel.members` already includes the arriving member (verified
+  PR #37 review). Each listener dispatch is its own task, so two arrivals
+  run concurrently and interleave at every await.
+
 **Why:** PR #35 shipped a comment and a test asserting `guild.voice_client`
 stays None during the handshake, which is false — the kind of claim that
 survives for years and misleads the next maintainer.

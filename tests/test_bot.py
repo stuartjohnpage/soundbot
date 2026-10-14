@@ -2339,7 +2339,7 @@ class TestAutoJoinBoard:
         before_state.channel = None
         after_state = MagicMock()
         after_state.channel = voice
-        asyncio.run(cog._maybe_autojoin(member, before_state, after_state, self.NOW))
+        asyncio.run(cog.on_voice_state_update(member, before_state, after_state))
         return voice
 
     def test_auto_join_posts_board_in_configured_channel(self, cog):
@@ -2485,14 +2485,16 @@ class TestJoinSounds:
     def cog(self, tmp_path, monkeypatch):
         from soundbot import config
 
-        monkeypatch.setattr(config, "JOIN_SOUNDS", {"alice": "alice", "4321": "bob"})
+        monkeypatch.setattr(
+            config, "JOIN_SOUNDS", {"alice": "alice-theme", "4321": "bob"}
+        )
         monkeypatch.setattr(config, "AUTO_JOIN_GUILD", "")
         cog = _make_cog(tmp_path)
         cog.bot.user.id = 999
         cog.pcm_cache = PCMCache(decoder=lambda p: b"\x00" * 7680)
         cog.mixers[GUILD_ID] = MixerSource()
         _add_sound(cog, "alice-hello", "a1.ogg")
-        cog.store.add_tag("alice-hello", "alice")
+        cog.store.add_tag("alice-hello", "alice-theme")
         _add_sound(cog, "unrelated", "u.ogg")
         return cog
 
@@ -2503,20 +2505,25 @@ class TestJoinSounds:
         member.bot = is_bot
         return member
 
-    def _arrive(self, cog, member, *, already_there=(), bot_elsewhere=False):
+    def _arrive(
+        self, cog, member, *, already_there=(), bot_elsewhere=False,
+        connected=True, came_from=None, left_again=False,
+    ):
         """Dispatch `member` moving into the bot's channel, which already
         holds `already_there` (plus the bot itself and `member`)."""
         channel = MagicMock()
         channel.name = "Lounge"
         vc = _connected_vc()
+        vc.is_connected.return_value = connected
         vc.guild.id = GUILD_ID
         vc.channel = MagicMock() if bot_elsewhere else channel
         bot_member = self._human(999, "soundbot", is_bot=True)
         channel.members = [bot_member, *already_there, member]
         member.guild.voice_client = vc
         member.guild.id = GUILD_ID
+        member.voice = None if left_again else MagicMock(channel=channel)
         before_state = MagicMock()
-        before_state.channel = None
+        before_state.channel = came_from
         after_state = MagicMock()
         after_state.channel = channel
         asyncio.run(cog.on_voice_state_update(member, before_state, after_state))
@@ -2575,10 +2582,35 @@ class TestJoinSounds:
         channel.members = [self._human(2), member]
         member.guild.voice_client = _connected_vc()
         member.guild.voice_client.channel = channel
+        member.voice = MagicMock(channel=channel)
         state = MagicMock()
         state.channel = channel
 
         asyncio.run(cog.on_voice_state_update(member, state, state))
+
+        assert self._played(cog) == 0
+
+    def test_moving_in_from_another_channel_counts_as_arriving(self, cog):
+        self._arrive(
+            cog, self._human(1, "alice"),
+            already_there=[self._human(2)], came_from=MagicMock(),
+        )
+
+        assert self._played(cog) == 1
+
+    def test_silent_while_voice_client_is_still_connecting(self, cog):
+        self._arrive(
+            cog, self._human(1, "alice"),
+            already_there=[self._human(2)], connected=False,
+        )
+
+        assert self._played(cog) == 0
+
+    def test_silent_if_they_already_left_again(self, cog):
+        self._arrive(
+            cog, self._human(1, "alice"),
+            already_there=[self._human(2)], left_again=True,
+        )
 
         assert self._played(cog) == 0
 
@@ -2604,3 +2636,72 @@ class TestParseJoinSounds:
         from soundbot.config import _parse_join_sounds
 
         assert _parse_join_sounds("") == {}
+
+
+class TestJoinSoundWithAutoJoin:
+    """An arrival that pulls the bot in via auto-join, with people already
+    waiting, gets its join sound -- before the auto-join board posts."""
+
+    @pytest.fixture
+    def cog(self, tmp_path, monkeypatch):
+        from soundbot import config
+
+        monkeypatch.setattr(config, "AUTO_JOIN_GUILD", "Watched Server")
+        monkeypatch.setattr(config, "AUTO_JOIN_CHANNELS", ("Lounge",))
+        monkeypatch.setattr(config, "AUTO_JOIN_BOARD_CHANNEL", "Sounds")
+        monkeypatch.setattr(config, "JOIN_SOUNDS", {"alice": "alice-theme"})
+        cog = _make_cog(tmp_path)
+        cog.bot.user.id = 999
+        cog.pcm_cache = PCMCache(decoder=lambda p: b"\x00" * 7680)
+        _add_sound(cog, "alice-hello", "a1.ogg")
+        cog.store.add_tag("alice-hello", "alice-theme")
+        return cog
+
+    def test_join_sound_plays_before_the_board_posts(self, cog):
+        events = []
+        guild = MagicMock()
+        guild.id = GUILD_ID
+        guild.name = "Watched Server"
+        guild.voice_client = None
+        board_channel = MagicMock()
+        board_channel.name = "Sounds"
+        board_channel.id = 4242
+
+        async def send(**kwargs):
+            events.append("board")
+            return MagicMock(id=1)
+
+        board_channel.send = send
+        guild.text_channels = [board_channel]
+
+        voice = MagicMock()
+        voice.name = "Lounge"
+        voice.id = 1
+        voice.guild = guild
+        waiting = MagicMock(id=2, bot=False)
+        member = MagicMock(id=1, bot=False, guild=guild)
+        member.name = "alice"
+        member.voice = MagicMock(channel=voice)
+        voice.members = [waiting, member]
+
+        async def connect():
+            vc = _connected_vc()
+            vc.channel = voice
+            guild.voice_client = vc
+            return vc
+
+        voice.connect = connect
+        real_start = cog._start_playback
+
+        async def start(vc, name):
+            events.append(f"sound:{name}")
+            return await real_start(vc, name)
+
+        cog._start_playback = start
+        before_state = MagicMock(channel=None)
+        after_state = MagicMock(channel=voice)
+
+        asyncio.run(cog.on_voice_state_update(member, before_state, after_state))
+
+        assert events == ["sound:alice-hello", "board"]
+        assert cog.store.get("alice-hello")["play_count"] == 1
