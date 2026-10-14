@@ -354,6 +354,9 @@ class Soundboard(commands.Cog):
             await self._handle_own_voice_change(member, before, after)
             return
         await self._maybe_autojoin(member, before, after, time.monotonic())
+        # After auto-join, so an arrival that pulls the bot into a channel
+        # where others were already waiting still gets its sound.
+        await self._maybe_play_join_sound(member, before, after)
 
     async def _handle_own_voice_change(
         self,
@@ -397,6 +400,50 @@ class Soundboard(commands.Cog):
                 guild_id, len(boards),
             )
             await self._delete_boards(boards)
+
+    # -- Join sounds --
+
+    def _join_sound_tag(self, member: discord.Member) -> str | None:
+        """The JOIN_SOUNDS tag for `member`, matched by username or id."""
+        for ref, tag in config.JOIN_SOUNDS.items():
+            if _matches_ref(ref, member.id, member.name):
+                return tag
+        return None
+
+    async def _maybe_play_join_sound(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Announce a JOIN_SOUNDS member with a random sound of their tag.
+
+        Only when they arrive in the bot's own channel and another human is
+        already there: walking into an empty room has nobody to announce to.
+        """
+        if member.bot:
+            return
+        channel = after.channel
+        if channel is None or channel == before.channel:
+            return
+        tag = self._join_sound_tag(member)
+        if tag is None:
+            return
+        vc = member.guild.voice_client
+        if vc is None or not vc.is_connected() or vc.channel != channel:
+            return
+        if not any(not m.bot and m.id != member.id for m in channel.members):
+            return
+        sounds = self.store.list_sounds(tag=tag)
+        if not sounds:
+            logger.info("no sounds tagged %r for %s's join sound", tag, member)
+            return
+        name, _ = random.choice(sounds)
+        error = await self._start_playback(vc, name)
+        if error is not None:
+            logger.info("join sound for %s skipped: %s", member, error)
+            return
+        logger.info("join sound=%s for %s in %s", name, member, channel.name)
 
     # -- Auto-join --
 

@@ -162,6 +162,7 @@ All settings are environment variables, configured in `.env`:
 | `AUTO_JOIN_CHANNELS` | *(empty)* | Comma-separated voice channels to watch on that server, by name or id. Empty = auto-join disabled. |
 | `AUTO_JOIN_COOLDOWN` | `300` | Seconds a deliberate exit keeps auto-join muted in that server. `0` = no mute. |
 | `AUTO_JOIN_BOARD_CHANNEL` | *(empty)* | Text channel on that server where the bot posts a `/board` each time it auto-joins, by name or id. Empty = no board. |
+| `JOIN_SOUNDS` | *(empty)* | Comma-separated `username:tag` pairs. When one of those people joins the bot's voice channel while someone else is already in it, the bot plays a random sound with that tag. A user id works in place of the username. Empty = off. |
 | `WEB_TOKEN` | *(empty)* | Auth token for the web admin panel. Empty = panel disabled. |
 | `WEB_HOST` | `0.0.0.0` | Interface the web panel binds to inside the container. |
 | `WEB_PORT` | `8000` | Port for the web admin panel. |
@@ -234,6 +235,26 @@ Two things worth knowing before you turn it on:
   disabled) and auto-join on, the bot joins on the first arrival and then
   never leaves on its own. Keep a non-zero `IDLE_TIMEOUT` unless you want it
   parked in voice indefinitely.
+
+## Join Sounds
+
+Give people an entrance. Tag some sounds with a person's name, then map
+their Discord username to that tag:
+
+```
+JOIN_SOUNDS=some.user:alice,another_user:bob
+```
+
+When `some.user` walks into the bot's voice channel, the bot plays a random
+sound tagged `alice`. It only does this when another person is already in the
+channel — joining an empty room (bots don't count) stays silent. Use the
+Discord **username**, not the display name; a user id also works, and name
+matching ignores case. Someone with no tagged sounds is skipped, with a line
+in the log.
+
+This works on any server the bot is in voice on, and combines with auto-join:
+if your arrival brings the bot into a channel where people were already
+waiting, your sound plays as it lands.
 
 ## Data and Persistence
 
