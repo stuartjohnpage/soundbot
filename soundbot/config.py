@@ -46,6 +46,27 @@ AUTO_JOIN_BOARD_CHANNEL: str = (
     os.getenv("AUTO_JOIN_BOARD_CHANNEL", "").strip().lstrip("#").strip()
 )
 
+
+def _parse_join_sounds(raw: str) -> dict[str, str]:
+    """Parse "who:tag,who:tag" into {who: tag}, dropping malformed pairs.
+
+    `who` is a Discord username or user id; tags are lowercased to match
+    how the store keeps them.
+    """
+    pairs: dict[str, str] = {}
+    for item in raw.split(","):
+        who, sep, tag = item.partition(":")
+        if sep and who.strip() and tag.strip():
+            pairs[who.strip()] = tag.strip().lower()
+    return pairs
+
+
+# Join sounds: when one of these people walks into the bot's voice channel
+# while someone else is already there, play a random sound carrying their
+# tag. Comma-separated "username:tag" pairs (a user id works in place of
+# the username). Empty = off.
+JOIN_SOUNDS: dict[str, str] = _parse_join_sounds(os.getenv("JOIN_SOUNDS", ""))
+
 # Web admin panel (issue #1). Empty token = panel disabled entirely.
 WEB_TOKEN: str = os.getenv("WEB_TOKEN", "")
 WEB_HOST: str = os.getenv("WEB_HOST", "0.0.0.0")

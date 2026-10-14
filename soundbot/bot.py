@@ -140,7 +140,8 @@ def parse_emoji_key(raw: str) -> str:
 
 
 def _matches_ref(ref: str, obj_id: int, name: str | None) -> bool:
-    """True if `ref` names this guild or channel, by snowflake id or name.
+    """True if `ref` names this guild, channel or member, by snowflake id
+    or name.
 
     Config accepts either form so an admin can write `Lounge` without
     turning on developer mode, while ids stay available for channels whose
@@ -353,7 +354,13 @@ class Soundboard(commands.Cog):
         if self.bot.user is not None and member.id == self.bot.user.id:
             await self._handle_own_voice_change(member, before, after)
             return
-        await self._maybe_autojoin(member, before, after, time.monotonic())
+        joined = await self._maybe_autojoin(member, before, after, time.monotonic())
+        # After auto-join, so an arrival that pulls the bot into a channel
+        # where others were already waiting still gets its sound -- and
+        # before the board, whose page-by-page posting would delay it.
+        await self._maybe_play_join_sound(member, before, after)
+        if joined:
+            await self._post_autojoin_board(member.guild)
 
     async def _handle_own_voice_change(
         self,
@@ -397,6 +404,57 @@ class Soundboard(commands.Cog):
                 guild_id, len(boards),
             )
             await self._delete_boards(boards)
+
+    # -- Join sounds --
+
+    def _join_sound_tag(self, member: discord.Member) -> str | None:
+        """The JOIN_SOUNDS tag for `member`, matched by username or id."""
+        for ref, tag in config.JOIN_SOUNDS.items():
+            if _matches_ref(ref, member.id, member.name):
+                return tag
+        return None
+
+    async def _maybe_play_join_sound(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Announce a JOIN_SOUNDS member with a random sound of their tag.
+
+        Only when they arrive in the bot's own channel and another human is
+        already there: walking into an empty room has nobody to announce to.
+        Fires on every arrival, so hopping out and back in replays it.
+        """
+        if member.bot:
+            return
+        channel = after.channel
+        if channel is None or channel == before.channel:
+            return
+        tag = self._join_sound_tag(member)
+        if tag is None:
+            return
+        # Re-read where they are now: an auto-join just ahead of this can
+        # take seconds, and they may have left again in the meantime.
+        if member.voice is None or member.voice.channel != channel:
+            return
+        # A voice client still mid-handshake (another arrival's auto-join)
+        # counts as not there yet; that arrival simply goes unannounced.
+        vc = member.guild.voice_client
+        if vc is None or not vc.is_connected() or vc.channel != channel:
+            return
+        if not any(not m.bot and m.id != member.id for m in channel.members):
+            return
+        sounds = self.store.list_sounds(tag=tag)
+        if not sounds:
+            logger.info("no sounds tagged %r for %s's join sound", tag, member)
+            return
+        name, _ = random.choice(sounds)
+        error = await self._start_playback(vc, name)
+        if error is not None:
+            logger.info("join sound for %s skipped: %s", member, error)
+            return
+        logger.info("join sound=%s for %s in %s", name, member, channel.name)
 
     # -- Auto-join --
 
@@ -451,8 +509,11 @@ class Soundboard(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
         now: float,
-    ) -> None:
+    ) -> bool:
         """Join a watched voice channel the moment a human lands in it.
+
+        Returns True when this arrival connected the bot, so the caller can
+        follow up with the auto-join board.
 
         `now` is monotonic time, passed in (rather than read here) so tests
         can drive the mute window explicitly, as _disconnect_if_idle does.
@@ -462,14 +523,14 @@ class Soundboard(commands.Cog):
         in another channel.
         """
         if member.bot:
-            return
+            return False
         channel = after.channel
         # Mutes, deafens and go-live all fire with the channel unchanged;
         # none of them is an arrival.
         if channel is None or channel == before.channel:
-            return
+            return False
         if not self._is_watched(channel):
-            return
+            return False
         guild = member.guild
         # Deliberately `is not None`, not the is_connected() this file uses
         # elsewhere: discord.py registers the voice client before the
@@ -477,11 +538,11 @@ class Soundboard(commands.Cog):
         # arrival has to be turned away. is_connected() would reopen the
         # double-connect race.
         if guild.voice_client is not None:
-            return
+            return False
         if self._autojoin_muted(guild.id, now):
-            return
+            return False
         if guild.id in self._autojoin_pending:
-            return
+            return False
         self._autojoin_pending.add(guild.id)
         try:
             logger.info(
@@ -498,10 +559,10 @@ class Soundboard(commands.Cog):
                 "auto-join of %s in guild_id=%s failed: %s",
                 channel.name, guild.id, exc,
             )
-        else:
-            await self._post_autojoin_board(guild)
+            return False
         finally:
             self._autojoin_pending.discard(guild.id)
+        return True
 
     async def _post_autojoin_board(self, guild: discord.Guild) -> None:
         """Post the full board to AUTO_JOIN_BOARD_CHANNEL, as if someone
