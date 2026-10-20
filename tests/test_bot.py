@@ -1468,6 +1468,61 @@ class TestAutoLeaveWhenAlone:
 
         vc.disconnect.assert_awaited_once_with(force=True)
 
+    def test_client_mid_transition_is_not_reaped(self, tmp_path, monkeypatch):
+        """/join or auto-join may be tearing this client down or connecting
+        a new one; a second teardown racing it could deregister the
+        replacement, since discord.py's cleanup() pops by guild id."""
+        cog, vc = self._make_idle_cog(tmp_path, monkeypatch, members=[self._human()])
+        vc.is_connected.return_value = False
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        cog._voice_busy.add(GUILD_ID)
+
+        asyncio.run(cog._disconnect_if_idle(1000.0 + DEAD_VOICE_GRACE))
+
+        vc.disconnect.assert_not_awaited()
+
+    def test_replacement_client_does_not_inherit_the_dead_clock(
+        self, tmp_path, monkeypatch
+    ):
+        """Once a dead client is torn down, its first-down time must go with
+        it, or the replacement -- not connected while it handshakes -- would
+        be judged dead the moment the next pass looked at it."""
+        cog, old = self._make_idle_cog(tmp_path, monkeypatch, members=[self._human()])
+        old.is_connected.return_value = False
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        asyncio.run(cog._teardown_voice(old, force=True))  # as /join does
+        new = _connected_vc()
+        new.is_connected.return_value = False
+        new.disconnect = AsyncMock()
+        cog.bot.voice_clients = [new]
+
+        asyncio.run(cog._disconnect_if_idle(1000.0 + DEAD_VOICE_GRACE))
+
+        new.disconnect.assert_not_awaited()
+
+    def test_one_failing_teardown_does_not_stop_the_pass(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """tasks.loop ends for good on most exceptions; a half-broken client
+        raising out of disconnect() must not take auto-leave and reaping
+        down with it, nor shield the next dead client."""
+        cog, broken = self._make_idle_cog(tmp_path, monkeypatch)
+        broken.is_connected.return_value = False
+        broken.disconnect = AsyncMock(side_effect=RuntimeError("half-closed"))
+        other = _connected_vc()
+        other.guild.id = 777
+        other.is_connected.return_value = False
+        other.disconnect = AsyncMock()
+        cog.bot.voice_clients = [broken, other]
+        caplog.set_level(logging.ERROR, logger="soundbot")
+
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        asyncio.run(cog._disconnect_if_idle(1000.0 + DEAD_VOICE_GRACE))
+
+        other.disconnect.assert_awaited_once_with(force=True)
+        assert "half-closed" in caplog.text
+        assert cog._voice_busy == set()
+
     def test_leave_command_uses_shared_teardown(self, tmp_path):
         cog = _make_cog(tmp_path)
         cog.mixers[GUILD_ID] = MixerSource()
@@ -1800,23 +1855,29 @@ class TestJoinRecoversBrokenVoiceClient:
     move_to() on it, Discord showed the bot in the channel, and every play
     failed with "use /join first" until a restart."""
 
-    def _dead_vc(self):
+    @staticmethod
+    def _stale_vc(*, connected):
         vc = _connected_vc()
-        vc.is_connected.return_value = False
+        vc.is_connected.return_value = connected
         vc.disconnect = AsyncMock()
         vc.move_to = AsyncMock()
         return vc
 
-    def _join(self, cog, vc):
+    @staticmethod
+    def _interaction(vc):
         interaction = _make_interaction(voice_client=vc)
         fresh = MagicMock()
         interaction.user.voice.channel.connect = AsyncMock(return_value=fresh)
+        return interaction, fresh
+
+    def _join(self, cog, vc):
+        interaction, fresh = self._interaction(vc)
         asyncio.run(Soundboard.join.callback(cog, interaction))
         return interaction, fresh
 
     def test_dead_voice_client_is_torn_down_and_replaced(self, tmp_path):
         cog = _make_cog(tmp_path)
-        dead = self._dead_vc()
+        dead = self._stale_vc(connected=False)
 
         interaction, fresh = self._join(cog, dead)
 
@@ -1830,21 +1891,19 @@ class TestJoinRecoversBrokenVoiceClient:
         """_start_playback finds nothing to play into without a mixer, and
         _connect_voice is the only place that puts one on the air."""
         cog = _make_cog(tmp_path)
-        live = self._dead_vc()
-        live.is_connected.return_value = True
+        mixerless = self._stale_vc(connected=True)
 
-        interaction, fresh = self._join(cog, live)
+        interaction, fresh = self._join(cog, mixerless)
 
-        live.disconnect.assert_awaited_once()
-        live.move_to.assert_not_awaited()
+        mixerless.disconnect.assert_awaited_once_with(force=True)
+        mixerless.move_to.assert_not_awaited()
         fresh.play.assert_called_once_with(cog.mixers[GUILD_ID])
 
     def test_live_client_with_its_mixer_just_moves(self, tmp_path):
         cog = _make_cog(tmp_path)
         mixer = MixerSource()
         cog.mixers[GUILD_ID] = mixer
-        live = self._dead_vc()
-        live.is_connected.return_value = True
+        live = self._stale_vc(connected=True)
 
         interaction, _ = self._join(cog, live)
 
@@ -1853,22 +1912,55 @@ class TestJoinRecoversBrokenVoiceClient:
         interaction.user.voice.channel.connect.assert_not_awaited()
         assert cog.mixers[GUILD_ID] is mixer
 
-    def test_auto_join_mid_handshake_is_left_alone(self, tmp_path):
-        """An auto-join's client is not connected yet and has no mixer,
-        which looks exactly like a dead one. Tearing it down would make the
-        auto-join's connect() fail, and discord.py's failure cleanup
-        deregisters whatever client the guild holds -- the fresh one /join
-        just made."""
+    def test_client_mid_transition_is_left_alone(self, tmp_path):
+        """A client still mid-handshake (auto-join, or another /join) is not
+        connected and has no mixer -- exactly like a dead one. Tearing it
+        down would fail that connect(), and discord.py's cleanup of the
+        failed attempt deregisters whatever client the guild then holds:
+        the fresh one this /join made."""
         cog = _make_cog(tmp_path)
-        connecting = self._dead_vc()
-        cog._autojoin_pending.add(GUILD_ID)
+        connecting = self._stale_vc(connected=False)
+        cog._voice_busy.add(GUILD_ID)
 
         interaction, _ = self._join(cog, connecting)
 
         connecting.disconnect.assert_not_awaited()
         interaction.user.voice.channel.connect.assert_not_awaited()
-        _, kwargs = interaction.response.send_message.call_args
-        assert kwargs.get("ephemeral") is True
+        args, _ = interaction.followup.send.call_args
+        assert "Already joining" in args[0]
+
+    def test_overlapping_joins_replace_a_dead_client_once(self, tmp_path):
+        """The forced disconnect can sit out a 30s wait for Discord's
+        confirmation; a second /join in that window must not start its own
+        teardown and connect alongside the first."""
+        cog = _make_cog(tmp_path)
+        dead = self._stale_vc(connected=False)
+        first, _ = self._interaction(dead)
+        second, _ = self._interaction(dead)
+
+        async def scenario():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def slow_disconnect(**kwargs):
+                started.set()
+                await release.wait()
+
+            dead.disconnect = AsyncMock(side_effect=slow_disconnect)
+            task = asyncio.create_task(Soundboard.join.callback(cog, first))
+            await started.wait()
+            # Bounded: without the guard this would block on the same
+            # disconnect, so a regression fails here rather than hanging.
+            await asyncio.wait_for(Soundboard.join.callback(cog, second), 1)
+            release.set()
+            await task
+
+        asyncio.run(scenario())
+
+        dead.disconnect.assert_awaited_once()
+        first.user.voice.channel.connect.assert_awaited_once()
+        second.user.voice.channel.connect.assert_not_awaited()
+        assert GUILD_ID not in cog._voice_busy
 
 
 class TestShutdownSignalHandler:
@@ -2210,6 +2302,46 @@ class TestAutoJoinWatchedChannels:
         dead.disconnect.assert_awaited_once_with(force=True)
         later.connect.assert_awaited_once()
 
+    def test_idle_pass_during_autojoin_teardown_leaves_it_alone(self, cog):
+        """The forced disconnect can wait ~30s and the idle loop ticks every
+        30s, so it will land mid-teardown. A second teardown of the same
+        client would finish late and its cleanup() would deregister the
+        client auto-join just connected."""
+        first = self._channel("Lounge")
+        dead = self._dead_vc(first)
+        cog.bot.voice_clients = [dead]
+        self._arrive(cog, first, now=self.NOW)  # starts the dead clock
+        later = self._channel("Lounge")
+        later.guild.voice_client = dead
+        member = self._member(later)
+        before_state = MagicMock()
+        before_state.channel = None
+        after_state = MagicMock()
+        after_state.channel = later
+        then = self.NOW + DEAD_VOICE_GRACE
+
+        async def scenario():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def slow_disconnect(**kwargs):
+                started.set()
+                await release.wait()
+
+            dead.disconnect = AsyncMock(side_effect=slow_disconnect)
+            arrival = asyncio.create_task(
+                cog._maybe_autojoin(member, before_state, after_state, then)
+            )
+            await started.wait()
+            await asyncio.wait_for(cog._disconnect_if_idle(then), 1)
+            release.set()
+            await arrival
+
+        asyncio.run(scenario())
+
+        dead.disconnect.assert_awaited_once()
+        later.connect.assert_awaited_once()
+
     def test_concurrent_arrivals_connect_only_once(self, cog):
         """Two people joining together dispatch two updates, and the second
         must not fire its own connect() while the first is mid-handshake.
@@ -2262,7 +2394,7 @@ class TestAutoJoinWatchedChannels:
         self._arrive(cog, failing)
 
         assert cog.mixers == {}
-        assert GUILD_ID not in cog._autojoin_pending
+        assert GUILD_ID not in cog._voice_busy
         assert "no Connect permission" in caplog.text
         # A failure is not a mute: the comment promises the next arrival
         # retries, so pin that rather than trusting it.
@@ -2601,7 +2733,7 @@ class TestAutoJoinBoard:
         self._arrive(cog, self._guild(board_channel))
 
         assert GUILD_ID in cog.mixers
-        assert GUILD_ID not in cog._autojoin_pending
+        assert GUILD_ID not in cog._voice_busy
         assert "could not post auto-join board" in caplog.text
 
     def test_manual_board_command_is_unchanged(self, cog):
