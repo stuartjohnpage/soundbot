@@ -16,6 +16,7 @@ import discord
 import pytest
 
 from soundbot.bot import (
+    DEAD_VOICE_GRACE,
     Soundboard,
     _matches_ref,
     deploy_commands,
@@ -1423,6 +1424,50 @@ class TestAutoLeaveWhenAlone:
         vc.disconnect.assert_not_awaited()
         assert cog._alone_since == {}
 
+    def test_client_dead_past_grace_is_torn_down(self, tmp_path, monkeypatch):
+        """A client that stays disconnected used to be skipped every pass,
+        forever, leaving guild.voice_client set and the guild stuck."""
+        cog, vc = self._make_idle_cog(tmp_path, monkeypatch, members=[self._human()])
+        vc.is_connected.return_value = False
+
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        asyncio.run(cog._disconnect_if_idle(1000.0 + DEAD_VOICE_GRACE - 1))
+        vc.disconnect.assert_not_awaited()
+
+        asyncio.run(cog._disconnect_if_idle(1000.0 + DEAD_VOICE_GRACE))
+
+        vc.disconnect.assert_awaited_once_with(force=True)
+        assert GUILD_ID not in cog.mixers
+
+    def test_reconnecting_within_grace_resets_the_clock(self, tmp_path, monkeypatch):
+        """discord.py reconnects on its own after a voice-server blip; a
+        client that came back must not be reaped on a stale first sighting."""
+        cog, vc = self._make_idle_cog(tmp_path, monkeypatch, members=[self._human()])
+        vc.is_connected.return_value = False
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        vc.is_connected.return_value = True
+        asyncio.run(cog._disconnect_if_idle(1030.0))
+        vc.is_connected.return_value = False
+        asyncio.run(cog._disconnect_if_idle(1040.0))
+
+        asyncio.run(cog._disconnect_if_idle(1000.0 + DEAD_VOICE_GRACE))
+
+        vc.disconnect.assert_not_awaited()
+
+    def test_dead_client_is_reaped_even_with_auto_leave_off(
+        self, tmp_path, monkeypatch
+    ):
+        from soundbot import config
+
+        cog, vc = self._make_idle_cog(tmp_path, monkeypatch)
+        monkeypatch.setattr(config, "IDLE_TIMEOUT", 0)
+        vc.is_connected.return_value = False
+
+        asyncio.run(cog._disconnect_if_idle(1000.0))
+        asyncio.run(cog._disconnect_if_idle(1000.0 + DEAD_VOICE_GRACE))
+
+        vc.disconnect.assert_awaited_once_with(force=True)
+
     def test_leave_command_uses_shared_teardown(self, tmp_path):
         cog = _make_cog(tmp_path)
         cog.mixers[GUILD_ID] = MixerSource()
@@ -1706,6 +1751,9 @@ class TestJoinLeaveReplyDeadline:
         existing = _connected_vc()
         existing.move_to = AsyncMock()
         cog = _make_cog(tmp_path)
+        # A healthy session has its mixer; without one /join reconnects
+        # instead of moving (see TestJoinRecoversBrokenVoiceClient).
+        cog.mixers[GUILD_ID] = MixerSource()
         interaction = _make_interaction(voice_client=existing)
 
         asyncio.run(Soundboard.join.callback(cog, interaction))
@@ -1742,6 +1790,85 @@ class TestJoinLeaveReplyDeadline:
         assert order == ["defer", "disconnect"]
         args, _ = interaction.followup.send.call_args
         assert "Left" in args[0]
+
+
+class TestJoinRecoversBrokenVoiceClient:
+    """/join must end with a live connection and a mixer on the air.
+
+    After someone hit Disconnect on the bot, guild.voice_client lingered
+    with is_connected() False and the mixer already gone; /join only called
+    move_to() on it, Discord showed the bot in the channel, and every play
+    failed with "use /join first" until a restart."""
+
+    def _dead_vc(self):
+        vc = _connected_vc()
+        vc.is_connected.return_value = False
+        vc.disconnect = AsyncMock()
+        vc.move_to = AsyncMock()
+        return vc
+
+    def _join(self, cog, vc):
+        interaction = _make_interaction(voice_client=vc)
+        fresh = MagicMock()
+        interaction.user.voice.channel.connect = AsyncMock(return_value=fresh)
+        asyncio.run(Soundboard.join.callback(cog, interaction))
+        return interaction, fresh
+
+    def test_dead_voice_client_is_torn_down_and_replaced(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        dead = self._dead_vc()
+
+        interaction, fresh = self._join(cog, dead)
+
+        dead.disconnect.assert_awaited_once_with(force=True)
+        dead.move_to.assert_not_awaited()
+        interaction.user.voice.channel.connect.assert_awaited_once()
+        fresh.play.assert_called_once_with(cog.mixers[GUILD_ID])
+        interaction.followup.send.assert_awaited_once()
+
+    def test_live_client_without_a_mixer_is_replaced(self, tmp_path):
+        """_start_playback finds nothing to play into without a mixer, and
+        _connect_voice is the only place that puts one on the air."""
+        cog = _make_cog(tmp_path)
+        live = self._dead_vc()
+        live.is_connected.return_value = True
+
+        interaction, fresh = self._join(cog, live)
+
+        live.disconnect.assert_awaited_once()
+        live.move_to.assert_not_awaited()
+        fresh.play.assert_called_once_with(cog.mixers[GUILD_ID])
+
+    def test_live_client_with_its_mixer_just_moves(self, tmp_path):
+        cog = _make_cog(tmp_path)
+        mixer = MixerSource()
+        cog.mixers[GUILD_ID] = mixer
+        live = self._dead_vc()
+        live.is_connected.return_value = True
+
+        interaction, _ = self._join(cog, live)
+
+        live.move_to.assert_awaited_once_with(interaction.user.voice.channel)
+        live.disconnect.assert_not_awaited()
+        interaction.user.voice.channel.connect.assert_not_awaited()
+        assert cog.mixers[GUILD_ID] is mixer
+
+    def test_auto_join_mid_handshake_is_left_alone(self, tmp_path):
+        """An auto-join's client is not connected yet and has no mixer,
+        which looks exactly like a dead one. Tearing it down would make the
+        auto-join's connect() fail, and discord.py's failure cleanup
+        deregisters whatever client the guild holds -- the fresh one /join
+        just made."""
+        cog = _make_cog(tmp_path)
+        connecting = self._dead_vc()
+        cog._autojoin_pending.add(GUILD_ID)
+
+        interaction, _ = self._join(cog, connecting)
+
+        connecting.disconnect.assert_not_awaited()
+        interaction.user.voice.channel.connect.assert_not_awaited()
+        _, kwargs = interaction.response.send_message.call_args
+        assert kwargs.get("ephemeral") is True
 
 
 class TestShutdownSignalHandler:
@@ -2047,6 +2174,41 @@ class TestAutoJoinWatchedChannels:
         self._arrive(cog, channel)
 
         channel.connect.assert_not_awaited()
+
+    def _dead_vc(self, channel):
+        vc = _connected_vc()
+        vc.is_connected.return_value = False
+        vc.disconnect = AsyncMock()
+        channel.guild.voice_client = vc
+        return vc
+
+    def test_client_still_connecting_is_not_disturbed(self, cog):
+        """A not-connected client inside the grace period may be another
+        arrival's handshake, or discord.py reconnecting: leave it be."""
+        first = self._channel("Lounge")
+        dead = self._dead_vc(first)
+        self._arrive(cog, first, now=self.NOW)
+
+        later = self._channel("Lounge")
+        later.guild.voice_client = dead
+        self._arrive(cog, later, now=self.NOW + DEAD_VOICE_GRACE - 1)
+
+        dead.disconnect.assert_not_awaited()
+        later.connect.assert_not_awaited()
+
+    def test_dead_client_past_grace_no_longer_blocks_autojoin(self, cog):
+        """A client left behind dead used to turn every arrival away, for
+        as long as the process lived."""
+        first = self._channel("Lounge")
+        dead = self._dead_vc(first)
+        self._arrive(cog, first, now=self.NOW)
+
+        later = self._channel("Lounge")
+        later.guild.voice_client = dead
+        self._arrive(cog, later, now=self.NOW + DEAD_VOICE_GRACE)
+
+        dead.disconnect.assert_awaited_once_with(force=True)
+        later.connect.assert_awaited_once()
 
     def test_concurrent_arrivals_connect_only_once(self, cog):
         """Two people joining together dispatch two updates, and the second

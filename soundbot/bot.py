@@ -28,6 +28,12 @@ logger = logging.getLogger("soundbot")
 SOUNDS_PER_BOARD = 25  # Discord's hard cap: 5 action rows * 5 buttons per row
 DISCORD_IMPORT_CATEGORY = "discord-import"
 _MAX_SUMMARY_LENGTH = 1900  # Leave headroom under Discord's 2000-char limit
+# Seconds a voice client may sit not-connected before it is treated as dead
+# and torn down. discord.py legitimately holds a registered client in that
+# state while it works: a handshake is capped at connect()'s 30s timeout,
+# and after a forced voice-socket close it waits up to the same 30s for
+# Discord to say where the bot went. Twice that clears both.
+DEAD_VOICE_GRACE = 60.0
 
 
 def classify_import_sound(
@@ -199,6 +205,9 @@ class Soundboard(commands.Cog):
         # voice channel. Entries live only while the bot stays alone;
         # _disconnect_if_idle prunes them the moment company arrives.
         self._alone_since: dict[int, float] = {}
+        # guild id -> monotonic time its voice client was first seen not
+        # connected. Lives only while that stays true; see _voice_is_dead.
+        self._down_since: dict[int, float] = {}
         # guild id -> monotonic deadline until which auto-join stays muted
         # after a deliberate exit. Pruned on the first arrival past it.
         self._autojoin_muted_until: dict[int, float] = {}
@@ -234,12 +243,36 @@ class Soundboard(commands.Cog):
             )
             return
         channel = interaction.user.voice.channel
+        # An auto-join mid-handshake holds a client that is not connected
+        # and has no mixer yet -- indistinguishable from a dead one below.
+        # Scrapping it would fail that connect(), and discord.py's cleanup
+        # of the failed attempt deregisters whichever client the guild then
+        # holds: the fresh one this /join made.
+        if interaction.guild.id in self._autojoin_pending:
+            await interaction.response.send_message(
+                "Already joining a voice channel; try again in a moment.",
+                ephemeral=True,
+            )
+            return
         # Defer first: the voice handshake routinely outlasts Discord's
         # 3-second acknowledgement window, and a late reply 404s as
         # "Unknown interaction" even though the join succeeded.
         await interaction.response.defer()
-        if interaction.guild.voice_client:
-            await interaction.guild.voice_client.move_to(channel)
+        vc = interaction.guild.voice_client
+        # move_to() only re-points a live connection; on a dead one it sends
+        # the gateway move, Discord shows the bot in the channel, and nothing
+        # ever re-runs the voice handshake -- so every play then fails with
+        # "use /join first". A client with no mixer is just as mute, and
+        # _connect_voice is the only place that puts one on the air. /join
+        # is the user saying "make it work", so either kind is scrapped and
+        # replaced rather than trusted.
+        if vc is not None and (
+            not vc.is_connected() or interaction.guild.id not in self.mixers
+        ):
+            await self._teardown_voice(vc, force=True)
+            vc = None
+        if vc is not None:
+            await vc.move_to(channel)
         else:
             await self._connect_voice(channel)
         # /join is the exact opposite intent to the /leave that armed any
@@ -285,18 +318,25 @@ class Soundboard(commands.Cog):
         self.mixers[channel.guild.id] = mixer
         return vc
 
-    async def _teardown_voice(self, vc: discord.VoiceProtocol) -> None:
+    async def _teardown_voice(
+        self, vc: discord.VoiceProtocol, *, force: bool = False
+    ) -> None:
         """Stop the mixer and disconnect — the one true voice teardown.
 
         Shared by /leave and the idle auto-leave so both paths get the
         mixer-race handling that _start_playback's re-check depends on
         (mixer dropped *before* the disconnect await).
+
+        Pass force=True for a client that is no longer connected: without
+        it discord.py skips the disconnect entirely and only deregisters
+        the client, so a bot Discord still shows in a channel would stay
+        there as a ghost and the half-open socket would never be closed.
         """
         mixer = self.mixers.pop(vc.guild.id, None)
         if mixer is not None:
             mixer.stop()
             mixer.cleanup()
-        await vc.disconnect()
+        await vc.disconnect(force=force)
 
     @tasks.loop(seconds=30)
     async def _idle_check_loop(self) -> None:
@@ -308,7 +348,13 @@ class Soundboard(commands.Cog):
         "Alone" means no non-bot members in the channel — other bots don't
         count as company. `now` is monotonic time, passed in (rather than
         read here) so tests can drive the clock explicitly.
+
+        Also reaps voice clients that have stayed disconnected past
+        DEAD_VOICE_GRACE, whatever IDLE_TIMEOUT says: a dead client left
+        registered blocks auto-join and makes every play fail until a
+        restart, which is a fault to clear, not an idle-policy choice.
         """
+        await self._reap_dead_voice(now)
         if config.IDLE_TIMEOUT <= 0:
             return
         alone: set[int] = set()
@@ -334,6 +380,40 @@ class Soundboard(commands.Cog):
         # resets, so the next empty stretch starts a fresh countdown.
         self._alone_since = {
             gid: t for gid, t in self._alone_since.items() if gid in alone
+        }
+
+    def _voice_is_dead(self, vc: discord.VoiceProtocol, now: float) -> bool:
+        """Whether `vc` has been not-connected for DEAD_VOICE_GRACE.
+
+        The first not-connected sighting starts the clock and a connected
+        one clears it, so a client discord.py reconnects in the meantime
+        is never mistaken for dead on a stale timestamp.
+        """
+        guild_id = vc.guild.id
+        if vc.is_connected():
+            self._down_since.pop(guild_id, None)
+            return False
+        first_down = self._down_since.setdefault(guild_id, now)
+        return now - first_down >= DEAD_VOICE_GRACE
+
+    async def _reap_dead_voice(self, now: float) -> None:
+        """Tear down every voice client dead past its grace period."""
+        present: set[int] = set()
+        for vc in list(self.bot.voice_clients):
+            if not self._voice_is_dead(vc, now):
+                present.add(vc.guild.id)
+                continue
+            logger.warning(
+                "tearing down voice client in guild_id=%s: "
+                "not connected for %.0fs",
+                vc.guild.id, now - self._down_since[vc.guild.id],
+            )
+            await self._teardown_voice(vc, force=True)
+        # Drop clocks for clients that are gone -- reaped here, or cleaned
+        # up by discord.py itself -- so the guild's next connection starts
+        # fresh rather than inheriting an old first sighting.
+        self._down_since = {
+            gid: t for gid, t in self._down_since.items() if gid in present
         }
 
     # -- Voice-state reactions --
@@ -388,6 +468,12 @@ class Soundboard(commands.Cog):
         # them all as deliberate — mute rather than bounce straight back
         # into a channel something just ejected us from — and clean up the
         # mixer no teardown got to.
+        #
+        # The voice client itself is left to discord.py: it handles this same
+        # update in a task of its own and force-disconnects and deregisters
+        # the client. A disconnect from here would race that, and would sit
+        # out its 30s wait for a confirmation Discord already sent. The rare
+        # client discord.py fails to clear is caught by _reap_dead_voice.
         stray = self.mixers.pop(guild_id, None)
         if stray is not None:
             stray.stop()
@@ -536,8 +622,11 @@ class Soundboard(commands.Cog):
         # elsewhere: discord.py registers the voice client before the
         # handshake finishes, and that window is exactly when a second
         # arrival has to be turned away. is_connected() would reopen the
-        # double-connect race.
-        if guild.voice_client is not None:
+        # double-connect race. The one exception is a client not connected
+        # for longer than any handshake or reconnect takes: that is a
+        # leftover, and honouring it would block auto-join for good.
+        vc = guild.voice_client
+        if vc is not None and not self._voice_is_dead(vc, now):
             return False
         if self._autojoin_muted(guild.id, now):
             return False
@@ -545,6 +634,11 @@ class Soundboard(commands.Cog):
             return False
         self._autojoin_pending.add(guild.id)
         try:
+            # Inside the pending guard: a forced disconnect can await
+            # Discord's confirmation, and a second arrival in that window
+            # must not tear down and connect alongside this one.
+            if vc is not None:
+                await self._teardown_voice(vc, force=True)
             logger.info(
                 "auto-joining %s for %s in guild_id=%s",
                 channel.name, member, guild.id,
