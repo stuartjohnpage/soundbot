@@ -228,11 +228,11 @@ never count.
 A dropped connection is handled separately. If the bot's voice connection
 dies (say, the host's internet goes down) and is still down a minute later,
 the bot scraps it and reconnects to the same channel, as long as someone is
-still in it. If the network is still out, it tries again every 30 seconds for
-up to 5 minutes. This works on any server, not just the auto-join one, and
-rejoining a watched channel posts a fresh board. It won't come back while a
-deliberate exit has auto-join muted, and running `/leave` while it is still
-retrying calls it off.
+still in it. If the network is still out, it keeps trying about every 30
+seconds for up to 5 minutes. This works on any server, not just the auto-join
+one, and rejoining a watched channel posts a fresh board. It won't come back
+while a deliberate exit has auto-join muted, and running `/leave` while it is
+still retrying calls it off.
 
 Two things worth knowing before you turn it on:
 
