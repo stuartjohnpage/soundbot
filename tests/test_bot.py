@@ -17,6 +17,8 @@ import pytest
 
 from soundbot.bot import (
     DEAD_VOICE_GRACE,
+    DEAD_VOICE_REJOIN_CONNECT_TIMEOUT,
+    DEAD_VOICE_REJOIN_WINDOW,
     Soundboard,
     _matches_ref,
     deploy_commands,
@@ -1536,6 +1538,494 @@ class TestAutoLeaveWhenAlone:
         assert GUILD_ID not in cog.mixers
         args, _ = interaction.followup.send.call_args
         assert "Left" in args[0]
+
+
+class TestRejoinAfterDeadVoice:
+    """After the idle loop reaps a dead voice client, the bot reconnects to
+    the channel it was in if people are still sitting there. Home internet
+    drops take the client down every hour or so, and auto-join only reacts
+    to someone *arriving*, so without this the room lost the bot until
+    somebody left and came back.
+
+    Driven through _disconnect_if_idle, the idle loop's body, with an
+    explicit clock. The fakes mimic discord.py's bookkeeping: disconnect()
+    deregisters the client and connect() registers a new one."""
+
+    BOT_ID = 999
+    CHANNEL_ID = 31
+    NOW = 1000.0
+
+    @pytest.fixture
+    def cog(self, tmp_path, monkeypatch):
+        from soundbot import config
+
+        # Rejoin restores a channel someone chose, on any server, so the
+        # base case runs with auto-join off entirely.
+        monkeypatch.setattr(config, "AUTO_JOIN_GUILD", "")
+        monkeypatch.setattr(config, "AUTO_JOIN_CHANNELS", ())
+        monkeypatch.setattr(config, "IDLE_TIMEOUT", 600.0)
+        cog = _make_cog(tmp_path)
+        cog.bot.user.id = self.BOT_ID
+        cog.bot.voice_clients = []
+        self.channels = {}
+        cog.bot.get_channel = MagicMock(side_effect=self.channels.get)
+        return cog
+
+    @staticmethod
+    def _member(*, is_bot=False):
+        m = MagicMock()
+        m.bot = is_bot
+        return m
+
+    def _setup(
+        self,
+        cog,
+        *,
+        humans=1,
+        guild_name="Some Server",
+        name="Lounge",
+        guild_id=GUILD_ID,
+        channel_id=CHANNEL_ID,
+    ):
+        """A guild whose voice client in `name` has just gone dead."""
+        guild = MagicMock()
+        guild.id = guild_id
+        guild.name = guild_name
+        guild.text_channels = []
+        channel = MagicMock()
+        channel.name = name
+        channel.id = channel_id
+        channel.guild = guild
+        channel.members = [self._member(is_bot=True)] + [
+            self._member() for _ in range(humans)
+        ]
+        dead = MagicMock()
+        dead.guild = guild
+        dead.channel = channel
+        dead.is_connected.return_value = False
+
+        async def deregister(**kwargs):
+            # discord.py's cleanup() after a disconnect.
+            if dead in cog.bot.voice_clients:
+                cog.bot.voice_clients.remove(dead)
+            guild.voice_client = None
+
+        dead.disconnect = AsyncMock(side_effect=deregister)
+        guild.voice_client = dead
+        cog.bot.voice_clients.append(dead)
+        cog.mixers[guild_id] = MixerSource()
+
+        async def connect(**kwargs):
+            new = _connected_vc()
+            new.guild = guild
+            new.channel = channel
+            new.disconnect = AsyncMock()
+            guild.voice_client = new
+            cog.bot.voice_clients.append(new)
+            return new
+
+        channel.connect = AsyncMock(side_effect=connect)
+        self.channels[channel_id] = channel
+        return guild, channel, dead
+
+    def _reap(self, cog, now=None):
+        """Two idle passes: the first sighting starts the dead clock, the
+        second lands past the grace period and tears the client down."""
+        now = self.NOW if now is None else now
+        asyncio.run(cog._disconnect_if_idle(now))
+        asyncio.run(cog._disconnect_if_idle(now + DEAD_VOICE_GRACE))
+        return now + DEAD_VOICE_GRACE
+
+    def test_reaped_client_rejoins_the_same_channel_while_people_remain(
+        self, cog, caplog
+    ):
+        caplog.set_level(logging.INFO, logger="soundbot")
+        guild, channel, dead = self._setup(cog)
+
+        self._reap(cog)
+
+        dead.disconnect.assert_awaited_once_with(force=True)
+        channel.connect.assert_awaited_once()
+        assert GUILD_ID in cog.mixers
+        assert guild.voice_client is not dead
+        assert "rejoining Lounge" in caplog.text
+
+    def test_nobody_left_but_bots_means_no_rejoin(self, cog):
+        """An empty room is exactly what idle auto-leave would walk out of;
+        coming back to it would just restart that countdown."""
+        guild, channel, dead = self._setup(cog, humans=0)
+
+        then = self._reap(cog)
+        asyncio.run(cog._disconnect_if_idle(then + 30))
+
+        channel.connect.assert_not_awaited()
+        assert cog._pending_rejoins == {}
+
+    def test_failed_rejoin_is_retried_on_the_next_tick(self, cog, caplog):
+        """The reap usually lands while the network is still down, so the
+        first attempt failing must not be the end of it."""
+        caplog.set_level(logging.WARNING, logger="soundbot")
+        guild, channel, dead = self._setup(cog)
+        succeed = channel.connect.side_effect
+        channel.connect.side_effect = asyncio.TimeoutError()
+
+        then = self._reap(cog)
+
+        assert GUILD_ID not in cog.mixers
+        assert cog._voice_busy == set()
+        assert f"rejoin of Lounge in guild_id={GUILD_ID} failed" in caplog.text
+
+        channel.connect.side_effect = succeed
+        asyncio.run(cog._disconnect_if_idle(then + 30))
+
+        assert channel.connect.await_count == 2
+        assert GUILD_ID in cog.mixers
+
+    def test_retries_stop_once_the_rejoin_window_closes(self, cog, caplog):
+        caplog.set_level(logging.INFO, logger="soundbot")
+        guild, channel, dead = self._setup(cog)
+        channel.connect.side_effect = asyncio.TimeoutError()
+        then = self._reap(cog)
+        deadline = then + DEAD_VOICE_REJOIN_WINDOW
+
+        asyncio.run(cog._disconnect_if_idle(deadline - 1))
+        attempts = channel.connect.await_count
+        asyncio.run(cog._disconnect_if_idle(deadline))
+        asyncio.run(cog._disconnect_if_idle(deadline + 30))
+
+        assert attempts == 2
+        assert channel.connect.await_count == attempts
+        assert cog._pending_rejoins == {}
+        assert "giving up on rejoining Lounge" in caplog.text
+
+    def test_everyone_leaving_before_a_retry_cancels_it(self, cog):
+        guild, channel, dead = self._setup(cog)
+        channel.connect.side_effect = asyncio.TimeoutError()
+        then = self._reap(cog)
+
+        channel.members = [self._member(is_bot=True)]
+        asyncio.run(cog._disconnect_if_idle(then + 30))
+        channel.members.append(self._member())  # back, but too late
+        asyncio.run(cog._disconnect_if_idle(then + 60))
+
+        assert channel.connect.await_count == 1
+        assert cog._pending_rejoins == {}
+
+    def test_a_guild_back_in_voice_another_way_is_left_alone(self, cog):
+        """Someone arriving in a watched channel, or running /join, may get
+        the bot back first; a rejoin then would drag it out of wherever
+        they put it."""
+        guild, channel, dead = self._setup(cog)
+        channel.connect.side_effect = asyncio.TimeoutError()
+        then = self._reap(cog)
+
+        elsewhere = _connected_vc()
+        guild.voice_client = elsewhere
+        asyncio.run(cog._disconnect_if_idle(then + 30))
+
+        assert channel.connect.await_count == 1
+        assert cog._pending_rejoins == {}
+
+    def test_a_deleted_channel_cancels_the_rejoin(self, cog):
+        guild, channel, dead = self._setup(cog)
+        channel.connect.side_effect = asyncio.TimeoutError()
+        then = self._reap(cog)
+
+        cog.bot.get_channel.side_effect = lambda cid: None
+        asyncio.run(cog._disconnect_if_idle(then + 30))
+
+        assert channel.connect.await_count == 1
+        assert cog._pending_rejoins == {}
+
+    def test_a_guild_mid_transition_is_skipped_until_it_settles(self, cog):
+        """Another actor holding the guild may be connecting right now; a
+        second connect alongside it is the double-connect _voice_busy
+        exists to stop. Wait a tick rather than give up."""
+        guild, channel, dead = self._setup(cog)
+        succeed = channel.connect.side_effect
+        channel.connect.side_effect = asyncio.TimeoutError()
+        then = self._reap(cog)
+        channel.connect.side_effect = succeed
+
+        cog._voice_busy.add(GUILD_ID)
+        asyncio.run(cog._disconnect_if_idle(then + 30))
+        assert channel.connect.await_count == 1
+
+        cog._voice_busy.discard(GUILD_ID)
+        asyncio.run(cog._disconnect_if_idle(then + 60))
+        assert channel.connect.await_count == 2
+        assert GUILD_ID in cog.mixers
+
+    def _watch(self, monkeypatch, *, board_channel=""):
+        """Make the test guild the auto-join guild, watching Lounge."""
+        from soundbot import config
+
+        monkeypatch.setattr(config, "AUTO_JOIN_GUILD", "Watched Server")
+        monkeypatch.setattr(config, "AUTO_JOIN_CHANNELS", ("Lounge",))
+        monkeypatch.setattr(config, "AUTO_JOIN_COOLDOWN", 300.0)
+        monkeypatch.setattr(config, "AUTO_JOIN_BOARD_CHANNEL", board_channel)
+
+    def test_no_rejoin_while_auto_join_is_muted(self, cog, monkeypatch):
+        """A mute means a person told the bot to go away; a dead connection
+        is no reason to override them."""
+        self._watch(monkeypatch)
+        guild, channel, dead = self._setup(cog, guild_name="Watched Server")
+        cog._mute_autojoin(guild, self.NOW)
+
+        then = self._reap(cog)
+        asyncio.run(cog._disconnect_if_idle(then + 30))
+
+        dead.disconnect.assert_awaited_once_with(force=True)
+        channel.connect.assert_not_awaited()
+        assert cog._pending_rejoins == {}
+
+    def test_leave_cancels_a_pending_rejoin(self, cog):
+        """Between retries the bot is out of voice, so /leave finds no
+        client and says so -- but the person still meant "stay out", and a
+        retry dragging it back seconds later would make /leave look broken."""
+        guild, channel, dead = self._setup(cog)
+        succeed = channel.connect.side_effect
+        channel.connect.side_effect = asyncio.TimeoutError()
+        then = self._reap(cog)
+        channel.connect.side_effect = succeed
+
+        interaction = _make_interaction(voice_client=None)
+        asyncio.run(Soundboard.leave.callback(cog, interaction))
+        asyncio.run(cog._disconnect_if_idle(then + 30))
+
+        assert channel.connect.await_count == 1
+        assert GUILD_ID not in cog.mixers
+
+    def _board_setup(
+        self, cog, tmp_path, monkeypatch, *, name="Lounge", confirm=True
+    ):
+        """A watched guild with a board channel and an old board on record,
+        whose dead client's disconnect delivers the bot's own leave update
+        before returning -- discord.py's disconnect(wait=True) waits for
+        exactly that confirmation. confirm=False models the gateway being
+        down too: no update ever arrives and the wait times out."""
+        from soundbot.boards import BoardTracker
+
+        self._watch(monkeypatch, board_channel="Sounds")
+        cog.boards = BoardTracker(tmp_path / "boards.json")
+        _add_sound(cog, "airhorn")
+        guild, channel, dead = self._setup(
+            cog, guild_name="Watched Server", name=name
+        )
+        board_channel = MagicMock()
+        board_channel.name = "Sounds"
+        board_channel.id = 4242
+        board_channel.send = AsyncMock(return_value=MagicMock(id=2))
+        guild.text_channels = [board_channel]
+        cog.boards.add(GUILD_ID, channel_id=4242, message_id=1)
+        deleted = []
+
+        def partial_messageable(channel_id):
+            messageable = MagicMock()
+
+            def partial_message(message_id):
+                message = MagicMock()
+
+                async def delete():
+                    deleted.append((channel_id, message_id))
+
+                message.delete = delete
+                return message
+
+            messageable.get_partial_message = partial_message
+            return messageable
+
+        cog.bot.get_partial_messageable = partial_messageable
+        deregister = dead.disconnect.side_effect
+
+        async def disconnect_and_confirm(**kwargs):
+            await deregister(**kwargs)
+            if not confirm:
+                return
+            me = MagicMock()
+            me.id = self.BOT_ID
+            me.guild = guild
+            before_state = MagicMock()
+            before_state.channel = channel
+            after_state = MagicMock()
+            after_state.channel = None
+            await cog.on_voice_state_update(me, before_state, after_state)
+
+        dead.disconnect.side_effect = disconnect_and_confirm
+        return guild, channel, board_channel, deleted
+
+    def test_rejoining_a_watched_channel_reposts_the_board(
+        self, cog, tmp_path, monkeypatch
+    ):
+        """The teardown's leave update deleted the old board; without a new
+        one the room is back in voice with no buttons to press."""
+        guild, channel, board_channel, deleted = self._board_setup(
+            cog, tmp_path, monkeypatch
+        )
+
+        self._reap(cog)
+
+        channel.connect.assert_awaited_once()
+        assert deleted == [(4242, 1)]
+        board_channel.send.assert_awaited_once()
+        assert cog.boards.pop_guild(GUILD_ID) == [(4242, 2)]
+        assert cog._autojoin_muted_until == {}
+
+    def test_rejoining_an_unwatched_channel_posts_no_board(
+        self, cog, tmp_path, monkeypatch
+    ):
+        guild, channel, board_channel, deleted = self._board_setup(
+            cog, tmp_path, monkeypatch, name="Elsewhere"
+        )
+
+        self._reap(cog)
+
+        channel.connect.assert_awaited_once()
+        board_channel.send.assert_not_awaited()
+
+    def test_an_unexpected_error_does_not_escape_the_idle_loop(
+        self, cog, caplog
+    ):
+        """tasks.loop stops for good on most exceptions, which would end
+        auto-leave, reaping and rejoining until a restart. Something outside
+        the expected network failures is a bug, not a blip, so it is logged
+        and that rejoin dropped rather than retried every tick."""
+        caplog.set_level(logging.ERROR, logger="soundbot")
+        guild, channel, dead = self._setup(cog)
+        channel.connect.side_effect = RuntimeError("surprise")
+
+        then = self._reap(cog)
+        asyncio.run(cog._disconnect_if_idle(then + 30))
+
+        assert "surprise" in caplog.text
+        assert channel.connect.await_count == 1
+        assert cog._voice_busy == set()
+        assert cog._pending_rejoins == {}
+
+
+    def test_leave_elsewhere_during_another_guilds_rejoin_still_cancels(
+        self, cog, caplog
+    ):
+        """The pass walks a snapshot of pending rejoins and awaits each
+        connect; a /leave landing during one guild's connect must still stop
+        the next guild's rejoin."""
+        caplog.set_level(logging.ERROR, logger="soundbot")
+        guild_a, channel_a, _ = self._setup(cog)
+        guild_b, channel_b, _ = self._setup(cog, guild_id=777, channel_id=32)
+        connect_a = channel_a.connect.side_effect
+        leave_b = _make_interaction(voice_client=None)
+        leave_b.guild.id = 777
+
+        async def connect_then_leave_elsewhere(**kwargs):
+            await Soundboard.leave.callback(cog, leave_b)
+            return await connect_a(**kwargs)
+
+        channel_a.connect.side_effect = connect_then_leave_elsewhere
+
+        self._reap(cog)
+
+        channel_a.connect.assert_awaited_once()
+        channel_b.connect.assert_not_awaited()
+        assert caplog.text == ""
+
+
+    def test_leave_during_the_rejoin_connect_wins(self, cog, caplog):
+        """/leave does not wait on _voice_busy, so it can cancel the rejoin
+        while its connect is in flight. "Stay out" is the later word: the
+        freshly connected client is torn back down."""
+        caplog.set_level(logging.ERROR, logger="soundbot")
+        guild, channel, _ = self._setup(cog)
+        connect = channel.connect.side_effect
+        leave = _make_interaction(voice_client=None)
+
+        async def leave_mid_connect(**kwargs):
+            await Soundboard.leave.callback(cog, leave)
+            return await connect(**kwargs)
+
+        channel.connect.side_effect = leave_mid_connect
+
+        self._reap(cog)
+
+        guild.voice_client.disconnect.assert_awaited_once()
+        assert GUILD_ID not in cog.mixers
+        assert cog._voice_busy == set()
+        assert caplog.text == ""
+
+
+    def test_discord_cancelling_its_own_connect_does_not_stop_the_loop(
+        self, cog, caplog
+    ):
+        """discord.py cancels an in-flight connector when a channel move or
+        voice-server update lands mid-handshake, and the awaiter sees
+        CancelledError. That is not an Exception, so left alone it would end
+        the tasks.loop for good, silently."""
+        caplog.set_level(logging.WARNING, logger="soundbot")
+        guild, channel, _ = self._setup(cog)
+        connect = channel.connect.side_effect
+        channel.connect.side_effect = asyncio.CancelledError()
+
+        then = self._reap(cog)
+
+        assert "cancelled" in caplog.text
+        assert cog._voice_busy == set()
+        channel.connect.side_effect = connect
+        asyncio.run(cog._disconnect_if_idle(then + 30))
+        assert GUILD_ID in cog.mixers
+
+    def test_cancelling_the_idle_loop_itself_still_cancels_it(self, cog):
+        """cog_unload cancels the loop; swallowing that would leave it
+        running past unload."""
+        guild, channel, _ = self._setup(cog)
+        asyncio.run(cog._disconnect_if_idle(self.NOW))
+
+        async def scenario():
+            started = asyncio.Event()
+
+            async def hang(**kwargs):
+                started.set()
+                await asyncio.Event().wait()
+
+            channel.connect.side_effect = hang
+            task = asyncio.create_task(
+                cog._disconnect_if_idle(self.NOW + DEAD_VOICE_GRACE)
+            )
+            await asyncio.wait_for(started.wait(), 1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+
+        asyncio.run(scenario())
+
+
+    def test_rejoin_connects_with_a_short_timeout(self, cog):
+        """Each attempt runs inside the idle loop, stalling auto-leave and
+        reaping in every other server while it waits. On a timeout
+        discord.py also waits the same timeout again for a disconnect
+        confirmation, so its 30s default would hold the loop for a minute."""
+        guild, channel, _ = self._setup(cog)
+
+        self._reap(cog)
+
+        channel.connect.assert_awaited_once_with(
+            timeout=DEAD_VOICE_REJOIN_CONNECT_TIMEOUT
+        )
+        assert DEAD_VOICE_REJOIN_CONNECT_TIMEOUT < 30.0
+
+
+    def test_board_left_over_by_an_unconfirmed_teardown_is_replaced(
+        self, cog, tmp_path, monkeypatch
+    ):
+        """With the gateway down as well, discord.py never hears the leave
+        confirmation, so the leave handler never deletes the old board.
+        Posting regardless would leave two boards, one of them dead."""
+        guild, channel, board_channel, deleted = self._board_setup(
+            cog, tmp_path, monkeypatch, confirm=False
+        )
+
+        self._reap(cog)
+
+        assert deleted == [(4242, 1)]
+        assert cog.boards.pop_guild(GUILD_ID) == [(4242, 2)]
 
 
 class TestStatsCommand:

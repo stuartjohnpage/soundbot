@@ -3,6 +3,7 @@ import logging
 import random
 import signal
 import time
+from typing import NamedTuple
 
 import discord
 from discord import app_commands
@@ -38,6 +39,24 @@ _MAX_SUMMARY_LENGTH = 1900  # Leave headroom under Discord's 2000-char limit
 # since a fresh connect recovers just as well and does not leave the guild
 # stuck if that loop never succeeds.
 DEAD_VOICE_GRACE = 60.0
+# Seconds after reaping a dead voice client during which the bot keeps
+# trying to get back into the channel it was in. Reaping happens while the
+# network may still be down, so the first attempt can fail; this bounds how
+# long the idle loop retries before leaving it to auto-join or /join.
+DEAD_VOICE_REJOIN_WINDOW = 300.0
+# Handshake timeout for each rejoin attempt, well under connect()'s 30s
+# default. Attempts run inside the idle loop, and a timed-out connect also
+# waits as long again for a disconnect confirmation, so the default would
+# stall auto-leave and reaping on every server for a minute per attempt. A
+# healthy handshake takes a second or two.
+DEAD_VOICE_REJOIN_CONNECT_TIMEOUT = 15.0
+
+
+class PendingRejoin(NamedTuple):
+    """A channel to get back into after its dead voice client was reaped."""
+
+    channel_id: int
+    deadline: float  # monotonic time to give up at
 
 
 def classify_import_sound(
@@ -166,6 +185,11 @@ def _matches_ref(ref: str, obj_id: int, name: str | None) -> bool:
     return name is not None and ref.casefold() == name.casefold()
 
 
+def _has_humans(channel: discord.abc.GuildChannel) -> bool:
+    """Whether anyone but bots is in `channel`; other bots are no company."""
+    return any(not m.bot for m in channel.members)
+
+
 def _admin_check() -> app_commands.check:
     """Check that the invoking user has the configured admin role."""
 
@@ -212,6 +236,10 @@ class Soundboard(commands.Cog):
         # guild id -> monotonic time its voice client was first seen not
         # connected. Lives only while that stays true; see _voice_is_dead.
         self._down_since: dict[int, float] = {}
+        # guild id -> where to rejoin, for a dead client reaped while people
+        # were still in its channel. Lives until the rejoin succeeds or stops
+        # making sense; see _rejoin_reaped_voice.
+        self._pending_rejoins: dict[int, PendingRejoin] = {}
         # guild id -> monotonic deadline until which auto-join stays muted
         # after a deliberate exit. Pruned on the first arrival past it.
         self._autojoin_muted_until: dict[int, float] = {}
@@ -298,6 +326,10 @@ class Soundboard(commands.Cog):
     @app_commands.command(name="leave", description="Bot leaves the voice channel")
     @_admin_check()
     async def leave(self, interaction: discord.Interaction) -> None:
+        # Before the not-in-voice check: between rejoin retries the bot is
+        # out of voice, and a retry pulling it back after "stay out" would
+        # make /leave look broken.
+        self._pending_rejoins.pop(interaction.guild.id, None)
         vc = interaction.guild.voice_client
         if not vc:
             await interaction.response.send_message(
@@ -317,7 +349,10 @@ class Soundboard(commands.Cog):
         await interaction.followup.send("Left the voice channel.")
 
     async def _connect_voice(
-        self, channel: "discord.VoiceChannel | discord.StageChannel"
+        self,
+        channel: "discord.VoiceChannel | discord.StageChannel",
+        *,
+        timeout: float | None = None,
     ) -> discord.VoiceClient:
         """Connect to `channel` and put that guild's mixer on the air.
 
@@ -325,8 +360,13 @@ class Soundboard(commands.Cog):
         and keyed off channel.guild exactly as that one keys off vc.guild:
         _play_sound looks the mixer up by guild id, so it has to be
         registered before the voice client starts playing.
+
+        `timeout` overrides connect()'s own handshake timeout when given.
         """
-        vc = await channel.connect()
+        if timeout is None:
+            vc = await channel.connect()
+        else:
+            vc = await channel.connect(timeout=timeout)
         mixer = MixerSource(volume=self.volume)
         vc.play(mixer)
         self.mixers[channel.guild.id] = mixer
@@ -370,9 +410,12 @@ class Soundboard(commands.Cog):
         Also reaps voice clients that have stayed disconnected past
         DEAD_VOICE_GRACE, whatever IDLE_TIMEOUT says: a dead client left
         registered blocks auto-join and makes every play fail until a
-        restart, which is a fault to clear, not an idle-policy choice.
+        restart, which is a fault to clear, not an idle-policy choice. The
+        rejoin that follows puts the bot back where people are still
+        waiting.
         """
         await self._reap_dead_voice(now)
+        await self._rejoin_reaped_voice(now)
         if config.IDLE_TIMEOUT <= 0:
             return
         alone: set[int] = set()
@@ -380,7 +423,7 @@ class Soundboard(commands.Cog):
             channel = getattr(vc, "channel", None)
             if not vc.is_connected() or channel is None:
                 continue
-            if any(not m.bot for m in channel.members):
+            if _has_humans(channel):
                 continue
             guild_id = vc.guild.id
             first_alone = self._alone_since.setdefault(guild_id, now)
@@ -419,6 +462,9 @@ class Soundboard(commands.Cog):
 
         Guilds mid-transition are skipped: whoever holds them is already
         replacing the client, and a second teardown would race theirs.
+
+        A client reaped with people still in its channel is queued for
+        _rejoin_reaped_voice: the drop was the network's doing, not theirs.
         """
         for vc in list(self.bot.voice_clients):
             guild_id = vc.guild.id
@@ -431,6 +477,18 @@ class Soundboard(commands.Cog):
                 "not connected for %.0fs",
                 guild_id, now - self._down_since[guild_id],
             )
+            # Read before the teardown, which deregisters the client. A muted
+            # guild is skipped: a person told the bot to go away there, and
+            # a dead connection is no reason to overrule them.
+            channel = getattr(vc, "channel", None)
+            if (
+                channel is not None
+                and _has_humans(channel)
+                and not self._autojoin_muted(guild_id, now)
+            ):
+                self._pending_rejoins[guild_id] = PendingRejoin(
+                    channel.id, now + DEAD_VOICE_REJOIN_WINDOW,
+                )
             self._voice_busy.add(guild_id)
             try:
                 await self._teardown_voice(vc, force=True)
@@ -450,6 +508,119 @@ class Soundboard(commands.Cog):
         registered = {vc.guild.id for vc in self.bot.voice_clients}
         for guild_id in self._down_since.keys() - registered:
             del self._down_since[guild_id]
+
+    async def _rejoin_reaped_voice(self, now: float) -> None:
+        """Get the bot back into channels it was reaped out of.
+
+        _reap_dead_voice records a pending rejoin when it scraps a dead
+        client with people still in its channel. Each idle pass, starting
+        with the one that did the reaping, tries again until the bot is
+        back, the rejoin stops making sense, or DEAD_VOICE_REJOIN_WINDOW
+        runs out. Without this, auto-join only reacts to someone arriving,
+        so a room that sat through a network drop lost the bot until
+        somebody left and came back.
+        """
+        for guild_id in list(self._pending_rejoins):
+            # Re-read rather than trust the snapshot: a /leave can cancel an
+            # entry while an earlier guild's connect is being awaited.
+            pending = self._pending_rejoins.get(guild_id)
+            if pending is None:
+                continue
+            try:
+                await self._try_rejoin(guild_id, pending, now)
+            except Exception:
+                # Same reasoning as in _reap_dead_voice: tasks.loop stops for
+                # good on most exceptions. The network failures connect()
+                # is expected to raise are handled inside; anything else is
+                # a bug that retrying every tick would only repeat.
+                logger.exception("rejoining voice in guild_id=%s failed", guild_id)
+                self._pending_rejoins.pop(guild_id, None)
+
+    async def _try_rejoin(
+        self, guild_id: int, pending: PendingRejoin, now: float
+    ) -> None:
+        """One attempt at a pending rejoin; see _rejoin_reaped_voice."""
+        channel = self.bot.get_channel(pending.channel_id)
+        # Any of these means the reason to rejoin has gone: the channel was
+        # deleted, the bot is already back (an auto-join or /join got there
+        # first, and a rejoin would drag it away from where they put it), or
+        # the room emptied and idle auto-leave would only walk out again.
+        if (
+            channel is None
+            or channel.guild.voice_client is not None
+            or not _has_humans(channel)
+        ):
+            del self._pending_rejoins[guild_id]
+            return
+        if now >= pending.deadline:
+            logger.info(
+                "giving up on rejoining %s in guild_id=%s", channel.name, guild_id
+            )
+            del self._pending_rejoins[guild_id]
+            return
+        # Someone else is mid-transition here; connecting alongside them is
+        # the race _voice_busy exists to stop. Their outcome decides the
+        # next pass: back in voice drops this, still out retries it.
+        if guild_id in self._voice_busy:
+            return
+        self._voice_busy.add(guild_id)
+        try:
+            logger.info(
+                "rejoining %s after dead voice in guild_id=%s",
+                channel.name, guild_id,
+            )
+            vc = await self._connect_voice(
+                channel, timeout=DEAD_VOICE_REJOIN_CONNECT_TIMEOUT
+            )
+            # /leave does not wait on _voice_busy, so it can cancel this
+            # entry while the connect is in flight. "Stay out" came last, so
+            # it wins: undo the connect while still holding the guild.
+            if self._pending_rejoins.pop(guild_id, None) is None:
+                logger.info(
+                    "/leave ran during rejoin of %s in guild_id=%s; leaving",
+                    channel.name, guild_id,
+                )
+                await self._teardown_voice(vc)
+                return
+        except (discord.DiscordException, asyncio.TimeoutError, OSError) as exc:
+            # The usual cause is the network still being down, so keep the
+            # entry and let the next pass try again.
+            logger.warning(
+                "rejoin of %s in guild_id=%s failed: %s",
+                channel.name, guild_id, exc,
+            )
+            return
+        except asyncio.CancelledError:
+            # discord.py cancels its own in-flight connector when a channel
+            # move or voice-server update lands mid-handshake, and that
+            # surfaces here. It is no Exception, so _rejoin_reaped_voice's
+            # guard would let it end the tasks.loop for good. Only a
+            # cancellation aimed at this task (cog_unload) may propagate.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            logger.warning(
+                "rejoin of %s in guild_id=%s was cancelled by discord.py",
+                channel.name, guild_id,
+            )
+            return
+        finally:
+            self._voice_busy.discard(guild_id)
+        # A watched channel should come back with its board. The teardown's
+        # leave update normally deleted the old one already, and has been
+        # handled by now: discord.py's disconnect() waits for it and
+        # dispatches our listener before that wait resumes. With the
+        # gateway down as well, though, no update ever arrives and the old
+        # board is still on record, so sweep it here rather than leave a
+        # dead board beside the new one. A confirmation replayed after this
+        # (a late gateway RESUME) would still read as an external
+        # disconnect; /join and auto-join replacing a dead client share
+        # that hazard.
+        if self._is_watched(channel):
+            stale = self.boards.pop_guild(guild_id)
+            if stale:
+                await self._delete_boards(stale)
+            await self._post_autojoin_board(channel.guild)
 
     # -- Voice-state reactions --
 
