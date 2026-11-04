@@ -38,6 +38,11 @@ _MAX_SUMMARY_LENGTH = 1900  # Leave headroom under Discord's 2000-char limit
 # since a fresh connect recovers just as well and does not leave the guild
 # stuck if that loop never succeeds.
 DEAD_VOICE_GRACE = 60.0
+# Seconds after reaping a dead voice client during which the bot keeps
+# trying to get back into the channel it was in. Reaping happens while the
+# network may still be down, so the first attempt can fail; this bounds how
+# long the idle loop retries before leaving it to auto-join or /join.
+DEAD_VOICE_REJOIN_WINDOW = 300.0
 
 
 def classify_import_sound(
@@ -212,6 +217,10 @@ class Soundboard(commands.Cog):
         # guild id -> monotonic time its voice client was first seen not
         # connected. Lives only while that stays true; see _voice_is_dead.
         self._down_since: dict[int, float] = {}
+        # guild id -> (channel id, monotonic give-up deadline) for a dead
+        # client reaped while people were still in its channel. Lives until
+        # the rejoin succeeds or stops making sense; see _rejoin_reaped_voice.
+        self._pending_rejoins: dict[int, tuple[int, float]] = {}
         # guild id -> monotonic deadline until which auto-join stays muted
         # after a deliberate exit. Pruned on the first arrival past it.
         self._autojoin_muted_until: dict[int, float] = {}
@@ -298,6 +307,10 @@ class Soundboard(commands.Cog):
     @app_commands.command(name="leave", description="Bot leaves the voice channel")
     @_admin_check()
     async def leave(self, interaction: discord.Interaction) -> None:
+        # Before the not-in-voice check: between rejoin retries the bot is
+        # out of voice, and a retry pulling it back after "stay out" would
+        # make /leave look broken.
+        self._pending_rejoins.pop(interaction.guild.id, None)
         vc = interaction.guild.voice_client
         if not vc:
             await interaction.response.send_message(
@@ -370,9 +383,12 @@ class Soundboard(commands.Cog):
         Also reaps voice clients that have stayed disconnected past
         DEAD_VOICE_GRACE, whatever IDLE_TIMEOUT says: a dead client left
         registered blocks auto-join and makes every play fail until a
-        restart, which is a fault to clear, not an idle-policy choice.
+        restart, which is a fault to clear, not an idle-policy choice. The
+        rejoin that follows puts the bot back where people are still
+        waiting.
         """
         await self._reap_dead_voice(now)
+        await self._rejoin_reaped_voice(now)
         if config.IDLE_TIMEOUT <= 0:
             return
         alone: set[int] = set()
@@ -419,6 +435,9 @@ class Soundboard(commands.Cog):
 
         Guilds mid-transition are skipped: whoever holds them is already
         replacing the client, and a second teardown would race theirs.
+
+        A client reaped with people still in its channel is queued for
+        _rejoin_reaped_voice: the drop was the network's doing, not theirs.
         """
         for vc in list(self.bot.voice_clients):
             guild_id = vc.guild.id
@@ -431,6 +450,18 @@ class Soundboard(commands.Cog):
                 "not connected for %.0fs",
                 guild_id, now - self._down_since[guild_id],
             )
+            # Read before the teardown, which deregisters the client. A muted
+            # guild is skipped: a person told the bot to go away there, and
+            # a dead connection is no reason to overrule them.
+            channel = getattr(vc, "channel", None)
+            if (
+                channel is not None
+                and any(not m.bot for m in channel.members)
+                and not self._autojoin_muted(guild_id, now)
+            ):
+                self._pending_rejoins[guild_id] = (
+                    channel.id, now + DEAD_VOICE_REJOIN_WINDOW,
+                )
             self._voice_busy.add(guild_id)
             try:
                 await self._teardown_voice(vc, force=True)
@@ -450,6 +481,83 @@ class Soundboard(commands.Cog):
         registered = {vc.guild.id for vc in self.bot.voice_clients}
         for guild_id in self._down_since.keys() - registered:
             del self._down_since[guild_id]
+
+    async def _rejoin_reaped_voice(self, now: float) -> None:
+        """Get the bot back into channels it was reaped out of.
+
+        _reap_dead_voice records a pending rejoin when it scraps a dead
+        client with people still in its channel. Each idle pass, starting
+        with the one that did the reaping, tries again until the bot is
+        back, the rejoin stops making sense, or DEAD_VOICE_REJOIN_WINDOW
+        runs out. Without this, auto-join only reacts to someone arriving,
+        so a room that sat through a network drop lost the bot until
+        somebody left and came back.
+        """
+        for guild_id, (channel_id, deadline) in list(self._pending_rejoins.items()):
+            try:
+                await self._try_rejoin(guild_id, channel_id, deadline, now)
+            except Exception:
+                # Same reasoning as in _reap_dead_voice: tasks.loop stops for
+                # good on most exceptions. The network failures connect()
+                # is expected to raise are handled inside; anything else is
+                # a bug that retrying every tick would only repeat.
+                logger.exception("rejoining voice in guild_id=%s failed", guild_id)
+                self._pending_rejoins.pop(guild_id, None)
+
+    async def _try_rejoin(
+        self, guild_id: int, channel_id: int, deadline: float, now: float
+    ) -> None:
+        """One attempt at a pending rejoin; see _rejoin_reaped_voice."""
+        channel = self.bot.get_channel(channel_id)
+        # Any of these means the reason to rejoin has gone: the channel was
+        # deleted, the bot is already back (an auto-join or /join got there
+        # first, and a rejoin would drag it away from where they put it), or
+        # the room emptied and idle auto-leave would only walk out again.
+        if (
+            channel is None
+            or channel.guild.voice_client is not None
+            or not any(not m.bot for m in channel.members)
+        ):
+            del self._pending_rejoins[guild_id]
+            return
+        if now >= deadline:
+            logger.info(
+                "giving up on rejoining %s in guild_id=%s", channel.name, guild_id
+            )
+            del self._pending_rejoins[guild_id]
+            return
+        # Someone else is mid-transition here; connecting alongside them is
+        # the race _voice_busy exists to stop. Their outcome decides the
+        # next pass: back in voice drops this, still out retries it.
+        if guild_id in self._voice_busy:
+            return
+        self._voice_busy.add(guild_id)
+        try:
+            logger.info(
+                "rejoining %s after dead voice in guild_id=%s",
+                channel.name, guild_id,
+            )
+            await self._connect_voice(channel)
+        except (discord.DiscordException, asyncio.TimeoutError, OSError) as exc:
+            # The usual cause is the network still being down, so keep the
+            # entry and let the next pass try again.
+            logger.warning(
+                "rejoin of %s in guild_id=%s failed: %s",
+                channel.name, guild_id, exc,
+            )
+            return
+        finally:
+            self._voice_busy.discard(guild_id)
+        del self._pending_rejoins[guild_id]
+        # The teardown's leave update deleted the old board, so a watched
+        # channel would be back in voice with nothing to press. That update
+        # has normally been handled by now and cannot sweep this board up:
+        # discord.py's disconnect() waits for it, and dispatches our
+        # listener before the wait resumes. Only a confirmation that missed
+        # its 30s timeout could land after this connect, and that hazard is
+        # shared with /join and auto-join replacing a dead client.
+        if self._is_watched(channel):
+            await self._post_autojoin_board(channel.guild)
 
     # -- Voice-state reactions --
 
